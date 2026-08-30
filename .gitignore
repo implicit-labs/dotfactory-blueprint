@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.dotfactory/
+/.worktrees/
+factory/factory.json
+*.db
+*.db-shm
+*.db-wal

@@ -1,0 +1,56 @@
+# dotfactory shell environment
+#
+# Copy or source this from ~/.zshrc. Load these values from a private secrets
+# file or password manager before using the API-backed functions:
+#
+#   DOTFACTORY_DEFAULT_ANTHROPIC_API_KEY
+#   DOTFACTORY_API_ANTHROPIC_API_KEY
+#
+# Never put either value in this repository.
+
+export PATH="$HOME/.local/bin:$PATH"
+
+alias updateclaude='curl -fsSL https://claude.ai/install.sh | bash'
+alias updatepi='bun install -g @mariozechner/pi-coding-agent'
+
+claude-operator() {
+    env -u ANTHROPIC_API_KEY claude "$@"
+}
+
+claude-api() {
+    if [ -z "${DOTFACTORY_API_ANTHROPIC_API_KEY:-}" ]; then
+        print -u2 "DOTFACTORY_API_ANTHROPIC_API_KEY is not set"
+        return 1
+    fi
+
+    ANTHROPIC_API_KEY="$DOTFACTORY_API_ANTHROPIC_API_KEY" command claude "$@"
+}
+
+omp-claude() {
+    if [ -z "${DOTFACTORY_DEFAULT_ANTHROPIC_API_KEY:-}" ]; then
+        print -u2 "DOTFACTORY_DEFAULT_ANTHROPIC_API_KEY is not set"
+        return 1
+    fi
+
+    printf '\e]0;omp · DEFAULT key\a'
+    print -P "%F{green}%K{black}  ●  PAYMENT PATH: DEFAULT Anthropic API key (default omp profile)  %k%f"
+    print -P "%F{green}   tip: run /rename DEFAULT once the session opens to pin this in the status bar too%f"
+    ANTHROPIC_API_KEY="$DOTFACTORY_DEFAULT_ANTHROPIC_API_KEY" command "$HOME/.local/bin/omp" \
+        --models claude-opus-5,claude-sonnet-5,claude-fable-5 "$@"
+}
+
+# >>> omp profile alias: omp-api >>>
+omp-api() {
+    if [ -z "${DOTFACTORY_API_ANTHROPIC_API_KEY:-}" ]; then
+        print -u2 "DOTFACTORY_API_ANTHROPIC_API_KEY is not set"
+        return 1
+    fi
+
+    printf '\e]0;omp · ALTERNATE key\a'
+    print -P "%F{red}%K{black}  ●  PAYMENT PATH: ALTERNATE Anthropic API key (profile: omp-api)  %k%f"
+    print -P "%F{red}   tip: run /rename ALTERNATE once the session opens to pin this in the status bar too%f"
+    ANTHROPIC_API_KEY="$DOTFACTORY_API_ANTHROPIC_API_KEY" command "$HOME/.local/bin/omp" \
+        --profile=omp-api \
+        --models claude-opus-5,claude-sonnet-5,claude-fable-5 "$@"
+}
+# <<< omp profile alias: omp-api <<<

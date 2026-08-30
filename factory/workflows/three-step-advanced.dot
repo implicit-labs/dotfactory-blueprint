@@ -1,0 +1,17 @@
+digraph ThreeStepAdvanced {
+  graph [name="three-step-advanced", schema_version=1]
+
+  start [shape=Mdiamond]
+  build [type=agent, runner=fake, model="gpt-5.6-sol", reasoning_effort=high, skills="codebase-explore,swift-testing", max_retries=3, timeout=30m, exit_contract="implementation-result-v1"]
+  review [type=human]
+  done [shape=Msquare]
+  canceled [shape=Msquare]
+
+  start -> build [id="start.build"]
+  build -> review [id="build.review", on=ready]
+  build -> build [id="build.retry", on=retry]
+  build -> canceled [id="build.exhausted", on=exhausted]
+  review -> done [id="review.done", on=approve]
+  review -> build [id="review.build", on=revise]
+  @any_nonterminal -> canceled [id="open.cancel", action=cancel, authority=human, signal=control_command, confirmation=true]
+}

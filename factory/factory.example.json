@@ -1,0 +1,90 @@
+{
+  "schema_version": 5,
+  "factory_id": "example-local",
+  "ledger_path": "~/.local/share/dotfactory/factory.db",
+  "default_workflow": "default",
+  "workflows": {
+    "default": {
+      "path": "./workflows/default.dot",
+      "profile_paths": []
+    },
+    "three-step": {
+      "path": "./workflows/three-step.dot",
+      "profile_paths": []
+    }
+  },
+  "scheduler": {
+    "poll_interval_ms": 30000,
+    "claim_ttl_seconds": 120,
+    "limits": {
+      "host": 3,
+      "projects": {"example-ios": 2},
+      "runners": {"codex": 2}
+    }
+  },
+  "preparation": {
+    "workspace": {
+      "remote": "origin",
+      "base_ref": "main",
+      "retention": "until_terminal"
+    },
+    "retry": {
+      "initial_seconds": 5,
+      "maximum_seconds": 60,
+      "deadline_seconds": 900
+    },
+    "providers": {
+      "portless": {
+        "kind": "portless",
+        "command": "portless",
+        "version": "0.15.6",
+        "node_minimum": 24,
+        "preflight_command": "dotfactory-portless-preflight"
+      }
+    },
+    "capabilities": {
+      "local-web": {
+        "provider": "portless",
+        "scope": "attempt",
+        "mode": "exclusive",
+        "config": {
+          "service_name": "web",
+          "command": ["npm", "run", "dev"]
+        }
+      }
+    }
+  },
+  "projects": {
+    "example-ios": {
+      "display_name": "Example iOS",
+      "enabled_by_default": true,
+      "workflow": "default",
+      "repository_path_env": "DOTFACTORY_EXAMPLE_IOS_REPOSITORY",
+      "tracker": {
+        "kind": "linear",
+        "project_slug": "example-ios",
+        "project_id_env": "DOTFACTORY_EXAMPLE_IOS_LINEAR_PROJECT_ID"
+      }
+    },
+    "example-service": {
+      "display_name": "Example Service",
+      "enabled_by_default": false,
+      "workflow": "three-step",
+      "repository_path_env": "DOTFACTORY_EXAMPLE_SERVICE_REPOSITORY",
+      "tracker": {
+        "kind": "linear",
+        "project_slug": "example-service",
+        "project_id_env": "DOTFACTORY_EXAMPLE_SERVICE_LINEAR_PROJECT_ID"
+      }
+    }
+  },
+  "projections": {
+    "linear": {"enabled": false, "token_env": "LINEAR_API_KEY"},
+    "logfire": {
+      "enabled": false,
+      "endpoint_env": "OTEL_EXPORTER_OTLP_ENDPOINT",
+      "headers_env": "OTEL_EXPORTER_OTLP_HEADERS",
+      "service_name_env": "OTEL_SERVICE_NAME"
+    }
+  }
+}
