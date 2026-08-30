@@ -1,0 +1,49 @@
+digraph DotfactoryDefault {
+  graph [
+    name="dotfactory-default",
+    schema_version=2,
+    conventions=linear,
+    linear_statuses=node_ids,
+    main_checkpoints="Todo,Ready,Review",
+    external_linear_states="Triage,Backlog"
+  ]
+
+  start [shape=Mdiamond]
+  Todo [type=checkpoint, role=pickup]
+  Autoplanning [type=work, role=planning]
+  Planning [type=work, role=planning]
+  Ready [type=checkpoint, role=pickup]
+  Implementing [type=work, role=delivery]
+  Verifying [type=work, role=verification]
+  Review [type=human, role=human]
+  Reworking [type=work, role=delivery]
+  Investigating [type=work, role=recovery]
+  Blocked [type=human, role=human]
+  Done [shape=Msquare]
+  Canceled [shape=Msquare]
+  Duplicate [shape=Msquare]
+
+  start -> Todo [on=enter]
+  Todo -> Autoplanning [on=claim, authority=agent]
+  Todo -> Planning [on=human]
+  Autoplanning -> Ready [on=complete]
+  Planning -> Ready [on=complete, authority=human]
+  Ready -> Implementing [on=claim, authority="human,agent"]
+  Implementing -> Verifying [on=complete, authority="human,agent"]
+  Verifying -> Review [on=complete, authority="human,agent"]
+  Review -> Done [on=approve]
+  Review -> Reworking [on=revise]
+  Reworking -> Verifying [on=complete, authority="human,agent"]
+
+  Autoplanning -> Investigating [on=failed]
+  Planning -> Investigating [on=failed, authority=human]
+  Implementing -> Investigating [on=failed, authority="human,agent"]
+  Verifying -> Investigating [on=failed, authority="human,agent"]
+  Reworking -> Investigating [on=failed, authority="human,agent"]
+  Investigating -> @resume [on=retry]
+  Investigating -> Blocked [on=blocked, authority="human,agent"]
+  Blocked -> Investigating [on=resume]
+
+  @any_nonterminal -> Canceled [on=cancel]
+  @any_nonterminal -> Duplicate [on=duplicate, authority="human,agent"]
+}

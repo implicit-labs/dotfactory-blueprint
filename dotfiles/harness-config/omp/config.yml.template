@@ -1,0 +1,31 @@
+setupVersion: 2
+web_search:
+  enabled: true
+fetch:
+  enabled: true
+providers:
+  fetch: auto
+computer:
+  enabled: true
+tools:
+  approvalMode: __APPROVAL_MODE__
+  artifactSpillThreshold: 16
+  artifactHeadBytes: 8
+  artifactTailBytes: 8
+  artifactTailLines: 200
+compaction:
+  thresholdTokens: 60000
+  methodOrder:
+    - remote
+    - soft
+async:
+  enabled: true
+task:
+  maxConcurrency: 2
+  maxRecursionDepth: 1
+bash:
+  autoBackground:
+    enabled: true
+    thresholdMs: 30000
+memory:
+  backend: local

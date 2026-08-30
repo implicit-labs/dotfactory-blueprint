@@ -1,0 +1,11 @@
+digraph ThreeStep {
+  start [shape=Mdiamond]
+  build [type=agent]
+  review [type=human]
+  done [shape=Msquare]
+
+  start -> build
+  build -> review
+  review -> done [on=approve]
+  review -> build [on=revise]
+}

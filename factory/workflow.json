@@ -1,0 +1,498 @@
+{
+  "schema_version": 2,
+  "name": "dotfactory-default",
+  "references": [
+    {
+      "name": "OpenAI Symphony default workflow",
+      "revision": "7af5a7648c9fbffa08825fe0c0b18be00100aff3",
+      "url": "https://github.com/openai/symphony/blob/7af5a7648c9fbffa08825fe0c0b18be00100aff3/elixir/WORKFLOW.md"
+    },
+    {
+      "name": "OpenAI Symphony service specification",
+      "revision": "8001b52e3062495a16e520e4ceaf8f9de868c4d0",
+      "url": "https://github.com/openai/symphony/blob/8001b52e3062495a16e520e4ceaf8f9de868c4d0/SPEC.md"
+    },
+    {
+      "name": "Legacy workflow contract",
+      "revision": "d422e10e383c6ec04abc4347ec47f33dcae0624a",
+      "url": "https://example.com/workflow-source"
+    }
+  ],
+  "semantics": {
+    "checkpoint": {
+      "can_rest": true,
+      "requires_active_attempt": false,
+      "meaning": "A durable condition waiting for a pickup, human decision, or terminal outcome."
+    },
+    "work": {
+      "can_rest": false,
+      "requires_active_attempt": true,
+      "required_attempt_fields": [
+        "owner",
+        "attempt_id",
+        "started_at",
+        "heartbeat_at"
+      ],
+      "meaning": "An owned operation in progress that must complete, recover, or block."
+    },
+    "edge_authority": {
+      "human": "A human decision or manual Linear action authorizes the edge.",
+      "agent": "Factory policy, a listener claim, or agent completion authorizes the edge.",
+      "both": "Either actor may authorize the edge independently; both approvals are not required.",
+      "signal": "The signal records how authority was expressed; it is not a third actor."
+    },
+    "ordinary_comments": "context_only",
+    "review_feedback": {
+      "required_when_leaving": "Review",
+      "required_fields": ["source", "kind", "author", "body", "url"],
+      "decision_kinds": {
+        "Done": "approval",
+        "Reworking": "changes_requested"
+      },
+      "rework_target": "next_attempt"
+    }
+  },
+  "scope": {
+    "entry_state": "Todo",
+    "main_checkpoints": ["Todo", "Ready", "Review"],
+    "external_linear_states": ["Triage", "Backlog"],
+    "terminal_states": ["Done", "Canceled", "Duplicate"]
+  },
+  "states": [
+    {
+      "id": "Todo",
+      "linear_status": "Todo",
+      "kind": "checkpoint",
+      "checkpoint_role": "pickup",
+      "meaning": "Committed work waiting for human planning or an automatic planner claim."
+    },
+    {
+      "id": "Autoplanning",
+      "linear_status": "Autoplanning",
+      "kind": "work",
+      "work_role": "planning",
+      "meaning": "An agent is producing the plan without a human planning session."
+    },
+    {
+      "id": "Planning",
+      "linear_status": "Planning",
+      "kind": "work",
+      "work_role": "planning",
+      "meaning": "A human-evoked planning session is active."
+    },
+    {
+      "id": "Ready",
+      "linear_status": "Ready",
+      "kind": "checkpoint",
+      "checkpoint_role": "pickup",
+      "meaning": "Planning is accepted and implementation may be claimed."
+    },
+    {
+      "id": "Implementing",
+      "linear_status": "Implementing",
+      "kind": "work",
+      "work_role": "delivery",
+      "meaning": "A human or agent is changing the product."
+    },
+    {
+      "id": "Verifying",
+      "linear_status": "Verifying",
+      "kind": "work",
+      "work_role": "verification",
+      "meaning": "A human or agent is producing and checking completion evidence."
+    },
+    {
+      "id": "Review",
+      "linear_status": "Review",
+      "kind": "checkpoint",
+      "checkpoint_role": "human",
+      "meaning": "Verified work is waiting for a human approval or changes decision."
+    },
+    {
+      "id": "Reworking",
+      "linear_status": "Reworking",
+      "kind": "work",
+      "work_role": "delivery",
+      "meaning": "A human or agent is addressing review feedback."
+    },
+    {
+      "id": "Investigating",
+      "linear_status": "Investigating",
+      "kind": "work",
+      "work_role": "recovery",
+      "meaning": "A human or agent is diagnosing a failed work attempt."
+    },
+    {
+      "id": "Blocked",
+      "linear_status": "Blocked",
+      "kind": "checkpoint",
+      "checkpoint_role": "human",
+      "meaning": "Recovery needs an external human decision or resource."
+    },
+    {
+      "id": "Done",
+      "linear_status": "Done",
+      "kind": "checkpoint",
+      "checkpoint_role": "terminal",
+      "meaning": "The issue reached its accepted outcome."
+    },
+    {
+      "id": "Canceled",
+      "linear_status": "Canceled",
+      "kind": "checkpoint",
+      "checkpoint_role": "terminal",
+      "meaning": "The issue will not be completed."
+    },
+    {
+      "id": "Duplicate",
+      "linear_status": "Duplicate",
+      "kind": "checkpoint",
+      "checkpoint_role": "terminal",
+      "meaning": "Another issue owns the work."
+    }
+  ],
+  "transitions": [
+    {
+      "id": "enter.todo",
+      "from": "@outside",
+      "to": "Todo",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"}
+      ],
+      "meaning": "A human commits an upstream issue to the factory."
+    },
+    {
+      "id": "todo.auto_plan",
+      "from": "Todo",
+      "to": "Autoplanning",
+      "evocations": [
+        {"actor": "agent", "signal": "listener_claim"}
+      ],
+      "meaning": "The automatic planner claims eligible work."
+    },
+    {
+      "id": "todo.plan",
+      "from": "Todo",
+      "to": "Planning",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "A human begins a planning session."
+    },
+    {
+      "id": "auto_plan.ready",
+      "from": "Autoplanning",
+      "to": "Ready",
+      "evocations": [
+        {"actor": "agent", "signal": "agent_handoff"}
+      ],
+      "meaning": "The automatic planner publishes an acceptable plan."
+    },
+    {
+      "id": "plan.ready",
+      "from": "Planning",
+      "to": "Ready",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "The human planning session accepts the plan."
+    },
+    {
+      "id": "ready.implement",
+      "from": "Ready",
+      "to": "Implementing",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "listener_claim"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "A human starts implementation or a builder claims it."
+    },
+    {
+      "id": "implement.verify",
+      "from": "Implementing",
+      "to": "Verifying",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "agent_handoff"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Implementation is ready for independent evidence."
+    },
+    {
+      "id": "verify.review",
+      "from": "Verifying",
+      "to": "Review",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "agent_handoff"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Verification passed and the output is ready for human judgment."
+    },
+    {
+      "id": "review.done",
+      "from": "Review",
+      "to": "Done",
+      "action": "approve",
+      "required_role": "approver",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "The human accepts the outcome."
+    },
+    {
+      "id": "review.rework",
+      "from": "Review",
+      "to": "Reworking",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "human", "signal": "structured_comment"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "The human requests changes with review context."
+    },
+    {
+      "id": "rework.verify",
+      "from": "Reworking",
+      "to": "Verifying",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "agent_handoff"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Review changes are ready for fresh verification."
+    },
+    {
+      "id": "auto_plan.investigate",
+      "from": "Autoplanning",
+      "to": "Investigating",
+      "evocations": [
+        {"actor": "agent", "signal": "recovery_requested"}
+      ],
+      "meaning": "Automatic planning failed and needs diagnosis."
+    },
+    {
+      "id": "plan.investigate",
+      "from": "Planning",
+      "to": "Investigating",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Planning failed and needs diagnosis."
+    },
+    {
+      "id": "implement.investigate",
+      "from": "Implementing",
+      "to": "Investigating",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "recovery_requested"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Implementation failed and needs diagnosis."
+    },
+    {
+      "id": "verify.investigate",
+      "from": "Verifying",
+      "to": "Investigating",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "recovery_requested"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Verification failed and needs diagnosis."
+    },
+    {
+      "id": "rework.investigate",
+      "from": "Reworking",
+      "to": "Investigating",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "recovery_requested"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Rework failed and needs diagnosis."
+    },
+    {
+      "id": "investigate.auto_plan",
+      "from": "Investigating",
+      "to": "Autoplanning",
+      "action": "retry",
+      "confirmation": true,
+      "condition": "resume_state == Autoplanning",
+      "evocations": [
+        {"actor": "agent", "signal": "agent_handoff"}
+      ],
+      "meaning": "Diagnosis resolved the automatic planning failure."
+    },
+    {
+      "id": "investigate.plan",
+      "from": "Investigating",
+      "to": "Planning",
+      "action": "retry",
+      "confirmation": true,
+      "condition": "resume_state == Planning",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Diagnosis resolved the planning failure."
+    },
+    {
+      "id": "investigate.implement",
+      "from": "Investigating",
+      "to": "Implementing",
+      "action": "retry",
+      "confirmation": true,
+      "condition": "resume_state == Implementing",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "agent_handoff"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Diagnosis resolved the implementation failure."
+    },
+    {
+      "id": "investigate.verify",
+      "from": "Investigating",
+      "to": "Verifying",
+      "action": "retry",
+      "confirmation": true,
+      "condition": "resume_state == Verifying",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "agent_handoff"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Diagnosis resolved the verification failure."
+    },
+    {
+      "id": "investigate.rework",
+      "from": "Investigating",
+      "to": "Reworking",
+      "action": "retry",
+      "confirmation": true,
+      "condition": "resume_state == Reworking",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "agent_handoff"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Diagnosis resolved the rework failure."
+    },
+    {
+      "id": "investigate.block",
+      "from": "Investigating",
+      "to": "Blocked",
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "agent_handoff"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "Diagnosis found a dependency that requires human intervention."
+    },
+    {
+      "id": "blocked.investigate",
+      "from": "Blocked",
+      "to": "Investigating",
+      "action": "retry",
+      "confirmation": true,
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "human", "signal": "structured_comment"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "The human supplies the missing decision or resource."
+    }
+  ],
+  "global_transitions": [
+    {
+      "id": "open.cancel",
+      "from": "@any_nonterminal",
+      "to": "Canceled",
+      "action": "cancel",
+      "confirmation": true,
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "A human cancels open work."
+    },
+    {
+      "id": "open.duplicate",
+      "from": "@any_nonterminal",
+      "to": "Duplicate",
+      "confirmation": true,
+      "evocations": [
+        {"actor": "human", "signal": "linear_status_change"},
+        {"actor": "agent", "signal": "agent_handoff"},
+        {"actor": "human", "signal": "control_command"}
+      ],
+      "meaning": "A human or agent links the canonical issue and closes the duplicate."
+    }
+  ],
+  "linear_migration": {
+    "rename": [
+      {"from": "Autoplan", "to": "Autoplanning"},
+      {"from": "In Review", "to": "Review"},
+      {"from": "Rework", "to": "Reworking"}
+    ],
+    "remove": [
+      {
+        "status": "In Progress",
+        "reason": "Generic activity duplicates every named work state."
+      }
+    ],
+    "outside_v1": [
+      {
+        "status": "Merging",
+        "reason": "Review completion goes directly to Done until landing needs its own observable attempt."
+      },
+      {
+        "status": "Triage",
+        "reason": "Intake precedes the factory entry checkpoint."
+      },
+      {
+        "status": "Backlog",
+        "reason": "Parking precedes the factory entry checkpoint."
+      }
+    ]
+  },
+  "reference_decisions": [
+    {
+      "source": "Symphony",
+      "decision": "adopt",
+      "subject": "Repository-owned workflow contract and listener claims"
+    },
+    {
+      "source": "Symphony",
+      "decision": "diverge",
+      "subject": "Replace generic In Progress with named work states"
+    },
+    {
+      "source": "Symphony",
+      "decision": "defer",
+      "subject": "Merging and land automation"
+    },
+    {
+      "source": "Autosymph",
+      "decision": "adopt",
+      "subject": "Separate planning, implementation, verification, review, rework, and recovery"
+    },
+    {
+      "source": "Autosymph",
+      "decision": "diverge",
+      "subject": "Keep verify-review internal instead of adding another Linear status"
+    },
+    {
+      "source": "Autosymph",
+      "decision": "diverge",
+      "subject": "Classify edge authority independently from visible status"
+    }
+  ]
+}
