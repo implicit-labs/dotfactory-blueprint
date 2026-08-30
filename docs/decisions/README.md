@@ -18,6 +18,7 @@ configured by dotfactory belong to their owning repository.
 | [0013](0013-schedule-from-durable-attempt-facts.md) | Schedule from durable attempt facts | Accepted | — |
 | [0014](0014-expand-readable-dot-before-execution.md) | Expand readable DOT before execution | Accepted | — |
 | [0015](0015-run-live-agents-through-versioned-protocols.md) | Run live agents through versioned protocols | Accepted | — |
+| [0017](0017-keep-execution-traces-authoritative.md) | Keep execution traces authoritative | Accepted | — |
 
 ## Lifecycle
 

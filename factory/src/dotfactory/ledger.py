@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -13,8 +14,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from .observability import (
+    ErrorFactV1, ProjectionReceiptV1, TraceRecordV1, canonical_json,
+    error_fingerprint, stable_record_id, stable_span_id, stable_trace_id,
+)
 
-SCHEMA_VERSION = 9
+
+SCHEMA_VERSION = 10
 
 LEGACY_STATE_IDS = {
     "todo": "Todo",
@@ -281,6 +287,7 @@ class SQLiteLedger:
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
+                self._create_schema_ten_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 1:
@@ -385,6 +392,7 @@ class SQLiteLedger:
                     self._create_schema_seven_additions(db)
                     self._create_schema_eight_additions(db)
                     self._create_schema_nine_additions(db)
+                    self._create_schema_ten_additions(db)
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             finally:
                 self.connection.execute(
@@ -404,6 +412,7 @@ class SQLiteLedger:
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
+                self._create_schema_ten_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 3:
@@ -414,6 +423,7 @@ class SQLiteLedger:
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
+                self._create_schema_ten_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 4:
@@ -423,6 +433,7 @@ class SQLiteLedger:
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
+                self._create_schema_ten_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 5:
@@ -431,6 +442,7 @@ class SQLiteLedger:
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
+                self._create_schema_ten_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 6:
@@ -438,17 +450,25 @@ class SQLiteLedger:
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
+                self._create_schema_ten_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 7:
             with self.transaction() as db:
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
+                self._create_schema_ten_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 8:
             with self.transaction() as db:
                 self._create_schema_nine_additions(db)
+                self._create_schema_ten_additions(db)
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            return
+        if version == 9:
+            with self.transaction() as db:
+                self._create_schema_ten_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         raise LedgerError(f"no migration from ledger schema {version}")
@@ -662,6 +682,459 @@ class SQLiteLedger:
             "ON runner_events(trace_id,sequence)"
         )
 
+    def _create_schema_ten_additions(self, db: sqlite3.Connection) -> None:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS trace_records ("
+            "seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "record_id TEXT NOT NULL UNIQUE,"
+            "source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_seq INTEGER,"
+            "execution_id TEXT NOT NULL REFERENCES workflow_executions(id),"
+            "state_run_id TEXT,attempt_id TEXT,runner_run_id TEXT,"
+            "trace_id TEXT NOT NULL,span_id TEXT NOT NULL,parent_span_id TEXT,"
+            "record_kind TEXT NOT NULL,domain TEXT NOT NULL,phase TEXT NOT NULL,"
+            "name TEXT NOT NULL,status TEXT NOT NULL,"
+            "entity_kind TEXT NOT NULL,entity_id TEXT NOT NULL,"
+            "started_at TEXT,ended_at TEXT,source_occurred_at TEXT,"
+            "observed_at TEXT NOT NULL,origin TEXT NOT NULL,trust_class TEXT NOT NULL,"
+            "ordering_quality TEXT NOT NULL,schema_version INTEGER NOT NULL,"
+            "links_json TEXT NOT NULL,completeness_json TEXT NOT NULL,"
+            "payload_json TEXT NOT NULL,created_at TEXT NOT NULL,"
+            "UNIQUE(source_kind,source_id))"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS trace_records_execution "
+            "ON trace_records(execution_id,seq)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS trace_records_trace "
+            "ON trace_records(trace_id,seq)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS trace_records_entity "
+            "ON trace_records(entity_kind,entity_id,seq)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS error_facts ("
+            "seq INTEGER PRIMARY KEY AUTOINCREMENT,error_id TEXT NOT NULL UNIQUE,"
+            "execution_id TEXT NOT NULL REFERENCES workflow_executions(id),"
+            "trace_record_id TEXT NOT NULL REFERENCES trace_records(record_id),"
+            "domain TEXT NOT NULL,phase TEXT NOT NULL,code TEXT NOT NULL,"
+            "category TEXT NOT NULL,severity TEXT NOT NULL,retryable INTEGER NOT NULL,"
+            "ambiguous_side_effect INTEGER NOT NULL,fingerprint TEXT NOT NULL,"
+            "fingerprint_version INTEGER NOT NULL,message TEXT NOT NULL,"
+            "safe_remedy TEXT NOT NULL,responsible_span_id TEXT,last_good_span_id TEXT,"
+            "first_failed_span_id TEXT,occurred_at TEXT NOT NULL,origin TEXT NOT NULL,"
+            "trust_class TEXT NOT NULL,capture_complete INTEGER NOT NULL,"
+            "completeness_json TEXT NOT NULL,schema_version INTEGER NOT NULL,"
+            "created_at TEXT NOT NULL,UNIQUE(trace_record_id))"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS error_facts_execution "
+            "ON error_facts(execution_id,seq)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS error_facts_fingerprint "
+            "ON error_facts(fingerprint,seq)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS projection_attempts ("
+            "id TEXT PRIMARY KEY,destination TEXT NOT NULL,command_id TEXT NOT NULL,"
+            "source_kind TEXT NOT NULL,from_source_seq INTEGER NOT NULL,"
+            "through_source_seq INTEGER NOT NULL,idempotency_key TEXT NOT NULL,"
+            "status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,"
+            "completed_at TEXT,UNIQUE(destination,command_id),"
+            "UNIQUE(destination,idempotency_key))"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS projection_attempts_status "
+            "ON projection_attempts(destination,status,created_at)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS projection_receipts ("
+            "seq INTEGER PRIMARY KEY AUTOINCREMENT,receipt_id TEXT NOT NULL UNIQUE,"
+            "attempt_id TEXT NOT NULL REFERENCES projection_attempts(id),"
+            "destination TEXT NOT NULL,source_record_id TEXT NOT NULL,"
+            "status TEXT NOT NULL,idempotency_key TEXT NOT NULL,external_id TEXT,"
+            "error_code TEXT,detail_json TEXT NOT NULL,schema_version INTEGER NOT NULL,"
+            "recorded_at TEXT NOT NULL,UNIQUE(attempt_id,idempotency_key))"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS projection_receipts_source "
+            "ON projection_receipts(destination,source_record_id,seq)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS projection_rejections ("
+            "receipt_id TEXT PRIMARY KEY REFERENCES projection_receipts(receipt_id),"
+            "attempt_id TEXT NOT NULL,destination TEXT NOT NULL,"
+            "source_record_id TEXT NOT NULL,error_code TEXT NOT NULL,"
+            "message TEXT NOT NULL,retryable INTEGER NOT NULL,created_at TEXT NOT NULL)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS projection_watermarks ("
+            "destination TEXT NOT NULL,source_kind TEXT NOT NULL,"
+            "through_source_seq INTEGER NOT NULL,attempt_id TEXT NOT NULL "
+            "REFERENCES projection_attempts(id),updated_at TEXT NOT NULL,"
+            "PRIMARY KEY(destination,source_kind))"
+        )
+        self._backfill_schema_ten(db)
+
+    @staticmethod
+    def _table_exists(db: sqlite3.Connection, table: str) -> bool:
+        return db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone() is not None
+
+    def _backfill_schema_ten(self, db: sqlite3.Connection) -> None:
+        if not self._table_exists(db, "events"):
+            return
+        existing = int(db.execute(
+            "SELECT COUNT(*) FROM trace_records"
+        ).fetchone()[0])
+        if existing:
+            return
+        affected: dict[str, dict[str, int]] = {}
+        for row in db.execute("SELECT * FROM events ORDER BY seq"):
+            payload = json.loads(row["payload_json"])
+            self._mirror_lifecycle_trace(
+                db, event_id=str(row["event_id"]), source_seq=int(row["seq"]),
+                execution_id=str(row["execution_id"]),
+                state_run_id=row["state_run_id"], attempt_id=row["attempt_id"],
+                event_type=str(row["event_type"]), payload=payload,
+                occurred_at=str(row["occurred_at"]), ordering_quality="reconstructed",
+                trust_class="reconstructed",
+            )
+            counts = affected.setdefault(str(row["execution_id"]), {"events": 0, "runner": 0})
+            counts["events"] += 1
+        if self._table_exists(db, "runner_events"):
+            for row in db.execute("SELECT * FROM runner_events ORDER BY seq"):
+                run = db.execute(
+                    "SELECT rr.*,a.state_run_id FROM runner_runs rr JOIN attempts a "
+                    "ON a.id=rr.attempt_id WHERE rr.id=?", (row["runner_run_id"],),
+                ).fetchone()
+                if not run:
+                    continue
+                self._mirror_runner_trace(db, row=row, run=run, reconstructed=True)
+                counts = affected.setdefault(
+                    str(row["execution_id"]), {"events": 0, "runner": 0}
+                )
+                counts["runner"] += 1
+        for execution_id in sorted(affected):
+            counts = affected[execution_id]
+            now = self.clock()
+            source_id = f"schema-9:{execution_id}"
+            record = TraceRecordV1(
+                record_id=stable_record_id("migration", source_id),
+                execution_id=execution_id, source_kind="migration", source_id=source_id,
+                record_kind="completeness", domain="observability", phase="migration",
+                name="schema_9_trace_reconstruction", status="incomplete",
+                entity_kind="execution", entity_id=execution_id,
+                trace_id=stable_trace_id(execution_id),
+                span_id=stable_span_id("migration", source_id),
+                origin="dotfactory-migration", trust_class="reconstructed",
+                observed_at=now, ordering_quality="reconstructed",
+                completeness={
+                    "complete": False,
+                    "reasons": ["reconstructed_order", "raw_stream_coverage_unknown"],
+                    "lifecycle_records": counts["events"],
+                    "runner_records": counts["runner"],
+                },
+                payload={"from_schema": 9, "to_schema": 10},
+            )
+            self._insert_trace_record(db, record)
+
+    @staticmethod
+    def _event_domain(event_type: str) -> str:
+        prefix = event_type.split("_", 1)[0]
+        return {
+            "execution": "workflow", "transition": "workflow", "linear": "workflow",
+            "scheduler": "scheduler", "preparation": "preparation",
+            "workspace": "workspace", "resource": "resource",
+            "runner": "runner", "cleanup": "cleanup", "attention": "attention",
+            "control": "control",
+        }.get(prefix, "kernel")
+
+    @staticmethod
+    def _event_status(event_type: str) -> str:
+        suffix = event_type.rsplit("_", 1)[-1]
+        if suffix in (
+            "failed", "error", "denied", "canceled", "superseded",
+            "quarantined", "busy", "attention",
+        ):
+            return "failed"
+        if suffix in (
+            "completed", "ready", "released", "resolved", "accepted",
+            "observed", "expired", "skipped", "result",
+        ):
+            return "completed"
+        if suffix in ("waiting", "requested"):
+            return "waiting"
+        return suffix
+
+    @staticmethod
+    def _event_record_kind(event_type: str) -> str:
+        status = SQLiteLedger._event_status(event_type)
+        if status == "failed":
+            return "error"
+        suffix = event_type.rsplit("_", 1)[-1]
+        if suffix in (
+            "started", "planned", "claimed", "preparing", "dispatching",
+            "completed", "ready", "released", "accepted", "failed",
+            "canceled", "superseded", "quarantined", "skipped",
+        ):
+            return "span"
+        return "event"
+
+    @staticmethod
+    def _trace_entity(
+        event_type: str, payload: dict[str, Any], execution_id: str,
+        state_run_id: str | None, attempt_id: str | None,
+    ) -> tuple[str, str]:
+        candidates = (
+            ("runner_run_id", "runner_run"), ("dispatch_id", "scheduler_dispatch"),
+            ("mutation_id", "resource_mutation"),
+            ("allocation_id", "resource_allocation"),
+            ("preparation_id", "preparation"), ("cleanup_id", "cleanup"),
+            ("workspace_id", "workspace"), ("attention_id", "attention"),
+            ("lease_id", "resource_lease"), ("command_id", "control_command"),
+        )
+        for key, kind in candidates:
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return kind, value
+        if event_type.startswith("execution_"):
+            return "execution", execution_id
+        if attempt_id:
+            return "attempt", attempt_id
+        if state_run_id:
+            return "state_run", state_run_id
+        return "execution", execution_id
+
+    @staticmethod
+    def _parent_span_id(
+        entity_kind: str, *, execution_id: str, state_run_id: str | None,
+        attempt_id: str | None, payload: dict[str, Any],
+    ) -> str | None:
+        if entity_kind == "execution":
+            return None
+        if entity_kind == "state_run":
+            return stable_span_id("execution", execution_id)
+        if entity_kind == "attempt":
+            parent_id = state_run_id or execution_id
+            parent_kind = "state_run" if state_run_id else "execution"
+            return stable_span_id(parent_kind, parent_id)
+        if entity_kind in ("resource_mutation", "resource_allocation"):
+            preparation_id = payload.get("preparation_id")
+            if isinstance(preparation_id, str) and preparation_id:
+                return stable_span_id("preparation", preparation_id)
+        if attempt_id:
+            return stable_span_id("attempt", attempt_id)
+        if state_run_id:
+            return stable_span_id("state_run", state_run_id)
+        return stable_span_id("execution", execution_id)
+
+    @staticmethod
+    def _event_times(event_type: str, occurred_at: str) -> tuple[str | None, str | None]:
+        suffix = event_type.rsplit("_", 1)[-1]
+        started_at = occurred_at if suffix in (
+            "started", "planned", "claimed", "preparing", "dispatching"
+        ) else None
+        ended_at = occurred_at if suffix in (
+            "completed", "ready", "released", "accepted", "failed", "canceled",
+            "superseded", "quarantined", "skipped", "expired",
+        ) else None
+        return started_at, ended_at
+
+    def _insert_trace_record(
+        self, db: sqlite3.Connection, record: TraceRecordV1,
+        *, source_seq: int | None = None,
+    ) -> int:
+        db.execute(
+            "INSERT INTO trace_records("
+            "record_id,source_kind,source_id,source_seq,execution_id,state_run_id,"
+            "attempt_id,runner_run_id,trace_id,span_id,parent_span_id,record_kind,"
+            "domain,phase,name,status,entity_kind,entity_id,started_at,ended_at,"
+            "source_occurred_at,observed_at,origin,trust_class,ordering_quality,"
+            "schema_version,links_json,completeness_json,payload_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record.record_id, record.source_kind, record.source_id, source_seq,
+                record.execution_id, record.state_run_id, record.attempt_id,
+                record.runner_run_id, record.trace_id or stable_trace_id(record.execution_id),
+                record.span_id or stable_span_id(record.source_kind, record.source_id),
+                record.parent_span_id, record.record_kind, record.domain, record.phase,
+                record.name, record.status, record.entity_kind, record.entity_id,
+                record.started_at, record.ended_at, record.source_occurred_at,
+                record.observed_at, record.origin, record.trust_class,
+                record.ordering_quality, record.schema_version,
+                canonical_json(record.links), canonical_json(record.completeness),
+                canonical_json(record.payload), self.clock(),
+            ),
+        )
+        return int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+    def _insert_error_fact(
+        self, db: sqlite3.Connection, record: TraceRecordV1,
+        error_source: Any,
+    ) -> None:
+        source = error_source if isinstance(error_source, dict) else {}
+        raw_message = source.get("message", source.get("excerpt", record.name))
+        message = str(redact_payload(str(raw_message)))[:2048]
+        raw_code = source.get("code")
+        code = str(raw_code) if isinstance(raw_code, (str, int)) else (
+            "DOTFACTORY_" + re.sub(r"[^A-Z0-9]+", "_", record.name.upper()).strip("_")
+        )
+        category = str(source.get("category", source.get("class", record.domain)))
+        fact = ErrorFactV1(
+            error_id=stable_record_id("error", record.record_id).replace("tr-", "err-", 1),
+            execution_id=record.execution_id, trace_record_id=record.record_id,
+            domain=record.domain, phase=record.phase, code=code,
+            category=category, severity=str(source.get("severity", "error")),
+            retryable=bool(source.get("retryable", False)),
+            ambiguous_side_effect=bool(source.get("ambiguous_side_effect", False)),
+            fingerprint=str(source.get("fingerprint") or error_fingerprint(
+                domain=record.domain, phase=record.phase, code=code, message=message,
+            )),
+            fingerprint_version=int(source.get("fingerprint_version", 1)),
+            message=message,
+            safe_remedy=str(source.get(
+                "safe_remedy", source.get(
+                    "remedy", "Inspect the linked trace record before retrying."
+                ),
+            )),
+            responsible_span_id=record.span_id,
+            last_good_span_id=source.get("last_good_span_id"),
+            first_failed_span_id=source.get("first_failed_span_id") or record.span_id,
+            occurred_at=record.source_occurred_at or record.observed_at,
+            origin=record.origin, trust_class=record.trust_class,
+            capture_complete=not bool(record.completeness),
+            completeness=record.completeness,
+        )
+        db.execute(
+            "INSERT INTO error_facts("
+            "error_id,execution_id,trace_record_id,domain,phase,code,category,severity,"
+            "retryable,ambiguous_side_effect,fingerprint,fingerprint_version,message,"
+            "safe_remedy,responsible_span_id,last_good_span_id,first_failed_span_id,"
+            "occurred_at,origin,trust_class,capture_complete,completeness_json,"
+            "schema_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                fact.error_id, fact.execution_id, fact.trace_record_id, fact.domain,
+                fact.phase, fact.code, fact.category, fact.severity, int(fact.retryable),
+                int(fact.ambiguous_side_effect), fact.fingerprint,
+                fact.fingerprint_version, fact.message, fact.safe_remedy,
+                fact.responsible_span_id, fact.last_good_span_id,
+                fact.first_failed_span_id, fact.occurred_at, fact.origin,
+                fact.trust_class, int(fact.capture_complete),
+                canonical_json(fact.completeness), fact.schema_version, self.clock(),
+            ),
+        )
+
+    def _mirror_lifecycle_trace(
+        self, db: sqlite3.Connection, *, event_id: str, source_seq: int,
+        execution_id: str, state_run_id: str | None, attempt_id: str | None,
+        event_type: str, payload: dict[str, Any], occurred_at: str,
+        ordering_quality: str = "exact", trust_class: str = "trusted-kernel",
+        source_kind: str = "event",
+    ) -> None:
+        payload = redact_payload(payload)
+        entity_kind, entity_id = self._trace_entity(
+            event_type, payload, execution_id, state_run_id, attempt_id
+        )
+        started_at, ended_at = self._event_times(event_type, occurred_at)
+        status = self._event_status(event_type)
+        record = TraceRecordV1(
+            record_id=stable_record_id(source_kind, event_id), execution_id=execution_id,
+            source_kind=source_kind, source_id=event_id,
+            state_run_id=state_run_id, attempt_id=attempt_id,
+            runner_run_id=(
+                str(payload["runner_run_id"])
+                if isinstance(payload.get("runner_run_id"), str) else None
+            ),
+            trace_id=stable_trace_id(execution_id),
+            span_id=stable_span_id(entity_kind, entity_id),
+            parent_span_id=self._parent_span_id(
+                entity_kind, execution_id=execution_id, state_run_id=state_run_id,
+                attempt_id=attempt_id, payload=payload,
+            ),
+            record_kind=self._event_record_kind(event_type),
+            domain=self._event_domain(event_type), phase=event_type,
+            name=event_type, status=status, entity_kind=entity_kind,
+            entity_id=entity_id, started_at=started_at, ended_at=ended_at,
+            source_occurred_at=occurred_at, observed_at=occurred_at,
+            origin="dotfactory-ledger", trust_class=trust_class,
+            ordering_quality=ordering_quality, payload=payload,
+        )
+        self._insert_trace_record(db, record, source_seq=source_seq)
+        if status == "failed":
+            error_source = payload.get("error", payload.get("result", payload))
+            self._insert_error_fact(db, record, error_source)
+
+    @staticmethod
+    def _runner_operation_id(payload: dict[str, Any]) -> str | None:
+        for key in ("toolCallId", "tool_call_id", "call_id", "id", "item_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _mirror_runner_trace(
+        self, db: sqlite3.Connection, *, row: sqlite3.Row, run: sqlite3.Row,
+        reconstructed: bool = False,
+    ) -> None:
+        payload = json.loads(row["payload_json"])
+        operation_id = self._runner_operation_id(payload)
+        span_id = (
+            stable_span_id("runner-operation", f"{row['runner_run_id']}:{operation_id}")
+            if operation_id else str(row["span_id"])
+        )
+        kind = str(row["kind"])
+        parent_span_id = row["parent_span_id"]
+        if kind == "tool_result" and operation_id and parent_span_id:
+            opening = db.execute(
+                "SELECT parent_span_id FROM runner_events WHERE runner_run_id=? "
+                "AND span_id=? ORDER BY sequence LIMIT 1",
+                (row["runner_run_id"], parent_span_id),
+            ).fetchone()
+            if opening:
+                parent_span_id = opening["parent_span_id"]
+        started_at = str(row["observed_at"]) if kind == "tool_call" else None
+        ended_at = str(row["observed_at"]) if kind == "tool_result" else None
+        completeness: dict[str, Any] = {}
+        if int(row["truncated"]):
+            completeness = {"complete": False, "reasons": ["payload_truncated"]}
+        if str(row["protocol_type"]) == "dotfactory.capture_dropped":
+            completeness = {
+                "complete": False, "reasons": ["records_dropped"],
+                "dropped_records": int(payload.get("dropped_events", 1)),
+            }
+        record = TraceRecordV1(
+            record_id=stable_record_id("runner_event", str(row["event_id"])),
+            execution_id=str(row["execution_id"]), source_kind="runner_event",
+            source_id=str(row["event_id"]), state_run_id=run["state_run_id"],
+            attempt_id=str(row["attempt_id"]), runner_run_id=str(row["runner_run_id"]),
+            trace_id=stable_trace_id(str(row["execution_id"])), span_id=span_id,
+            parent_span_id=parent_span_id,
+            record_kind=(
+                "error" if kind == "error" else
+                "span" if kind in ("tool_call", "tool_result") else "event"
+            ),
+            domain="runner", phase=str(row["protocol_type"]),
+            name=kind, status="failed" if kind == "error" else (
+                "started" if kind == "tool_call" else
+                "completed" if kind in ("tool_result", "terminal") else "observed"
+            ),
+            entity_kind="runner_operation" if operation_id else "runner_run",
+            entity_id=operation_id or str(row["runner_run_id"]),
+            started_at=started_at, ended_at=ended_at,
+            source_occurred_at=row["source_occurred_at"],
+            observed_at=str(row["observed_at"]), origin=str(row["origin"]),
+            trust_class=("reconstructed" if reconstructed else str(row["trust_class"])),
+            ordering_quality="reconstructed" if reconstructed else "exact",
+            completeness=completeness, payload=payload,
+        )
+        self._insert_trace_record(db, record, source_seq=int(row["seq"]))
+        if kind == "error":
+            self._insert_error_fact(db, record, payload)
+
     def _event(
         self,
         db: sqlite3.Connection,
@@ -674,17 +1147,26 @@ class SQLiteLedger:
         idempotency_key: str,
         destinations: tuple[str, ...] = ("linear", "logfire"),
     ) -> int:
+        event_id = self.id_factory()
+        occurred_at = self.clock()
+        redacted = redact_payload(payload)
         db.execute(
             "INSERT INTO events(event_id,execution_id,state_run_id,attempt_id,event_type,"
             "schema_version,occurred_at,payload_json,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?)",
-            (self.id_factory(), execution_id, state_run_id, attempt_id, event_type, 1,
-             self.clock(), json.dumps(redact_payload(payload), sort_keys=True), idempotency_key),
+            (event_id, execution_id, state_run_id, attempt_id, event_type, 1,
+             occurred_at, canonical_json(redacted), idempotency_key),
         )
+        self._fault("after_trace_source_recorded")
         seq = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+        self._mirror_lifecycle_trace(
+            db, event_id=event_id, source_seq=seq, execution_id=execution_id,
+            state_run_id=state_run_id, attempt_id=attempt_id,
+            event_type=event_type, payload=redacted, occurred_at=occurred_at,
+        )
         for destination in destinations:
             db.execute(
                 "INSERT INTO outbox(id,destination,event_seq,status,created_at) VALUES(?,?,?,?,?)",
-                (self.id_factory(), destination, seq, "pending", self.clock()),
+                (self.id_factory(), destination, seq, "pending", occurred_at),
             )
         return seq
 
@@ -1414,11 +1896,16 @@ class SQLiteLedger:
                  kind, protocol_type, stream, source_occurred_at, observed_at,
                  origin, trust_class, encoded.decode("utf-8"), payload_bytes, truncated),
             )
+            self._fault("after_runner_trace_source_recorded")
             db.execute(
                 "UPDATE runner_runs SET event_count=?,last_activity_at=?,"
                 "session_id=COALESCE(?,session_id) WHERE id=?",
                 (sequence, observed_at, session_id, runner_run_id),
             )
+            stored = db.execute(
+                "SELECT * FROM runner_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            self._mirror_runner_trace(db, row=stored, run=run)
         return {
             "event_id": event_id, "runner_run_id": runner_run_id,
             "sequence": sequence, "truncated": bool(truncated),
@@ -3568,6 +4055,50 @@ class SQLiteLedger:
             result.append(item)
         return result
 
+    @staticmethod
+    def _bounded_page(after_seq: int, limit: int) -> None:
+        if after_seq < 0:
+            raise LedgerError("page sequence cannot be negative")
+        if limit < 1 or limit > 1000:
+            raise LedgerError("page limit must be between 1 and 1000")
+
+    @staticmethod
+    def _trace_record_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["links"] = json.loads(item.pop("links_json"))
+        item["completeness"] = json.loads(item.pop("completeness_json"))
+        item["payload"] = json.loads(item.pop("payload_json"))
+        return item
+
+    def trace_page(
+        self, execution_id: str, *, after_seq: int = 0, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        self._bounded_page(after_seq, limit)
+        rows = self.connection.execute(
+            "SELECT * FROM trace_records WHERE execution_id=? AND seq>? "
+            "ORDER BY seq LIMIT ?", (execution_id, after_seq, limit),
+        ).fetchall()
+        return [self._trace_record_dict(row) for row in rows]
+
+    @staticmethod
+    def _error_fact_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["retryable"] = bool(item["retryable"])
+        item["ambiguous_side_effect"] = bool(item["ambiguous_side_effect"])
+        item["capture_complete"] = bool(item["capture_complete"])
+        item["completeness"] = json.loads(item.pop("completeness_json"))
+        return item
+
+    def error_page(
+        self, execution_id: str, *, after_seq: int = 0, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        self._bounded_page(after_seq, limit)
+        rows = self.connection.execute(
+            "SELECT * FROM error_facts WHERE execution_id=? AND seq>? "
+            "ORDER BY seq LIMIT ?", (execution_id, after_seq, limit),
+        ).fetchall()
+        return [self._error_fact_dict(row) for row in rows]
+
     def artifacts_page(
         self, execution_id: str, *, kind: str | None = None, limit: int = 25,
         before_created_at: str | None = None, before_id: str | None = None,
@@ -3693,11 +4224,31 @@ class SQLiteLedger:
         self, db: sqlite3.Connection, command_id: str, event_type: str,
         payload: dict[str, Any],
     ) -> None:
-        db.execute(
+        event_id = self.id_factory()
+        occurred_at = self.clock()
+        redacted = redact_payload({"command_id": command_id, **payload})
+        inserted = db.execute(
             "INSERT OR IGNORE INTO control_command_events "
             "(event_id,command_id,event_type,occurred_at,payload_json) VALUES(?,?,?,?,?)",
-            (self.id_factory(), command_id, event_type, self.clock(),
-             json.dumps(redact_payload(payload), sort_keys=True)),
+            (event_id, command_id, event_type, occurred_at, canonical_json(redacted)),
+        )
+        if inserted.rowcount != 1:
+            return
+        self._fault("after_control_trace_source_recorded")
+        source_seq = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+        context = db.execute(
+            "SELECT cc.execution_id,we.current_state_run_id,a.id AS attempt_id "
+            "FROM control_commands cc JOIN workflow_executions we "
+            "ON we.id=cc.execution_id LEFT JOIN attempts a "
+            "ON a.state_run_id=we.current_state_run_id AND a.status='active' "
+            "WHERE cc.command_id=?", (command_id,),
+        ).fetchone()
+        self._mirror_lifecycle_trace(
+            db, event_id=event_id, source_seq=source_seq,
+            execution_id=str(context["execution_id"]),
+            state_run_id=context["current_state_run_id"],
+            attempt_id=context["attempt_id"], event_type=event_type,
+            payload=redacted, occurred_at=occurred_at, source_kind="control_event",
         )
 
     def begin_control_command(
@@ -3812,6 +4363,332 @@ class SQLiteLedger:
             (destination, limit),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def start_projection_attempt(
+        self, destination: str, *, command_id: str, idempotency_key: str,
+        source_kind: str = "trace_record", from_source_seq: int = 1,
+        through_source_seq: int | None = None,
+    ) -> dict[str, Any]:
+        for value, name in (
+            (destination, "destination"), (command_id, "command ID"),
+            (idempotency_key, "idempotency key"), (source_kind, "source kind"),
+        ):
+            if not value.strip():
+                raise LedgerError(f"projection {name} is required")
+        if from_source_seq < 1:
+            raise LedgerError("projection range must start at sequence 1 or later")
+        if through_source_seq is None:
+            if source_kind != "trace_record":
+                raise LedgerError("non-trace projections require a fixed through sequence")
+            through_source_seq = int(self.connection.execute(
+                "SELECT COALESCE(MAX(seq),0) FROM trace_records"
+            ).fetchone()[0])
+            through_source_seq = max(through_source_seq, from_source_seq - 1)
+        if through_source_seq < from_source_seq - 1:
+            raise LedgerError("projection range ends before it starts")
+        prior = self.connection.execute(
+            "SELECT * FROM projection_attempts WHERE destination=? "
+            "AND (command_id=? OR idempotency_key=?)",
+            (destination, command_id, idempotency_key),
+        ).fetchone()
+        expected = (
+            command_id, source_kind, from_source_seq, through_source_seq,
+            idempotency_key,
+        )
+        if prior:
+            observed = tuple(prior[key] for key in (
+                "command_id", "source_kind", "from_source_seq",
+                "through_source_seq", "idempotency_key",
+            ))
+            if observed != expected:
+                raise LedgerError("projection attempt identity was reused with new inputs")
+            return self.projection_attempt(str(prior["id"]))
+        attempt_id = self.id_factory()
+        now = self.clock()
+        empty = through_source_seq < from_source_seq
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO projection_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    attempt_id, destination, command_id, source_kind,
+                    from_source_seq, through_source_seq, idempotency_key,
+                    "completed" if empty else "running", now, now,
+                    now if empty else None,
+                ),
+            )
+        return self.projection_attempt(attempt_id)
+
+    def projection_attempt(self, attempt_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT pa.*,COUNT(pr.receipt_id) AS receipt_count,"
+            "COALESCE(SUM(CASE WHEN pr.status='accepted' THEN 1 ELSE 0 END),0) "
+            "AS accepted_count,"
+            "COALESCE(SUM(CASE WHEN pr.status='rejected' THEN 1 ELSE 0 END),0) "
+            "AS rejected_count,"
+            "COALESCE(SUM(CASE WHEN pr.status='duplicate' THEN 1 ELSE 0 END),0) "
+            "AS duplicate_count FROM projection_attempts pa "
+            "LEFT JOIN projection_receipts pr ON pr.attempt_id=pa.id "
+            "WHERE pa.id=? GROUP BY pa.id", (attempt_id,),
+        ).fetchone()
+        if not row:
+            raise LedgerError("projection attempt not found")
+        return dict(row)
+
+    def resume_projection_attempt(self, attempt_id: str) -> dict[str, Any]:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM projection_attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+            if not row:
+                raise LedgerError("projection attempt not found")
+            if row["status"] != "completed":
+                db.execute(
+                    "UPDATE projection_attempts SET status='running',updated_at=?,"
+                    "completed_at=NULL WHERE id=?", (self.clock(), attempt_id),
+                )
+        return self.projection_attempt(attempt_id)
+
+    def pending_projection_records(
+        self, attempt_id: str, *, after_source_seq: int = 0, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        self._bounded_page(after_source_seq, limit)
+        attempt = self.connection.execute(
+            "SELECT * FROM projection_attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+        if not attempt:
+            raise LedgerError("projection attempt not found")
+        if attempt["source_kind"] != "trace_record":
+            raise LedgerError("projection source does not support ledger record paging")
+        rows = self.connection.execute(
+            "SELECT tr.* FROM trace_records tr WHERE tr.seq BETWEEN ? AND ? "
+            "AND tr.seq>? AND NOT EXISTS ("
+            "SELECT 1 FROM projection_receipts pr WHERE pr.attempt_id=? "
+            "AND pr.source_record_id=tr.record_id "
+            "AND pr.status IN ('accepted','duplicate')) ORDER BY tr.seq LIMIT ?",
+            (
+                attempt["from_source_seq"], attempt["through_source_seq"],
+                after_source_seq, attempt_id, limit,
+            ),
+        ).fetchall()
+        return [self._trace_record_dict(row) for row in rows]
+
+    def record_projection_receipt(
+        self, receipt: ProjectionReceiptV1, *,
+        rejection: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized = ProjectionReceiptV1(
+            receipt_id=receipt.receipt_id, attempt_id=receipt.attempt_id,
+            destination=receipt.destination, source_record_id=receipt.source_record_id,
+            status=receipt.status, idempotency_key=receipt.idempotency_key,
+            recorded_at=receipt.recorded_at, external_id=receipt.external_id,
+            error_code=receipt.error_code, detail=redact_payload(dict(receipt.detail)),
+        )
+        prior = self.connection.execute(
+            "SELECT * FROM projection_receipts WHERE receipt_id=? OR "
+            "(attempt_id=? AND idempotency_key=?)",
+            (normalized.receipt_id, normalized.attempt_id, normalized.idempotency_key),
+        ).fetchone()
+        if prior:
+            observed = (
+                prior["receipt_id"], prior["attempt_id"], prior["destination"],
+                prior["source_record_id"], prior["status"], prior["idempotency_key"],
+                prior["recorded_at"], prior["external_id"], prior["error_code"],
+                prior["detail_json"], int(prior["schema_version"]),
+            )
+            expected = (
+                normalized.receipt_id, normalized.attempt_id, normalized.destination,
+                normalized.source_record_id, normalized.status,
+                normalized.idempotency_key, normalized.recorded_at,
+                normalized.external_id, normalized.error_code,
+                canonical_json(normalized.detail), normalized.schema_version,
+            )
+            if observed != expected:
+                raise LedgerError("projection receipt identity was reused with new inputs")
+            return self._projection_receipt_dict(prior)
+        with self.transaction() as db:
+            attempt = db.execute(
+                "SELECT * FROM projection_attempts WHERE id=?", (normalized.attempt_id,)
+            ).fetchone()
+            if not attempt:
+                raise LedgerError("projection attempt not found")
+            if attempt["destination"] != normalized.destination:
+                raise LedgerError("projection receipt destination does not match attempt")
+            source_record = None
+            if attempt["source_kind"] == "trace_record":
+                source_record = db.execute(
+                    "SELECT * FROM trace_records WHERE record_id=? AND seq BETWEEN ? AND ?",
+                    (
+                        normalized.source_record_id, attempt["from_source_seq"],
+                        attempt["through_source_seq"],
+                    ),
+                ).fetchone()
+                if not source_record:
+                    raise LedgerError("projection receipt is outside the fixed source range")
+            db.execute(
+                "INSERT INTO projection_receipts("
+                "receipt_id,attempt_id,destination,source_record_id,status,"
+                "idempotency_key,external_id,error_code,detail_json,schema_version,"
+                "recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    normalized.receipt_id, normalized.attempt_id,
+                    normalized.destination, normalized.source_record_id,
+                    normalized.status, normalized.idempotency_key,
+                    normalized.external_id, normalized.error_code,
+                    canonical_json(normalized.detail), normalized.schema_version,
+                    normalized.recorded_at,
+                ),
+            )
+            self._fault("after_projection_receipt_recorded")
+            if normalized.status == "rejected":
+                details = redact_payload(dict(rejection or {}))
+                error_code = str(normalized.error_code or details.get(
+                    "code", "PROJECTION_REJECTED"
+                ))
+                message = str(details.get("message", "destination rejected record"))[:2048]
+                db.execute(
+                    "INSERT INTO projection_rejections VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        normalized.receipt_id, normalized.attempt_id,
+                        normalized.destination, normalized.source_record_id,
+                        error_code, message, int(bool(details.get("retryable", True))),
+                        normalized.recorded_at,
+                    ),
+                )
+                db.execute(
+                    "UPDATE projection_attempts SET status='paused',updated_at=? "
+                    "WHERE id=?", (normalized.recorded_at, normalized.attempt_id),
+                )
+            else:
+                db.execute(
+                    "UPDATE projection_attempts SET updated_at=? WHERE id=?",
+                    (normalized.recorded_at, normalized.attempt_id),
+                )
+            if source_record:
+                links = ({
+                    "type": "asynchronous_projection",
+                    "record_id": normalized.source_record_id,
+                },)
+                record = TraceRecordV1(
+                    record_id=stable_record_id(
+                        "projection_receipt", normalized.receipt_id
+                    ),
+                    execution_id=str(source_record["execution_id"]),
+                    source_kind="projection_receipt",
+                    source_id=normalized.receipt_id,
+                    state_run_id=source_record["state_run_id"],
+                    attempt_id=source_record["attempt_id"],
+                    trace_id=stable_trace_id(str(source_record["execution_id"])),
+                    span_id=stable_span_id(
+                        "projection_receipt", normalized.receipt_id
+                    ),
+                    record_kind=(
+                        "error" if normalized.status == "rejected" else "event"
+                    ),
+                    domain="projection", phase="delivery",
+                    name=f"projection_item_{normalized.status}",
+                    status="failed" if normalized.status == "rejected" else "completed",
+                    entity_kind="projection_attempt",
+                    entity_id=normalized.attempt_id,
+                    observed_at=normalized.recorded_at,
+                    source_occurred_at=normalized.recorded_at,
+                    origin="dotfactory-projection",
+                    trust_class="trusted-runtime", links=links,
+                    completeness=(
+                        {"complete": False, "reasons": ["projection_rejected"]}
+                        if normalized.status == "rejected" else {}
+                    ),
+                    payload={
+                        "destination": normalized.destination,
+                        "source_record_id": normalized.source_record_id,
+                        "receipt_status": normalized.status,
+                        "error_code": normalized.error_code,
+                    },
+                )
+                self._insert_trace_record(db, record)
+                if normalized.status == "rejected":
+                    self._insert_error_fact(db, record, {
+                        **redact_payload(dict(rejection or {})),
+                        "code": normalized.error_code or "PROJECTION_REJECTED",
+                    })
+        row = self.connection.execute(
+            "SELECT * FROM projection_receipts WHERE receipt_id=?",
+            (normalized.receipt_id,),
+        ).fetchone()
+        return self._projection_receipt_dict(row)
+
+    @staticmethod
+    def _projection_receipt_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["detail"] = json.loads(item.pop("detail_json"))
+        return item
+
+    def projection_receipts_page(
+        self, attempt_id: str, *, after_seq: int = 0, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        self._bounded_page(after_seq, limit)
+        rows = self.connection.execute(
+            "SELECT * FROM projection_receipts WHERE attempt_id=? AND seq>? "
+            "ORDER BY seq LIMIT ?", (attempt_id, after_seq, limit),
+        ).fetchall()
+        return [self._projection_receipt_dict(row) for row in rows]
+
+    def advance_projection_watermark(
+        self, attempt_id: str, *, through_source_seq: int,
+    ) -> dict[str, Any]:
+        with self.transaction() as db:
+            attempt = db.execute(
+                "SELECT * FROM projection_attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+            if not attempt:
+                raise LedgerError("projection attempt not found")
+            if not (
+                int(attempt["from_source_seq"]) - 1 <= through_source_seq
+                <= int(attempt["through_source_seq"])
+            ):
+                raise LedgerError("projection watermark is outside the fixed source range")
+            if attempt["source_kind"] == "trace_record":
+                missing = int(db.execute(
+                    "SELECT COUNT(*) FROM trace_records tr WHERE tr.seq BETWEEN ? AND ? "
+                    "AND NOT EXISTS (SELECT 1 FROM projection_receipts pr "
+                    "WHERE pr.attempt_id=? AND pr.source_record_id=tr.record_id "
+                    "AND pr.status IN ('accepted','duplicate'))",
+                    (attempt["from_source_seq"], through_source_seq, attempt_id),
+                ).fetchone()[0])
+                if missing:
+                    raise LedgerError("projection watermark would skip unaccepted records")
+            prior = db.execute(
+                "SELECT * FROM projection_watermarks WHERE destination=? AND source_kind=?",
+                (attempt["destination"], attempt["source_kind"]),
+            ).fetchone()
+            if prior and int(prior["through_source_seq"]) > through_source_seq:
+                raise LedgerError("projection watermark cannot move backward")
+            now = self.clock()
+            if prior:
+                db.execute(
+                    "UPDATE projection_watermarks SET through_source_seq=?,attempt_id=?,"
+                    "updated_at=? WHERE destination=? AND source_kind=?",
+                    (
+                        through_source_seq, attempt_id, now, attempt["destination"],
+                        attempt["source_kind"],
+                    ),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO projection_watermarks VALUES(?,?,?,?,?)",
+                    (
+                        attempt["destination"], attempt["source_kind"],
+                        through_source_seq, attempt_id, now,
+                    ),
+                )
+            if through_source_seq == int(attempt["through_source_seq"]):
+                db.execute(
+                    "UPDATE projection_attempts SET status='completed',updated_at=?,"
+                    "completed_at=? WHERE id=?", (now, now, attempt_id),
+                )
+        return dict(self.connection.execute(
+            "SELECT * FROM projection_watermarks WHERE destination=? AND source_kind=?",
+            (attempt["destination"], attempt["source_kind"]),
+        ).fetchone())
 
     def start_projection_rebuild(
         self, destination: str, *, command_id: str, requested_by: str,

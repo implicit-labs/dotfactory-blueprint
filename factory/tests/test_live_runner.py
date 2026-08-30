@@ -126,7 +126,7 @@ class LiveRunnerTests(unittest.TestCase):
             self.assertNotIn("secret", " ".join(command).lower())
 
     def test_prompt_requires_an_immutable_snapshot(self):
-        _kernel, _execution, launch = self.launch("codex")
+        _kernel, execution, launch = self.launch("codex")
         with self.assertRaisesRegex(RunnerProtocolError, "immutable prompt text"):
             CodexAdapter().stdin(launch, prompt_text="")
 
@@ -284,7 +284,7 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertEqual("not installed", missing.reason)
 
     def test_live_supervisor_drains_both_streams_and_persists_trace_receipt(self):
-        _kernel, _execution, launch = self.launch("codex")
+        _kernel, execution, launch = self.launch("codex")
         secret = "-".join(("fixture", "secret", "value"))
         lines = self.lines("codex-0.147.0-success.jsonl")
         executable = self.executable(f"""
@@ -322,9 +322,15 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertNotIn(secret, durable)
         self.assertNotIn("dotfactory_result", durable)
         self.assertEqual(0, stored["receipt"]["exit_code"])
+        runner_trace = [
+            item for item in self.ledger.trace_page(execution, limit=1000)
+            if item["source_kind"] == "runner_event"
+        ]
+        self.assertEqual(len(stored["events"]), len(runner_trace))
+        self.assertNotIn(secret, json.dumps(runner_trace, sort_keys=True))
 
     def test_tool_result_span_is_parented_to_its_tool_call(self):
-        _kernel, _execution, launch = self.launch("codex")
+        _kernel, execution, launch = self.launch("codex")
         proof = {
             "dotfactory_result": 1, "outcome": "succeeded",
             "preferred_label": "complete",
@@ -372,9 +378,18 @@ class LiveRunnerTests(unittest.TestCase):
             event for event in events if event["kind"] == "tool_result"
         )
         self.assertEqual(tool_call["span_id"], tool_result["parent_span_id"])
+        trace = self.ledger.trace_page(execution, limit=1000)
+        tool_spans = [
+            item for item in trace
+            if item["source_kind"] == "runner_event"
+            and item["entity_id"] == "tool-1"
+        ]
+        self.assertEqual(2, len(tool_spans))
+        self.assertEqual(tool_spans[0]["span_id"], tool_spans[1]["span_id"])
+        self.assertEqual(tool_spans[0]["parent_span_id"], tool_spans[1]["parent_span_id"])
 
     def test_silence_timeout_terminates_owned_runner_and_records_error(self):
-        _kernel, _execution, launch = self.launch("codex")
+        _kernel, execution, launch = self.launch("codex")
         executable = self.executable("""
             import sys
             import time
@@ -397,6 +412,8 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertEqual("failed", stored["status"])
         self.assertEqual("timeout", stored["error"]["class"])
         self.assertTrue(stored["error"]["retryable"])
+        errors = self.ledger.error_page(execution)
+        self.assertTrue(any(item["category"] == "timeout" for item in errors))
         with self.assertRaises(ProcessLookupError):
             os.kill(int(stored["pid"]), 0)
 
@@ -632,7 +649,7 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertIsNone(stored["result"])
 
     def test_event_limit_records_capture_drop_before_failing(self):
-        _kernel, _execution, launch = self.launch("codex")
+        _kernel, execution, launch = self.launch("codex")
         lines = self.lines("codex-0.147.0-success.jsonl")
         executable = self.executable(f"""
             import sys
@@ -659,6 +676,11 @@ class LiveRunnerTests(unittest.TestCase):
             event["protocol_type"] == "dotfactory.capture_dropped"
             for event in stored["events"]
         ))
+        capture = [
+            item for item in self.ledger.trace_page(execution, limit=1000)
+            if item["phase"] == "dotfactory.capture_dropped"
+        ]
+        self.assertEqual(["records_dropped"], capture[0]["completeness"]["reasons"])
 
     def test_oversized_event_payload_is_replaced_by_capture_metadata(self):
         _kernel, _execution, launch = self.launch("codex")
@@ -733,7 +755,7 @@ class LiveRunnerTests(unittest.TestCase):
         database.commit()
         database.close()
         migrated = SQLiteLedger(path)
-        self.assertEqual(9, migrated.connection.execute(
+        self.assertEqual(10, migrated.connection.execute(
             "PRAGMA user_version"
         ).fetchone()[0])
         tables = {

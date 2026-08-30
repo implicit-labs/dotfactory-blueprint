@@ -858,7 +858,7 @@ class LedgerMigrationTests(unittest.TestCase):
                 "workflow_snapshots", "execution_workflow_snapshots", "attempt_bindings"
             }.issubset(tables))
             self.assertEqual(
-                9, ledger.connection.execute("PRAGMA user_version").fetchone()[0]
+                10, ledger.connection.execute("PRAGMA user_version").fetchone()[0]
             )
             ledger.close()
 
@@ -881,7 +881,7 @@ class LedgerMigrationTests(unittest.TestCase):
             }
             self.assertIn("requested_by", columns)
             self.assertIn("through_event_seq", columns)
-            self.assertEqual(9, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(10, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
             ledger.close()
 
     def test_schema_one_gains_project_execution_and_exact_status_identity(self):
@@ -966,7 +966,7 @@ class LedgerMigrationTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM work_items WHERE identifier='TASK-567'"
             ).fetchone()[0]
             self.assertEqual(2, count)
-            self.assertEqual(9, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(10, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
             ledger.close()
 
 
