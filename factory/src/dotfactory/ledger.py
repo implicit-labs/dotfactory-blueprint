@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 LEGACY_STATE_IDS = {
     "todo": "Todo",
@@ -279,6 +280,7 @@ class SQLiteLedger:
                 self._create_schema_six_additions(db)
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
+                self._create_schema_nine_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 1:
@@ -382,6 +384,7 @@ class SQLiteLedger:
                     self._create_schema_six_additions(db)
                     self._create_schema_seven_additions(db)
                     self._create_schema_eight_additions(db)
+                    self._create_schema_nine_additions(db)
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             finally:
                 self.connection.execute(
@@ -400,6 +403,7 @@ class SQLiteLedger:
                 self._create_schema_six_additions(db)
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
+                self._create_schema_nine_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 3:
@@ -409,6 +413,7 @@ class SQLiteLedger:
                 self._create_schema_six_additions(db)
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
+                self._create_schema_nine_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 4:
@@ -417,6 +422,7 @@ class SQLiteLedger:
                 self._create_schema_six_additions(db)
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
+                self._create_schema_nine_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 5:
@@ -424,17 +430,25 @@ class SQLiteLedger:
                 self._create_schema_six_additions(db)
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
+                self._create_schema_nine_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 6:
             with self.transaction() as db:
                 self._create_schema_seven_additions(db)
                 self._create_schema_eight_additions(db)
+                self._create_schema_nine_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 7:
             with self.transaction() as db:
                 self._create_schema_eight_additions(db)
+                self._create_schema_nine_additions(db)
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            return
+        if version == 8:
+            with self.transaction() as db:
+                self._create_schema_nine_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         raise LedgerError(f"no migration from ledger schema {version}")
@@ -601,6 +615,51 @@ class SQLiteLedger:
         db.execute(
             "CREATE INDEX IF NOT EXISTS scheduler_dispatch_status "
             "ON scheduler_dispatches(status,available_at,expires_at)"
+        )
+
+    def _create_schema_nine_additions(self, db: sqlite3.Connection) -> None:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS runner_runs ("
+            "id TEXT PRIMARY KEY,"
+            "execution_id TEXT NOT NULL REFERENCES workflow_executions(id),"
+            "attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id),"
+            "preparation_id TEXT NOT NULL REFERENCES preparations(id),"
+            "fence_token TEXT NOT NULL,runner_key TEXT NOT NULL,"
+            "adapter_kind TEXT NOT NULL,adapter_version TEXT NOT NULL,"
+            "protocol_version INTEGER NOT NULL,"
+            "execution_trace_id TEXT NOT NULL,trace_id TEXT NOT NULL,"
+            "root_span_id TEXT NOT NULL,parent_trace_id TEXT,"
+            "status TEXT NOT NULL,command_json TEXT NOT NULL,"
+            "command_digest TEXT NOT NULL,prompt_digest TEXT NOT NULL,"
+            "host_id TEXT NOT NULL,boot_id TEXT NOT NULL,"
+            "pid INTEGER,process_group_id INTEGER,session_id TEXT,"
+            "attention_id TEXT REFERENCES attention_requests(id),"
+            "resume_count INTEGER NOT NULL DEFAULT 0,"
+            "event_count INTEGER NOT NULL DEFAULT 0,"
+            "dropped_event_count INTEGER NOT NULL DEFAULT 0,"
+            "result_json TEXT,receipt_json TEXT,error_json TEXT,"
+            "created_at TEXT NOT NULL,started_at TEXT,last_activity_at TEXT,"
+            "completed_at TEXT)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS runner_runs_status "
+            "ON runner_runs(status,created_at)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS runner_events ("
+            "seq INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT NOT NULL UNIQUE,"
+            "runner_run_id TEXT NOT NULL REFERENCES runner_runs(id),"
+            "sequence INTEGER NOT NULL,execution_id TEXT NOT NULL,"
+            "attempt_id TEXT NOT NULL,trace_id TEXT NOT NULL,span_id TEXT NOT NULL,"
+            "parent_span_id TEXT,kind TEXT NOT NULL,protocol_type TEXT NOT NULL,"
+            "stream TEXT NOT NULL,source_occurred_at TEXT,observed_at TEXT NOT NULL,"
+            "origin TEXT NOT NULL,trust_class TEXT NOT NULL,payload_json TEXT NOT NULL,"
+            "payload_bytes INTEGER NOT NULL,truncated INTEGER NOT NULL DEFAULT 0,"
+            "UNIQUE(runner_run_id,sequence))"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS runner_events_trace "
+            "ON runner_events(trace_id,sequence)"
         )
 
     def _event(
@@ -1138,6 +1197,461 @@ class SQLiteLedger:
 
     def assert_attempt_active(self, attempt_id: str, fence_token: str) -> dict[str, Any]:
         return dict(self._active_attempt(self.connection, attempt_id, fence_token))
+
+    def _runner_run_dict(
+        self, row: sqlite3.Row, *, include_events: bool = True
+    ) -> dict[str, Any]:
+        item = dict(row)
+        for source, target in (
+            ("command_json", "command"), ("result_json", "result"),
+            ("receipt_json", "receipt"), ("error_json", "error"),
+        ):
+            value = item.pop(source)
+            item[target] = json.loads(value) if value else None
+        if include_events:
+            item["events"] = [
+                {
+                    **dict(event),
+                    "payload": json.loads(event["payload_json"]),
+                }
+                for event in self.connection.execute(
+                    "SELECT * FROM runner_events WHERE runner_run_id=? ORDER BY sequence",
+                    (item["id"],),
+                )
+            ]
+            for event in item["events"]:
+                event.pop("payload_json", None)
+        return item
+
+    def runner_run(self, runner_run_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM runner_runs WHERE id=?", (runner_run_id,)
+        ).fetchone()
+        if not row:
+            raise LedgerError("runner run not found")
+        return self._runner_run_dict(row)
+
+    def runner_run_for_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM runner_runs WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        return self._runner_run_dict(row) if row else None
+
+    def _active_runner_run(
+        self, db: sqlite3.Connection, runner_run_id: str, fence_token: str,
+        statuses: tuple[str, ...],
+    ) -> sqlite3.Row:
+        placeholders = ",".join("?" for _ in statuses)
+        run = db.execute(
+            "SELECT rr.*,a.status AS attempt_status,a.fence_token AS active_fence,"
+            "a.state_run_id FROM runner_runs rr JOIN attempts a ON a.id=rr.attempt_id "
+            f"WHERE rr.id=? AND rr.status IN ({placeholders})",
+            (runner_run_id, *statuses),
+        ).fetchone()
+        if (
+            not run or run["fence_token"] != fence_token
+            or run["attempt_status"] != "active" or run["active_fence"] != fence_token
+        ):
+            raise StaleAttempt("runner run is missing, terminal, or fenced")
+        return run
+
+    def plan_runner_run(
+        self, *, execution_id: str, attempt_id: str, preparation_id: str,
+        preparation_digest: str, fence_token: str, runner_key: str,
+        adapter_kind: str, adapter_version: str, protocol_version: int,
+        execution_trace_id: str, trace_id: str, root_span_id: str,
+        parent_trace_id: str | None, command: list[str], command_digest: str,
+        prompt_digest: str, host_id: str, boot_id: str,
+    ) -> dict[str, Any]:
+        existing = self.connection.execute(
+            "SELECT * FROM runner_runs WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        if existing:
+            expected = (
+                execution_id, preparation_id, fence_token, runner_key, adapter_kind,
+                adapter_version, protocol_version, command_digest, prompt_digest,
+            )
+            observed = tuple(existing[key] for key in (
+                "execution_id", "preparation_id", "fence_token", "runner_key",
+                "adapter_kind", "adapter_version", "protocol_version",
+                "command_digest", "prompt_digest",
+            ))
+            if observed != expected:
+                raise LedgerError("runner plan changed after durable creation")
+            self.assert_attempt_active(attempt_id, fence_token)
+            return self._runner_run_dict(existing)
+        with self.transaction() as db:
+            attempt = self._active_attempt(db, attempt_id, fence_token)
+            if attempt["execution_id"] != execution_id:
+                raise StaleAttempt("runner execution does not own the active attempt")
+            preparation = db.execute(
+                "SELECT * FROM preparations WHERE id=? AND attempt_id=?",
+                (preparation_id, attempt_id),
+            ).fetchone()
+            if (
+                not preparation or preparation["status"] != "ready"
+                or preparation["fence_token"] != fence_token
+                or preparation["result_digest"] != preparation_digest
+            ):
+                raise StaleAttempt("runner launch does not match ready preparation")
+            runner_run_id = self.id_factory()
+            now = self.clock()
+            db.execute(
+                "INSERT INTO runner_runs("
+                "id,execution_id,attempt_id,preparation_id,fence_token,runner_key,"
+                "adapter_kind,adapter_version,protocol_version,execution_trace_id,"
+                "trace_id,root_span_id,parent_trace_id,status,command_json,command_digest,"
+                "prompt_digest,host_id,boot_id,created_at,last_activity_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'planned',?,?,?,?,?,?,?)",
+                (runner_run_id, execution_id, attempt_id, preparation_id, fence_token,
+                 runner_key, adapter_kind, adapter_version, protocol_version,
+                 execution_trace_id, trace_id, root_span_id, parent_trace_id,
+                 json.dumps(redact_payload(command), sort_keys=True), command_digest,
+                 prompt_digest, host_id, boot_id, now, now),
+            )
+            self._event(
+                db, execution_id=execution_id, state_run_id=attempt["state_run_id"],
+                attempt_id=attempt_id, event_type="runner_planned",
+                payload={
+                    "runner_run_id": runner_run_id, "runner": runner_key,
+                    "adapter_kind": adapter_kind, "adapter_version": adapter_version,
+                    "protocol_version": protocol_version, "trace_id": trace_id,
+                    "root_span_id": root_span_id, "command_digest": command_digest,
+                    "prompt_digest": prompt_digest,
+                },
+                idempotency_key=f"runner:{runner_run_id}:planned",
+            )
+        return self.runner_run(runner_run_id)
+
+    def mark_runner_starting(
+        self, runner_run_id: str, *, fence_token: str
+    ) -> dict[str, Any]:
+        current = self.runner_run(runner_run_id)
+        if current["status"] == "starting":
+            return current
+        with self.transaction() as db:
+            run = self._active_runner_run(
+                db, runner_run_id, fence_token, ("planned",)
+            )
+            now = self.clock()
+            db.execute(
+                "UPDATE runner_runs SET status='starting',started_at=?,last_activity_at=? "
+                "WHERE id=?", (now, now, runner_run_id),
+            )
+            self._event(
+                db, execution_id=run["execution_id"], state_run_id=run["state_run_id"],
+                attempt_id=run["attempt_id"], event_type="runner_starting",
+                payload={"runner_run_id": runner_run_id, "trace_id": run["trace_id"]},
+                idempotency_key=(
+                    f"runner:{runner_run_id}:starting:{run['resume_count']}"
+                ),
+            )
+        return self.runner_run(runner_run_id)
+
+    def mark_runner_running(
+        self, runner_run_id: str, *, fence_token: str, pid: int,
+        process_group_id: int,
+    ) -> dict[str, Any]:
+        with self.transaction() as db:
+            run = self._active_runner_run(
+                db, runner_run_id, fence_token, ("starting",)
+            )
+            now = self.clock()
+            db.execute(
+                "UPDATE runner_runs SET status='running',pid=?,process_group_id=?,"
+                "last_activity_at=? WHERE id=?",
+                (pid, process_group_id, now, runner_run_id),
+            )
+            self._event(
+                db, execution_id=run["execution_id"], state_run_id=run["state_run_id"],
+                attempt_id=run["attempt_id"], event_type="runner_started",
+                payload={"runner_run_id": runner_run_id, "pid": pid,
+                         "process_group_id": process_group_id,
+                         "trace_id": run["trace_id"]},
+                idempotency_key=(
+                    f"runner:{runner_run_id}:running:{run['resume_count']}"
+                ),
+            )
+        return self.runner_run(runner_run_id)
+
+    def append_runner_event(
+        self, runner_run_id: str, *, fence_token: str, kind: str,
+        protocol_type: str, stream: str, payload: dict[str, Any],
+        span_id: str, parent_span_id: str | None, source_occurred_at: str | None,
+        observed_at: str, origin: str, trust_class: str,
+        session_id: str | None = None, maximum_payload_bytes: int = 262144,
+    ) -> dict[str, Any]:
+        with self.transaction() as db:
+            run = self._active_runner_run(
+                db, runner_run_id, fence_token,
+                ("starting", "running", "waiting_input"),
+            )
+            redacted = redact_payload(payload)
+            encoded = json.dumps(
+                redacted, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            payload_bytes = len(encoded)
+            truncated = 0
+            if payload_bytes > maximum_payload_bytes:
+                redacted = {
+                    "capture": "truncated",
+                    "original_bytes": payload_bytes,
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                    "top_level_keys": sorted(redacted) if isinstance(redacted, dict) else [],
+                }
+                encoded = json.dumps(redacted, sort_keys=True).encode("utf-8")
+                truncated = 1
+            sequence = int(run["event_count"]) + 1
+            event_id = self.id_factory()
+            db.execute(
+                "INSERT INTO runner_events("
+                "event_id,runner_run_id,sequence,execution_id,attempt_id,trace_id,span_id,"
+                "parent_span_id,kind,protocol_type,stream,source_occurred_at,observed_at,"
+                "origin,trust_class,payload_json,payload_bytes,truncated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (event_id, runner_run_id, sequence, run["execution_id"],
+                 run["attempt_id"], run["trace_id"], span_id, parent_span_id,
+                 kind, protocol_type, stream, source_occurred_at, observed_at,
+                 origin, trust_class, encoded.decode("utf-8"), payload_bytes, truncated),
+            )
+            db.execute(
+                "UPDATE runner_runs SET event_count=?,last_activity_at=?,"
+                "session_id=COALESCE(?,session_id) WHERE id=?",
+                (sequence, observed_at, session_id, runner_run_id),
+            )
+        return {
+            "event_id": event_id, "runner_run_id": runner_run_id,
+            "sequence": sequence, "truncated": bool(truncated),
+        }
+
+    def mark_runner_waiting_input(
+        self, runner_run_id: str, *, fence_token: str, attention_id: str
+    ) -> dict[str, Any]:
+        with self.transaction() as db:
+            run = self._active_runner_run(
+                db, runner_run_id, fence_token, ("starting", "running")
+            )
+            db.execute(
+                "UPDATE runner_runs SET status='waiting_input',attention_id=?,"
+                "last_activity_at=? WHERE id=?",
+                (attention_id, self.clock(), runner_run_id),
+            )
+            self._event(
+                db, execution_id=run["execution_id"], state_run_id=run["state_run_id"],
+                attempt_id=run["attempt_id"], event_type="runner_waiting_input",
+                payload={"runner_run_id": runner_run_id,
+                         "attention_id": attention_id,
+                         "trace_id": run["trace_id"]},
+                idempotency_key=(
+                    f"runner:{runner_run_id}:waiting-input:{run['resume_count']}"
+                ),
+            )
+        return self.runner_run(runner_run_id)
+
+    def add_runner_dropped_events(
+        self, runner_run_id: str, *, fence_token: str, count: int
+    ) -> dict[str, Any]:
+        if count < 1:
+            raise LedgerError("dropped runner event count must be positive")
+        with self.transaction() as db:
+            run = self._active_runner_run(
+                db, runner_run_id, fence_token,
+                ("starting", "running", "waiting_input"),
+            )
+            db.execute(
+                "UPDATE runner_runs SET dropped_event_count=dropped_event_count+?,"
+                "last_activity_at=? WHERE id=?",
+                (count, self.clock(), runner_run_id),
+            )
+        return self.runner_run(runner_run_id)
+
+    def remedy_runner_attention(
+        self, *, execution_id: str, attention_id: str, remedy: str,
+        command_id: str, expected_attempt_id: str | None,
+    ) -> dict[str, Any]:
+        if remedy not in ("retry", "cancel"):
+            raise LedgerError("runner attention supports only retry or cancel")
+        with self.transaction() as db:
+            attention = db.execute(
+                "SELECT * FROM attention_requests WHERE id=? AND execution_id=?",
+                (attention_id, execution_id),
+            ).fetchone()
+            if not attention or attention["status"] != "open":
+                raise LedgerError("runner attention is missing or already resolved")
+            detail = json.loads(attention["detail_json"])
+            if remedy not in detail.get("allowed_actions", []):
+                raise LedgerError(f"{remedy} is not allowed for this attention request")
+            attempt_id = str(attention["attempt_id"] or "")
+            if not attempt_id or expected_attempt_id != attempt_id:
+                raise StaleAttempt("runner attention does not match the expected attempt")
+            run = db.execute(
+                "SELECT rr.*,a.state_run_id FROM runner_runs rr JOIN attempts a "
+                "ON a.id=rr.attempt_id WHERE rr.attempt_id=? AND rr.attention_id=?",
+                (attempt_id, attention_id),
+            ).fetchone()
+            if not run or run["status"] != "waiting_input":
+                raise LedgerError("runner is not waiting on this attention request")
+            self._active_attempt(db, attempt_id, str(run["fence_token"]))
+            now = self.clock()
+            resolution = "canceled" if remedy == "cancel" else "resolved"
+            detail["resolution"] = {
+                "remedy": remedy, "command_id": command_id,
+            }
+            db.execute(
+                "UPDATE attention_requests SET status=?,detail_json=?,updated_at=?,"
+                "resolved_at=? WHERE id=?",
+                (resolution, json.dumps(redact_payload(detail), sort_keys=True),
+                 now, now, attention_id),
+            )
+            error = None
+            if remedy == "cancel":
+                error = {
+                    "class": "canceled", "message": "runner canceled by operator",
+                    "command_id": command_id,
+                }
+            db.execute(
+                "UPDATE runner_runs SET status=?,attention_id=NULL,error_json=?,"
+                "last_activity_at=?,completed_at=? WHERE id=?",
+                ("canceled" if remedy == "cancel" else "resume_authorized",
+                 json.dumps(error, sort_keys=True) if error else None,
+                 now, now if remedy == "cancel" else None, run["id"]),
+            )
+            self._event(
+                db, execution_id=execution_id, state_run_id=run["state_run_id"],
+                attempt_id=attempt_id, event_type="attention_resolved",
+                payload={"attention_id": attention_id, "resolution": resolution,
+                         "detail": detail["resolution"]},
+                idempotency_key=f"attention:{attention_id}:{resolution}",
+            )
+            self._event(
+                db, execution_id=execution_id, state_run_id=run["state_run_id"],
+                attempt_id=attempt_id,
+                event_type=(
+                    "runner_resume_authorized" if remedy == "retry"
+                    else "runner_canceled"
+                ),
+                payload={"runner_run_id": run["id"], "attention_id": attention_id,
+                         "command_id": command_id, "trace_id": run["trace_id"]},
+                idempotency_key=f"runner:{run['id']}:attention:{command_id}",
+            )
+        return {
+            "attention": self.attention(attention_id), "remedy": remedy,
+            "runner_run": self.runner_run(str(run["id"])),
+        }
+
+    def plan_runner_resume(
+        self, runner_run_id: str, *, fence_token: str, command: list[str],
+        command_digest: str,
+    ) -> dict[str, Any]:
+        with self.transaction() as db:
+            run = self._active_runner_run(
+                db, runner_run_id, fence_token, ("resume_authorized",)
+            )
+            if not run["session_id"]:
+                raise LedgerError("runner resume requires a durable session reference")
+            resume_count = int(run["resume_count"]) + 1
+            now = self.clock()
+            db.execute(
+                "UPDATE runner_runs SET status='planned',command_json=?,command_digest=?,"
+                "resume_count=?,pid=NULL,process_group_id=NULL,error_json=NULL,"
+                "started_at=NULL,last_activity_at=?,completed_at=NULL WHERE id=?",
+                (json.dumps(redact_payload(command), sort_keys=True), command_digest,
+                 resume_count, now, runner_run_id),
+            )
+            self._event(
+                db, execution_id=run["execution_id"], state_run_id=run["state_run_id"],
+                attempt_id=run["attempt_id"], event_type="runner_resume_planned",
+                payload={"runner_run_id": runner_run_id, "resume_count": resume_count,
+                         "trace_id": run["trace_id"], "session_id": run["session_id"],
+                         "command_digest": command_digest},
+                idempotency_key=f"runner:{runner_run_id}:resume:{resume_count}",
+            )
+        return self.runner_run(runner_run_id)
+
+    def record_runner_result(
+        self, runner_run_id: str, *, fence_token: str, result: dict[str, Any],
+        receipt: dict[str, Any], session_id: str | None,
+    ) -> dict[str, Any]:
+        with self.transaction() as db:
+            run = self._active_runner_run(
+                db, runner_run_id, fence_token, ("running",)
+            )
+            now = self.clock()
+            db.execute(
+                "UPDATE runner_runs SET status='result_ready',result_json=?,receipt_json=?,"
+                "session_id=COALESCE(?,session_id),last_activity_at=?,completed_at=? "
+                "WHERE id=?",
+                (json.dumps(redact_payload(result), sort_keys=True),
+                 json.dumps(redact_payload(receipt), sort_keys=True), session_id,
+                 now, now, runner_run_id),
+            )
+            self._event(
+                db, execution_id=run["execution_id"], state_run_id=run["state_run_id"],
+                attempt_id=run["attempt_id"], event_type="runner_result_ready",
+                payload={"runner_run_id": runner_run_id, "trace_id": run["trace_id"],
+                         "result": result, "receipt": receipt},
+                idempotency_key=f"runner:{runner_run_id}:result-ready",
+            )
+        return self.runner_run(runner_run_id)
+
+    def finish_runner_run(
+        self, runner_run_id: str, *, fence_token: str, status: str,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if status not in ("failed", "canceled"):
+            raise LedgerError("invalid terminal runner status")
+        current = self.runner_run(runner_run_id)
+        if current["status"] in ("failed", "canceled"):
+            return current
+        with self.transaction() as db:
+            run = self._active_runner_run(
+                db, runner_run_id, fence_token,
+                ("planned", "starting", "running", "waiting_input"),
+            )
+            now = self.clock()
+            db.execute(
+                "UPDATE runner_runs SET status=?,error_json=?,last_activity_at=?,"
+                "completed_at=? WHERE id=?",
+                (status, json.dumps(redact_payload(error or {}), sort_keys=True),
+                 now, now, runner_run_id),
+            )
+            self._event(
+                db, execution_id=run["execution_id"], state_run_id=run["state_run_id"],
+                attempt_id=run["attempt_id"], event_type=f"runner_{status}",
+                payload={"runner_run_id": runner_run_id, "trace_id": run["trace_id"],
+                         "error": error or {}},
+                idempotency_key=f"runner:{runner_run_id}:{status}",
+            )
+        return self.runner_run(runner_run_id)
+
+    def supersede_runner_run(
+        self, runner_run_id: str, *, reason: str
+    ) -> dict[str, Any]:
+        current = self.runner_run(runner_run_id)
+        if current["status"] == "superseded":
+            return current
+        if current["status"] in ("result_ready", "failed", "canceled"):
+            raise LedgerError("terminal runner run cannot be superseded")
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT rr.*,a.state_run_id FROM runner_runs rr JOIN attempts a "
+                "ON a.id=rr.attempt_id WHERE rr.id=?", (runner_run_id,)
+            ).fetchone()
+            now = self.clock()
+            error = {"class": "stale_attempt", "message": reason}
+            db.execute(
+                "UPDATE runner_runs SET status='superseded',error_json=?,"
+                "last_activity_at=?,completed_at=? WHERE id=?",
+                (json.dumps(error, sort_keys=True), now, now, runner_run_id),
+            )
+            self._event(
+                db, execution_id=row["execution_id"], state_run_id=row["state_run_id"],
+                attempt_id=row["attempt_id"], event_type="runner_superseded",
+                payload={"runner_run_id": runner_run_id, "trace_id": row["trace_id"],
+                         "error": error},
+                idempotency_key=f"runner:{runner_run_id}:superseded",
+            )
+        return self.runner_run(runner_run_id)
 
     def begin_preparation(
         self, *, attempt_id: str, fence_token: str, request_digest: str

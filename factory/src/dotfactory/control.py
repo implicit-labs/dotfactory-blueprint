@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from .kernel import DurableKernel
 from .ledger import LedgerError, SQLiteLedger
@@ -275,10 +275,12 @@ class ControlService:
     def __init__(
         self, ledger: SQLiteLedger, kernel: DurableKernel,
         resource_controller: Any | None = None,
+        attention_controllers: Mapping[str, Any] | None = None,
     ) -> None:
         self.ledger = ledger
         self.kernel = kernel
         self.resource_controller = resource_controller
+        self.attention_controllers = dict(attention_controllers or {})
         self.observation = ObservationService(ledger, kernel)
 
     def execute(
@@ -431,11 +433,6 @@ class ControlService:
         parameters = request["parameters"]
         state = str(current["current_state_id"])
         if action == "attention":
-            if self.resource_controller is None:
-                raise ControlError(
-                    "resource_control_unavailable",
-                    "resource attention control is not configured", status=409,
-                )
             attention_id = parameters.get("attention_id")
             remedy = parameters.get("remedy")
             expected_attempt_id = parameters.get("expected_attempt_id")
@@ -447,8 +444,17 @@ class ControlService:
                 raise ControlError(
                     "invalid_expected_attempt", "expected_attempt_id must be a string"
                 )
+            attention = self.ledger.attention(attention_id)
+            controller = self.attention_controllers.get(
+                str(attention.get("provider") or "")
+            ) or self.resource_controller
+            if controller is None:
+                raise ControlError(
+                    "attention_control_unavailable",
+                    "attention control is not configured for this provider", status=409,
+                )
             try:
-                return self.resource_controller.remedy_attention(
+                return controller.remedy_attention(
                     execution_id, attention_id=attention_id, remedy=remedy,
                     command_id=command_id,
                     expected_attempt_id=expected_attempt_id,

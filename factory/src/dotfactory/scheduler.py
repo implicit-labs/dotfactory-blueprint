@@ -13,7 +13,7 @@ from .resources import (
     PreparationEngine, PreparationError, PreparationResult, PreparedLaunch,
     PreparedRunner,
 )
-from .runner import RunnerRequest, RunnerResult, runner_request
+from .runner import RunnerNeedsAttention, RunnerRequest, RunnerResult, runner_request
 
 
 logger = logging.getLogger(__name__)
@@ -433,6 +433,22 @@ class Scheduler:
             return self._handle_preparation(
                 dispatch, project, request, recovered=False,
             )
+        except RunnerNeedsAttention as error:
+            current = self.ledger.dispatch(str(dispatch["id"]))
+            self.ledger.mark_dispatch_attention(
+                str(dispatch["id"]), claim_token=str(current["claim_token"]),
+                attention_id=error.attention_id,
+                error={"message": str(error), "category": "runner-input",
+                       "runner_run_id": error.runner_run_id,
+                       "resume_phase": error.resume_phase},
+            )
+            return self._emit(SchedulerTick(
+                "needs_attention", dispatch_id=str(dispatch["id"]),
+                execution_id=str(dispatch["execution_id"]),
+                attempt_id=str(dispatch["attempt_id"]),
+                detail={"attention_id": error.attention_id,
+                        "runner_run_id": error.runner_run_id},
+            ))
         except StaleAttempt:
             try:
                 self.ledger.supersede_dispatch(

@@ -121,6 +121,17 @@ project, and runner admission limits. The scheduler reads runner names from the
 attempt's stored resolved node; it does not branch on a provider or workflow
 state name. Keep the host limit conservative until live adapters are measured.
 
+Schema v6 adds the `runners` registry. Keep executable, minimum version,
+profile, permission mode, and native capability declarations there. A node's
+`runner` must resolve to one active registry entry before launch. Do not put
+credentials, personal sessions, or executable paths in DOT.
+
+The example OMP route uses the isolated `dotfactory-claude-api` profile and
+names `ANTHROPIC_API_KEY` in `environment_envs`. Export the key in the Factory
+process environment and configure the profile locally. The value is injected
+only into the OMP child process; it is never written to the example, ledger,
+command, receipt, or trace.
+
 ## Dotfiles
 
 Keep portable behavior in `dotfiles/`. Keep credentials, OAuth state, machine

@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"11111111-1111-4111-8111-111111111111"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"{\"dotfactory_result\":1,\"outcome\":\"succeeded\",\"preferred_label\":\"complete\",\"evidence\":[{\"kind\":\"test\",\"uri\":\"local://proof\"}]}"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}

@@ -15,6 +15,7 @@ PROJECT_KEY = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 SECRET_WORDS = ("authorization", "password", "secret", "token", "api_key")
 RESOURCE_SCOPES = {"attempt", "execution"}
 RESOURCE_MODES = {"exclusive", "namespaced", "capacity", "prerequisite"}
+RUNNER_KINDS = {"codex", "claude-code", "omp-rpc"}
 
 
 class FactoryConfigError(ValueError):
@@ -317,6 +318,71 @@ def _validate_scheduler(values: dict[str, Any]) -> None:
         )
 
 
+def _validate_runners(values: dict[str, Any]) -> None:
+    if values["schema_version"] < 6:
+        return
+    runners = values.get("runners")
+    if not isinstance(runners, dict) or not runners:
+        raise FactoryConfigError("config.runners must contain at least one runner")
+    allowed = {
+        "kind", "command", "minimum_version", "permission_mode", "profile",
+        "capabilities", "environment_envs", "silence_timeout_seconds",
+        "termination_grace_seconds", "maximum_frame_bytes",
+        "maximum_reassembled_frame_bytes", "maximum_events",
+        "maximum_payload_bytes",
+    }
+    for name, runner in runners.items():
+        path = f"config.runners.{name}"
+        if not isinstance(name, str) or not PROJECT_KEY.fullmatch(name):
+            raise FactoryConfigError(f"{path} must use a lowercase hyphenated key")
+        if not isinstance(runner, dict):
+            raise FactoryConfigError(f"{path} must be an object")
+        if set(runner) - allowed:
+            raise FactoryConfigError(f"{path} contains unknown fields")
+        if runner.get("kind") not in RUNNER_KINDS:
+            raise FactoryConfigError(f"{path}.kind is not supported")
+        for key in ("command", "minimum_version", "permission_mode"):
+            if not isinstance(runner.get(key), str) or not runner[key].strip():
+                raise FactoryConfigError(f"{path}.{key} must be a non-empty string")
+        if "profile" in runner and (
+            not isinstance(runner["profile"], str) or not runner["profile"].strip()
+        ):
+            raise FactoryConfigError(f"{path}.profile must be a non-empty string")
+        capabilities = runner.get("capabilities", [])
+        if not isinstance(capabilities, list) or any(
+            not isinstance(item, str) or not PROJECT_KEY.fullmatch(item)
+            for item in capabilities
+        ):
+            raise FactoryConfigError(
+                f"{path}.capabilities must be lowercase hyphenated names"
+            )
+        environment_envs = runner.get("environment_envs", [])
+        if not isinstance(environment_envs, list) or any(
+            not isinstance(item, str) or not ENV_NAME.fullmatch(item)
+            for item in environment_envs
+        ):
+            raise FactoryConfigError(
+                f"{path}.environment_envs must contain environment variable names"
+            )
+        defaults = {
+            "silence_timeout_seconds": 300,
+            "termination_grace_seconds": 5,
+            "maximum_frame_bytes": 1024 * 1024,
+            "maximum_reassembled_frame_bytes": 64 * 1024 * 1024,
+            "maximum_events": 10000,
+            "maximum_payload_bytes": 256 * 1024,
+        }
+        resolved = {key: runner.get(key, value) for key, value in defaults.items()}
+        for key, value in resolved.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise FactoryConfigError(f"{path}.{key} must be a positive integer")
+        if resolved["maximum_reassembled_frame_bytes"] < resolved["maximum_frame_bytes"]:
+            raise FactoryConfigError(
+                f"{path}.maximum_reassembled_frame_bytes cannot be smaller than "
+                "maximum_frame_bytes"
+            )
+
+
 @dataclass(frozen=True)
 class FactoryConfig:
     path: Path
@@ -327,9 +393,9 @@ class FactoryConfig:
         resolved = Path(path).expanduser().resolve()
         values = json.loads(resolved.read_text(encoding="utf-8"))
         _reject_embedded_secrets(values)
-        if values.get("schema_version") not in (2, 3, 4, 5):
+        if values.get("schema_version") not in (2, 3, 4, 5, 6):
             raise FactoryConfigError(
-                "factory config requires schema_version 2, 3, 4, or 5"
+                "factory config requires schema_version 2, 3, 4, 5, or 6"
             )
         for key in ("factory_id", "ledger_path"):
             _require_string(values, key)
@@ -340,6 +406,7 @@ class FactoryConfig:
         )
         _validate_projects(values.get("projects"), workflow_names)
         _validate_scheduler(values)
+        _validate_runners(values)
         return cls(resolved, values)
 
     @classmethod
@@ -535,6 +602,45 @@ class FactoryConfig:
                 },
             },
         }
+
+    def resolve_runners(self) -> dict[str, dict[str, Any]]:
+        if self.values["schema_version"] < 6:
+            return {}
+        return {
+            str(name): {
+                "name": str(name), "kind": str(value["kind"]),
+                "command": str(value["command"]),
+                "minimum_version": str(value["minimum_version"]),
+                "permission_mode": str(value["permission_mode"]),
+                "profile": value.get("profile"),
+                "capabilities": tuple(value.get("capabilities", [])),
+                "environment_envs": tuple(value.get("environment_envs", [])),
+                "silence_timeout_seconds": int(
+                    value.get("silence_timeout_seconds", 300)
+                ),
+                "termination_grace_seconds": int(
+                    value.get("termination_grace_seconds", 5)
+                ),
+                "maximum_frame_bytes": int(
+                    value.get("maximum_frame_bytes", 1024 * 1024)
+                ),
+                "maximum_reassembled_frame_bytes": int(
+                    value.get("maximum_reassembled_frame_bytes", 64 * 1024 * 1024)
+                ),
+                "maximum_events": int(value.get("maximum_events", 10000)),
+                "maximum_payload_bytes": int(
+                    value.get("maximum_payload_bytes", 256 * 1024)
+                ),
+            }
+            for name, value in self.values["runners"].items()
+        }
+
+    def validate_runner_name(self, runner: Any) -> str:
+        if not isinstance(runner, str) or not runner:
+            raise FactoryConfigError("resolved runner must be a non-empty string")
+        if runner not in self.resolve_runners():
+            raise FactoryConfigError(f"resolved runner is not configured: {runner}")
+        return runner
 
     def validate_resource_names(
         self, project_key: str, resources: Any

@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"22222222-2222-4222-8222-222222222222"}
+{"type":"assistant","session_id":"22222222-2222-4222-8222-222222222222","message":{"content":[{"type":"text","text":"done"}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"22222222-2222-4222-8222-222222222222","structured_output":{"dotfactory_result":1,"outcome":"succeeded","preferred_label":"complete","evidence":[{"kind":"test","uri":"local://proof"}]}}

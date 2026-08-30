@@ -972,7 +972,7 @@ class SchemaSevenMigrationTests(unittest.TestCase):
                 "execution_workspaces", "preparations", "resource_allocations",
                 "resource_mutations", "attention_requests", "cleanup_plans",
             }.issubset(tables))
-            self.assertEqual(8, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(9, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
             ledger.close()
 
 
