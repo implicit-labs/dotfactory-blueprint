@@ -1,5 +1,5 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "factory_id": "example-local",
   "ledger_path": "~/.local/share/dotfactory/factory.db",
   "default_workflow": "default",
@@ -20,6 +20,31 @@
       "host": 3,
       "projects": {"example-ios": 2},
       "runners": {"codex": 2}
+    }
+  },
+  "runners": {
+    "codex": {
+      "kind": "codex",
+      "command": "codex",
+      "minimum_version": "0.147.0",
+      "permission_mode": "approve-for-me",
+      "capabilities": []
+    },
+    "claude": {
+      "kind": "claude-code",
+      "command": "claude",
+      "minimum_version": "2.1.251",
+      "permission_mode": "auto",
+      "capabilities": ["runner-browser"]
+    },
+    "omp": {
+      "kind": "omp-rpc",
+      "command": "omp",
+      "minimum_version": "18.0.4",
+      "permission_mode": "write",
+      "profile": "dotfactory-claude-api",
+      "environment_envs": ["ANTHROPIC_API_KEY"],
+      "capabilities": ["runner-browser", "runner-computer"]
     }
   },
   "preparation": {

@@ -8,6 +8,17 @@ from typing import Any
 from .kernel import DurableKernel, KernelError
 
 
+class RunnerNeedsAttention(KernelError):
+    def __init__(
+        self, message: str, *, attention_id: str, runner_run_id: str,
+        resume_phase: str = "waiting_input",
+    ) -> None:
+        super().__init__(message)
+        self.attention_id = attention_id
+        self.runner_run_id = runner_run_id
+        self.resume_phase = resume_phase
+
+
 @dataclass(frozen=True)
 class RunnerRequest:
     execution_id: str
