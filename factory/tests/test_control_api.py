@@ -315,7 +315,7 @@ class ControlAPITests(unittest.TestCase):
         }
         self.assertIn("control_commands", tables)
         self.assertIn("control_command_events", tables)
-        self.assertEqual(9, self.ledger.connection.execute("PRAGMA user_version").fetchone()[0])
+        self.assertEqual(10, self.ledger.connection.execute("PRAGMA user_version").fetchone()[0])
 
     def call_wsgi(self, app, method, path, headers=None, body=None):
         raw = json.dumps(body).encode("utf-8") if body is not None else b""
