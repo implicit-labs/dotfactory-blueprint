@@ -67,6 +67,34 @@ class WorkflowCompilationTests(unittest.TestCase):
         )
         self.assertEqual(workflow.digest, repeated.digest)
 
+    def test_compiler_emits_versioned_state_definitions(self):
+        workflow = compile_dot(parse_dot(
+            "digraph X { graph [schema_version=2, conventions=linear, "
+            "linear_statuses=node_ids] start [shape=Mdiamond] "
+            "build [type=agent, runner=codex, max_retries=2] "
+            "done [shape=Msquare] start -> build "
+            "build -> build [on=retry] build -> done [on=complete] }"
+        ))
+        build = {item["id"]: item for item in workflow.states}["build"]
+        definition = build["state_definition"]
+        self.assertEqual(1, workflow.normalized["state_definition_version"])
+        self.assertEqual(1, definition["version"])
+        self.assertEqual("codex", definition["runner_policy"]["runner"])
+        self.assertEqual(2, definition["retry_policy"]["max_retries"])
+        self.assertEqual(1, len(definition["retry_policy"]["retry_edge_ids"]))
+
+    def test_compiler_rejects_ambiguous_human_reverse_status_route(self):
+        graph = parse_dot(
+            "digraph X { graph [schema_version=2, conventions=linear] "
+            "start [shape=Mdiamond] current [type=checkpoint, linear_status=Current] "
+            "one [type=checkpoint, linear_status=Shared] "
+            "two [type=checkpoint, linear_status=Shared] done [shape=Msquare] "
+            "start -> current current -> one [on=enter, authority=human] "
+            "current -> two [on=enter, authority=human] one -> done two -> done }"
+        )
+        with self.assertRaisesRegex(WorkflowError, "ambiguous human Linear reverse route"):
+            compile_dot(graph)
+
     def test_node_override_wins_over_profile(self):
         graph = parse_dot(
             "digraph X { start [shape=Mdiamond] "
@@ -226,6 +254,22 @@ class WorkflowCompilationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(WorkflowError, "prompt does not exist"):
                 load_workflow(path)
+
+    def test_prompt_file_content_is_snapshotted_not_its_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "work.md").write_text("Plan the requested change.\n", encoding="utf-8")
+            path = root / "workflow.dot"
+            path.write_text(
+                "digraph X { start [shape=Mdiamond] "
+                "build [type=agent, prompt=work.md] done [shape=Msquare] "
+                "start -> build build -> done }",
+                encoding="utf-8",
+            )
+            workflow = load_workflow(path)
+            build = next(item for item in workflow.states if item["id"] == "build")
+            self.assertEqual("Plan the requested change.\n", build["execution"]["prompt"])
+            self.assertNotIn("work.md", build["execution"]["prompt"])
 
     def test_generic_renderer_uses_resolved_three_step_graph_and_digest(self):
         workflow = load_workflow(ROOT / "workflows" / "three-step-advanced.dot")

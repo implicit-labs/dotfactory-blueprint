@@ -6,6 +6,7 @@ from dotfactory.control import ControlService, Principal
 from dotfactory.kernel import DurableKernel
 from dotfactory.ledger import LedgerError, SQLiteLedger
 from dotfactory.runner import FakeRunner, RunnerResult, run_fake_attempt
+from dotfactory.workflow import WorkflowError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -249,17 +250,10 @@ class ThreeStepWorkflowTests(unittest.TestCase):
             """,
             encoding="utf-8",
         )
-        kernel = DurableKernel(self.ledger, workflow)
-        execution = kernel.begin(
-            "proof", "TASK-AMBIGUOUS", {"title": "Ambiguous projection"},
-            command_id="ambiguous",
-        )
-        result = kernel.observe_linear_status(
-            execution, "Done", command_id="linear-done"
-        )
-        self.assertEqual("rejected", result["payload"]["disposition"])
-        self.assertEqual("ambiguous Linear status projection", result["payload"]["reason"])
-        self.assertEqual("review", self.ledger.current(execution)["current_state_id"])
+        with self.assertRaisesRegex(
+            WorkflowError, "ambiguous human Linear reverse route"
+        ):
+            DurableKernel(self.ledger, workflow)
 
 
 if __name__ == "__main__":

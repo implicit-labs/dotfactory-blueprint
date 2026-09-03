@@ -15,7 +15,7 @@ import signal
 import socket
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .ledger import SQLiteLedger, StaleAttempt
@@ -29,6 +29,10 @@ EVENT_KINDS = {
     "approval", "input", "warning", "error", "terminal", "protocol",
 }
 RESULT_MARKER = "dotfactory_result"
+RESULT_SCHEMA_PATH = os.path.join(
+    os.path.dirname(__file__), "runner_result.schema.json"
+)
+MCP_DISCOVERY_TIMEOUT_SECONDS = 10
 
 
 class RunnerProtocolError(PreparationError):
@@ -45,6 +49,8 @@ class RunnerRoute:
     capabilities: tuple[str, ...] = ()
     profile: str | None = None
     environment_envs: tuple[str, ...] = ()
+    disabled_mcp_servers: tuple[str, ...] = ()
+    configured_mcp_servers: tuple[str, ...] | None = None
     silence_timeout_seconds: int = 300
     termination_grace_seconds: int = 5
     maximum_frame_bytes: int = 1024 * 1024
@@ -368,22 +374,36 @@ def _validated_result(
     outcome = envelope.get("outcome")
     label = envelope.get("preferred_label")
     evidence = envelope.get("evidence")
-    if not isinstance(outcome, str) or not outcome:
+    if not isinstance(outcome, str) or not outcome.strip():
         raise RunnerProtocolError("runner result proof requires outcome")
-    if not isinstance(label, str) or not label:
+    if not isinstance(label, str) or not label.strip():
         raise RunnerProtocolError("runner result proof requires preferred_label")
-    if not isinstance(evidence, list) or any(not isinstance(item, dict) for item in evidence):
+    if not isinstance(evidence, list) or not evidence or any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("kind"), str)
+        or not item["kind"].strip()
+        or not isinstance(item.get("uri"), str)
+        or not item["uri"].strip()
+        for item in evidence
+    ):
         raise RunnerProtocolError("runner result proof requires evidence objects")
+    normalized_evidence = []
+    for item in evidence:
+        normalized = dict(item)
+        normalized["kind"] = item["kind"].strip()
+        normalized["uri"] = item["uri"].strip()
+        normalized_evidence.append(normalized)
     kinds = {
-        str(item.get("kind")) for item in evidence
-        if isinstance(item.get("kind"), str)
+        str(item["kind"]) for item in normalized_evidence
     }
     missing = set(required_evidence) - kinds
     if missing:
         raise RunnerProtocolError(
             "runner result proof is missing evidence: " + ", ".join(sorted(missing))
         )
-    return RunnerResult(outcome, label, tuple(dict(item) for item in evidence))
+    return RunnerResult(
+        outcome.strip(), label.strip(), tuple(normalized_evidence)
+    )
 
 
 class RunnerAdapter:
@@ -398,9 +418,16 @@ class RunnerAdapter:
     def stdin(self, launch: PreparedLaunch, *, prompt_text: str) -> str:
         if not isinstance(prompt_text, str) or not prompt_text.strip():
             raise RunnerProtocolError("live runner requires immutable prompt text")
+        allowed = launch.request.config.get("allowed_preferred_labels", [])
+        labels = ", ".join(str(item) for item in allowed)
         contract = (
-            "\n\nReturn a final JSON object with dotfactory_result=1, outcome, "
-            "preferred_label, and evidence. Process exit alone is not success."
+            "\n\nReturn only one final JSON object with dotfactory_result=1, "
+            "outcome, preferred_label, and evidence. outcome must be a non-empty "
+            "JSON string summarizing what happened; never return an object, array, "
+            "or null for outcome. evidence must be a non-empty JSON array of "
+            "objects; every object must contain non-empty kind and uri strings. "
+            "Process exit alone is not success. "
+            f"preferred_label must be exactly one of: {labels}."
         )
         return prompt_text + contract
 
@@ -433,9 +460,15 @@ class CodexAdapter(RunnerAdapter):
 
     def command(self, route, launch, *, session_id=None):
         if session_id:
-            command = [route.command, "exec", "resume", "--json", session_id]
+            command = [
+                route.command, "exec", "resume", "--json",
+                "--output-schema", RESULT_SCHEMA_PATH,
+            ]
         else:
-            command = [route.command, "exec", "--json", "--approve-for-me"]
+            command = [
+                route.command, "exec", "--json", "--approve-for-me",
+                "--output-schema", RESULT_SCHEMA_PATH,
+            ]
         config = launch.request.config
         if config.get("model"):
             command.extend(["-m", str(config["model"])])
@@ -443,6 +476,18 @@ class CodexAdapter(RunnerAdapter):
             command.extend([
                 "-c", f'model_reasoning_effort="{config["reasoning_effort"]}"',
             ])
+        if (
+            route.disabled_mcp_servers
+            and route.configured_mcp_servers is None
+        ):
+            raise RunnerProtocolError(
+                "Codex MCP deny policy was not resolved for this workspace"
+            )
+        configured = set(route.configured_mcp_servers or ())
+        for server in sorted(set(route.disabled_mcp_servers) & configured):
+            command.extend(["-c", f"mcp_servers.{server}.enabled=false"])
+        if session_id:
+            command.append(session_id)
         command.append("-")
         return tuple(command)
 
@@ -771,6 +816,7 @@ class LiveRunner:
         fault_hook: Callable[[str], None] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        run_command: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         kill_process_group: Callable[[int, int], None] = os.killpg,
         host_id: str | None = None, boot_id: str | None = None,
     ) -> None:
@@ -783,6 +829,7 @@ class LiveRunner:
         self.fault_hook = fault_hook
         self.monotonic = monotonic
         self.popen = popen
+        self.run_command = run_command
         self.kill_process_group = kill_process_group
         self.host_id = host_id or socket.gethostname()
         boot_epoch = int(time.time() - monotonic())
@@ -836,6 +883,59 @@ class LiveRunner:
             sensitive.append(value)
         child.update(launch.environment_dict())
         return child, tuple(sensitive)
+
+    def _resolve_workspace_integrations(
+        self, route: RunnerRoute, launch: PreparedLaunch
+    ) -> RunnerRoute:
+        if route.kind != "codex" or not route.disabled_mcp_servers:
+            return route
+        if route.configured_mcp_servers is not None:
+            return route
+        child_environment, sensitive = self._child_environment(route, launch)
+        try:
+            result = self.run_command(
+                [route.command, "mcp", "list", "--json"],
+                cwd=launch.workspace_path, env=child_environment,
+                check=False, text=True, timeout=MCP_DISCOVERY_TIMEOUT_SECONDS,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RunnerProtocolError(
+                "Codex MCP configuration discovery timed out after "
+                f"{MCP_DISCOVERY_TIMEOUT_SECONDS} seconds"
+            ) from error
+        except OSError as error:
+            raise RunnerProtocolError(
+                "Codex MCP configuration discovery could not start"
+            ) from error
+        if result.returncode != 0:
+            detail = str(_replace_sensitive(
+                (result.stderr or result.stdout or "").strip(), sensitive,
+            ))[:512]
+            suffix = f": {detail}" if detail else ""
+            raise RunnerProtocolError(
+                "Codex MCP configuration discovery failed with code "
+                f"{result.returncode}{suffix}"
+            )
+        try:
+            entries = json.loads(result.stdout or "")
+        except (TypeError, json.JSONDecodeError) as error:
+            raise RunnerProtocolError(
+                "Codex MCP configuration discovery returned malformed JSON"
+            ) from error
+        if not isinstance(entries, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or not item["name"]
+            for item in entries
+        ):
+            raise RunnerProtocolError(
+                "Codex MCP configuration discovery returned an invalid server list"
+            )
+        return replace(
+            route,
+            configured_mcp_servers=tuple(sorted({item["name"] for item in entries})),
+        )
 
     def _error_fact(
         self, error: Exception, *, phase: str, route: RunnerRoute,
@@ -997,14 +1097,54 @@ class LiveRunner:
             evidence=tuple(dict(item) for item in evidence),
         )
 
+    def _prompt(self, launch: PreparedLaunch, route: RunnerRoute) -> str:
+        base_prompt = launch.request.config.get("prompt")
+        if not isinstance(base_prompt, str) or not base_prompt.strip():
+            raise RunnerProtocolError("live runner requires immutable prompt text")
+        current = self.ledger.current(launch.request.execution_id)
+        intent = json.loads(current["intent_snapshot_json"])
+        disabled_mcp_servers = sorted(route.disabled_mcp_servers)
+        if "linear" in disabled_mcp_servers:
+            intent.pop("url", None)
+            intent.pop("linear_issue_id", None)
+        context = {
+            "execution_id": launch.request.execution_id,
+            "execution_key": current["execution_key"],
+            "project_key": current["project_key"],
+            "work_item_identifier": current["work_item_identifier"],
+            "state_id": launch.request.state_id,
+            "workflow_digest": launch.request.workflow_digest,
+            "intent": intent,
+            "disabled_mcp_servers": disabled_mcp_servers,
+            "skills": list(launch.request.config.get("skills", [])),
+            "capabilities": list(launch.request.config.get("capabilities", [])),
+            "allowed_preferred_labels": list(
+                launch.request.config.get("allowed_preferred_labels", [])
+            ),
+        }
+        integration_policy = ""
+        if disabled_mcp_servers:
+            integration_policy = (
+                "\n\nRunner integration policy:\n"
+                "Direct access to these systems is disabled: "
+                + ", ".join(disabled_mcp_servers)
+                + ". Do not contact them through MCP, browser, web, CLI, "
+                "or direct APIs. Use only the immutable local context; the "
+                "factory handles external synchronization. Do not infer missing "
+                "task detail or broaden the intent. If the context does not "
+                "explicitly authorize a repository change, preserve its files."
+            )
+        return (
+            base_prompt.rstrip()
+            + integration_policy
+            + "\n\nDotfactory execution context:\n"
+            + json.dumps(context, sort_keys=True, separators=(",", ":"))
+        )
+
     def run(self, launch: PreparedLaunch) -> RunnerResult:
         if not isinstance(launch, PreparedLaunch):
             raise PreparationError("live runner requires PreparedLaunch")
         route, adapter = self.router.route(launch)
-        version = self._version(route)
-        prompt = launch.request.config.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise RunnerProtocolError("live runner requires immutable prompt text")
         existing = self.ledger.runner_run_for_attempt(launch.request.attempt_id)
         if existing and existing["status"] == "result_ready":
             self.ledger.assert_attempt_active(
@@ -1022,6 +1162,9 @@ class LiveRunner:
             raise RunnerExecutionError(
                 f"runner attempt already has non-resumable status {existing['status']}"
             )
+        version = self._version(route)
+        route = self._resolve_workspace_integrations(route, launch)
+        prompt = self._prompt(launch, route)
         session_id = (
             str(existing["session_id"])
             if existing and existing.get("session_id")
@@ -1319,6 +1462,11 @@ class LiveRunner:
                 logical_lines, exit_code=exit_code,
                 required_evidence=required_evidence,
             )
+            allowed_labels = launch.request.config.get("allowed_preferred_labels", [])
+            if receipt.result.preferred_label not in allowed_labels:
+                raise RunnerProtocolError(
+                    "runner preferred_label is outside the graph exit contract"
+                )
             if not terminal_seen:
                 raise RunnerProtocolError("runner stream has no terminal event")
             self.ledger.assert_attempt_active(

@@ -48,6 +48,21 @@ Once a project key is registered, its tracker type and stable project ID cannot
 be changed; add a new key instead.
 Fields ending in `_env` contain environment-variable names, never credentials.
 Keep projections disabled until their named variables are available.
+Runner integrations are separate from projections. For Codex, list `linear` in
+`runners.<name>.disabled_mcp_servers` whenever Linear updates must flow only
+through the factory or be handled manually. This disables the Codex MCP server,
+withholds the Linear URL and internal ID from its prompt, and adds a cooperative
+prompt rule against alternate direct access. Use sandbox or network policy when
+alternate browser, shell, or API access must be mechanically blocked.
+The launch checks the prepared workspace's configured server list first, so the
+same policy also works on a clean Codex install where no Linear server exists.
+
+For live Linear convergence, configure each Linear project's stable team and
+project IDs, export the variables named by their `_env` fields, and export the
+authorization value named by `projections.linear.token_env`. The factory binds
+every workflow status to one team status ID before activation. Polling is the
+recovery path; a signed webhook may only accelerate it. A timeout after a status
+write remains ambiguous until a read confirms the remote issue.
 
 The default worktree pool is `<project checkout>/.worktrees`. Add it to the
 project's `.gitignore` before activation:
@@ -79,14 +94,49 @@ PYTHONPATH=factory/src python3 -c \
   'from dotfactory import FactoryConfig; print(FactoryConfig.from_environment().values["factory_id"])'
 ```
 
-The factory package provides kernel, preparation, and durable scheduler
-primitives. A polling service, tracker listener, and live runner adapters are
-separate runtime components and are not included yet.
+Run a credential-free Git-backed lifecycle before using a real project:
+
+```bash
+PYTHONPATH=factory/src python3 -m dotfactory demo
+```
+
+For a configured project, start one named issue:
+
+```bash
+PYTHONPATH=factory/src python3 -m dotfactory run \
+  --config factory/factory.json --project example-ios --issue TASK-600
+```
+
+Omitting `--issue` enables Linear pickup discovery and therefore requires the
+configured token. `--watch` keeps polling after the run reaches a stable
+boundary. Without it, the command stops at a human checkpoint, attention
+request, or terminal state and prints a deterministic lifecycle receipt.
+
+The first composition holds one process lock per ledger and permits one SQLite
+writer. It does not host the WSGI control API or webhook endpoint.
 
 Use a stable scheduler owner per machine process. `claimed` and `prepared`
 claims expire safely. `preparing`, `dispatching`, and `result_ready` do not;
 the same owner reconciles them after restart. If that owner cannot return,
 resolve the emitted attention request instead of editing the ledger.
+
+For scheduler-owned attention, record the remedy with the exact IDs printed in
+the lifecycle receipt:
+
+```bash
+PYTHONPATH=factory/src python3 -m dotfactory attention \
+  --config factory/factory.json --project example-ios \
+  --execution EXECUTION_ID --attention-id ATTENTION_ID \
+  --expected-state Investigating --expected-attempt ATTEMPT_ID \
+  --remedy retry --command-id operator:ATTENTION_ID:retry
+```
+
+Attention resolution and scheduler execution are separate crash-safe steps.
+The attention command uses a control-only runtime, skips runner and Linear
+preflights, and changes only the audited control state; run the lifecycle again
+to reconcile it. For a `result_ready` inspection, `--max-ticks 2` performs
+the resume tick and stored-result commit without launching the new state attempt.
+The commit completes the old attempt but preserves its execution and worktree.
 
 `ControlHTTPApp` exposes the [v1 control contract](../factory/CONTROL_API.md) to
 a WSGI host. The host must authenticate each request and return a `Principal`;
@@ -118,8 +168,9 @@ deletion policy.
 | dirty workspace | retain and quarantine; never force-remove it |
 | unknown process or route | retain and escalate; ownership is not proven |
 | `release_pending` | finish provider cleanup before dispatching new work |
-| ambiguous preparation | inspect mutations, then retry, quarantine, or cancel |
-| ambiguous dispatch | retain or cancel; never assume the runner did not start |
+| ambiguous preparation | inspect mutations, then retry the recorded safe phase |
+| ambiguous dispatch | retain and escalate; there is no automated retry or cancel |
+| scheduler `result_ready` | authorize retry, then replay the stored result; never rerun the runner |
 
 Cleanup is planned in the ledger before mutation. Worktrees remain until the
 execution is terminal or an operator explicitly requests cleanup.

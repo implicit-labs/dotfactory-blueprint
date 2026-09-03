@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import threading
 import unittest
@@ -7,10 +8,11 @@ from pathlib import Path
 
 from dotfactory import (
     ControlService, DurableKernel, FactoryConfig, FakePreparedRunner,
-    PreparationEngine, PreparationResult, PreparedLaunch, Principal,
+    ObservationService, PreparationEngine, PreparationResult, PreparedLaunch, Principal,
     RunnerResult, ScheduledProject, Scheduler, SchedulerPolicy, SQLiteLedger,
 )
-from dotfactory.ledger import StaleAttempt
+from dotfactory.ledger import LedgerError, StaleAttempt
+from dotfactory.observability import stable_span_id
 from dotfactory.resources import PreparationError
 from dotfactory.runner import runner_request
 
@@ -129,20 +131,52 @@ class SchedulerTests(unittest.TestCase):
         self.clock.advance(1)
         return kernel, execution, claim
 
-    def scheduler(self, kernel, preparation, runner=None, fault_hook=None, observer=None):
+    def scheduler(
+        self, kernel, preparation, runner=None, fault_hook=None, observer=None,
+        project="alpha",
+    ):
         return Scheduler(
             self.ledger,
-            projects={"alpha": ScheduledProject(kernel, preparation)},
+            projects={project: ScheduledProject(kernel, preparation)},
             runner=runner or FakePreparedRunner([
                 RunnerResult("succeeded", "complete", EVIDENCE)
             ]),
             owner="scheduler-a",
             policy=SchedulerPolicy(
                 claim_ttl_seconds=120, host_limit=2,
-                project_limits={"alpha": 2}, runner_limits={"codex": 2},
+                project_limits={project: 2}, runner_limits={"codex": 2},
             ),
             fault_hook=fault_hook, observer=observer,
         )
+
+    def result_ready_attention(
+        self, identifier="TASK-RESULT-RETRY", project="alpha",
+    ):
+        kernel, execution, claim = self.work(identifier, project=project)
+        investigating = kernel.complete_attempt(
+            execution, preferred_label="failed", outcome="failed",
+            evidence=[{"kind": "runner_error", "uri": "local://first-run"}],
+            attempt_id=claim["attempt_id"], fence_token=claim["fence_token"],
+            owner=f"owner-{identifier}", command_id=f"fail-{identifier}",
+        )
+        preparation = FakePreparation(self.ledger)
+        runner = FakePreparedRunner([
+            RunnerResult("recovered", "retry", EVIDENCE)
+        ])
+        scheduler = self.scheduler(kernel, preparation, runner, project=project)
+        complete_attempt = kernel.complete_attempt
+
+        def broken_commit(*_args, **_kwargs):
+            raise RuntimeError("result commit fix is not active")
+
+        kernel.complete_attempt = broken_commit
+        try:
+            tick = scheduler.tick()
+        finally:
+            kernel.complete_attempt = complete_attempt
+        self.assertEqual("needs_attention", tick.disposition)
+        self.assertEqual("result-commit", tick.detail["category"])
+        return kernel, execution, investigating, preparation, runner, scheduler, tick
 
     def test_tick_prepares_dispatches_cleans_and_commits(self):
         kernel, execution, _claim = self.work()
@@ -210,6 +244,479 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual("Autoplanning", self.ledger.current(execution)["current_state_id"])
             attention = self.ledger.attention(tick.detail["attention_id"])
             self.assertEqual("open", attention["status"])
+
+    def test_durable_terminal_runner_failure_follows_failed_graph_edge(self):
+        kernel, execution, _claim = self.work("TASK-RUNNER-FAIL")
+
+        class DurablyFailingRunner:
+            def __init__(self, ledger):
+                self.ledger = ledger
+
+            def run(self, launch):
+                request = launch.request
+                run = self.ledger.plan_runner_run(
+                    execution_id=request.execution_id,
+                    attempt_id=request.attempt_id,
+                    preparation_id=launch.preparation_id,
+                    preparation_digest=launch.preparation_digest,
+                    fence_token=request.fence_token, runner_key="codex",
+                    adapter_kind="fixture", adapter_version="1.0.0",
+                    protocol_version=1, execution_trace_id="1" * 32,
+                    trace_id="2" * 32, root_span_id="3" * 16,
+                    parent_trace_id=None, command=["fixture"],
+                    command_digest="command", prompt_digest="prompt",
+                    host_id="host", boot_id="boot",
+                )
+                self.ledger.mark_runner_starting(
+                    str(run["id"]), fence_token=request.fence_token
+                )
+                self.ledger.finish_runner_run(
+                    str(run["id"]), fence_token=request.fence_token,
+                    status="failed", error={
+                        "code": "INVALID_RESULT_PROOF", "category": "protocol",
+                        "message": "runner evidence was invalid", "retryable": False,
+                        "safe_remedy": "Inspect the runner receipt.",
+                    },
+                )
+                raise RuntimeError("runner evidence was invalid")
+
+        tick = self.scheduler(
+            kernel, FakePreparation(self.ledger), DurablyFailingRunner(self.ledger)
+        ).tick()
+        self.assertEqual("completed", tick.disposition)
+        self.assertEqual("Investigating", self.ledger.current(execution)["current_state_id"])
+        self.assertEqual("completed", self.ledger.dispatch(tick.dispatch_id)["status"])
+        self.assertEqual(
+            "runner_error", self.ledger.run_history(execution)["artifacts"][-1]["kind"]
+        )
+
+    def test_terminal_cancel_closes_ambiguous_live_records_and_survives_restart(self):
+        kernel, execution, _claim = self.work("TASK-CANCEL-LIVE")
+        _other_kernel, other_execution, other_claim = self.work("TASK-OTHER-LIVE")
+        other_preparation = self.ledger.begin_preparation(
+            attempt_id=other_claim["attempt_id"],
+            fence_token=other_claim["fence_token"],
+            request_digest="unrelated-preparation",
+        )
+        unrelated_allocation = self.ledger.acquire_allocation(
+            other_preparation["id"], fence_token=other_claim["fence_token"],
+            scope="attempt", provider="fixture", capability="server",
+            resource_id="unrelated-allocation",
+        )
+        unrelated_attention = self.ledger.open_attention(
+            execution_id=other_execution, attempt_id=other_claim["attempt_id"],
+            preparation_id=None, dedupe_key="unrelated-attention",
+            category="unrelated", provider="fixture",
+            detail={"allowed_actions": ["retry"]},
+        )
+        unrelated_lease = self.ledger.acquire_resource(
+            "unrelated-resource", attempt_id=other_claim["attempt_id"],
+            fence_token=other_claim["fence_token"],
+            expires_at=(self.clock.value + timedelta(minutes=5)).isoformat(),
+            idempotency_key="unrelated-resource-lease",
+        )
+
+        class AmbiguousLiveRunner:
+            def __init__(self, ledger):
+                self.ledger = ledger
+                self.runner_run_id = None
+
+            def run(self, launch):
+                request = launch.request
+                run = self.ledger.plan_runner_run(
+                    execution_id=request.execution_id,
+                    attempt_id=request.attempt_id,
+                    preparation_id=launch.preparation_id,
+                    preparation_digest=launch.preparation_digest,
+                    fence_token=request.fence_token, runner_key="codex",
+                    adapter_kind="fixture", adapter_version="1.0.0",
+                    protocol_version=1, execution_trace_id="1" * 32,
+                    trace_id="2" * 32, root_span_id="3" * 16,
+                    parent_trace_id=None, command=["fixture"],
+                    command_digest="command", prompt_digest="prompt",
+                    host_id="host", boot_id="boot",
+                )
+                self.runner_run_id = str(run["id"])
+                self.ledger.mark_runner_starting(
+                    self.runner_run_id, fence_token=request.fence_token
+                )
+                self.ledger.mark_runner_running(
+                    self.runner_run_id, fence_token=request.fence_token,
+                    pid=1234, process_group_id=1234,
+                )
+                raise RuntimeError("runner process ended before result capture")
+
+        runner = AmbiguousLiveRunner(self.ledger)
+        scheduler = self.scheduler(kernel, FakePreparation(self.ledger), runner)
+        blocked = scheduler.tick()
+        attention_id = blocked.detail["attention_id"]
+        self.assertEqual("needs_attention", blocked.disposition)
+        self.assertEqual("ambiguous-dispatch", blocked.detail["category"])
+        self.assertEqual(
+            "running", self.ledger.runner_run(runner.runner_run_id)["status"]
+        )
+        self.assertEqual(
+            "attention", self.ledger.dispatch(blocked.dispatch_id)["status"]
+        )
+        live_waterfall = ObservationService(
+            self.ledger, kernel
+        ).execution_projection(execution)["waterfall"]
+        live_spans = {
+            item["span_id"]: item for item in live_waterfall["items"]
+            if item["kind"] == "span"
+        }
+        self.assertIsNone(live_spans[
+            self.ledger.runner_run(runner.runner_run_id)["root_span_id"]
+        ]["ended_at"])
+        self.assertIsNone(live_spans[
+            stable_span_id("scheduler_dispatch", blocked.dispatch_id)
+        ]["ended_at"])
+
+        control = ControlService(self.ledger, kernel)
+        request = {
+            "action": "cancel", "expected_state": "Autoplanning",
+            "confirmed": True,
+            "parameters": {"reason": "Operator stopped the ambiguous live runner."},
+        }
+        first = control.execute(
+            execution, command_id="cancel-ambiguous-live",
+            principal=Principal("operator", "operator", "test"), request=request,
+        )
+        repeated = control.execute(
+            execution, command_id="cancel-ambiguous-live",
+            principal=Principal("operator", "operator", "test"), request=request,
+        )
+        self.assertEqual(first, repeated)
+
+        runner_run = self.ledger.runner_run(runner.runner_run_id)
+        self.assertEqual("canceled", runner_run["status"])
+        self.assertIsNotNone(runner_run["completed_at"])
+        self.assertIsNone(runner_run["result"])
+        self.assertIsNone(runner_run["receipt"])
+        self.assertTrue(runner_run["error"]["ambiguous_side_effect"])
+        dispatch = self.ledger.dispatch(blocked.dispatch_id)
+        self.assertEqual("superseded", dispatch["status"])
+        self.assertEqual("ambiguous-dispatch", dispatch["error"]["category"])
+        self.assertIsNotNone(dispatch["completed_at"])
+        attention = self.ledger.attention(attention_id)
+        self.assertEqual("canceled", attention["status"])
+        self.assertIsNotNone(attention["resolved_at"])
+
+        summary = ObservationService(
+            self.ledger, kernel
+        ).execution_projection(execution)
+        self.assertEqual(0, summary["waterfall"]["open_span_count"])
+        completion_facts = {
+            (item["entity_kind"], item["entity_id"]): item
+            for item in self.ledger.trace_completion_facts(execution)
+        }
+        self.assertEqual(
+            runner_run["root_span_id"],
+            completion_facts[("runner_run", runner.runner_run_id)]["span_id"],
+        )
+        self.assertEqual(
+            stable_span_id("scheduler_dispatch", blocked.dispatch_id),
+            completion_facts[("scheduler_dispatch", blocked.dispatch_id)]["span_id"],
+        )
+        summary = summary["summary"]
+        self.assertEqual("TASK-CANCEL-LIVE: Canceled", summary["headline"])
+        self.assertIn(
+            "DOTFACTORY_SCHEDULER_DISPATCH_ATTENTION",
+            {item["code"] for item in summary["errors"]},
+        )
+        self.assertEqual(
+            "open", self.ledger.attention(unrelated_attention["id"])["status"]
+        )
+        self.assertEqual("active", self.ledger.connection.execute(
+            "SELECT status FROM resource_leases WHERE id=?", (unrelated_lease,),
+        ).fetchone()[0])
+        self.assertEqual("active", self.ledger.connection.execute(
+            "SELECT status FROM resource_allocations WHERE id=?",
+            (unrelated_allocation["id"],),
+        ).fetchone()[0])
+
+        self.ledger.close()
+        self.ledger = SQLiteLedger(self.db_path, clock=self.clock)
+        restarted_kernel = DurableKernel(
+            self.ledger, ROOT / "workflows" / "default.dot",
+            factory_defaults={"runner": "codex", "resources": []},
+        )
+        after_restart = ControlService(self.ledger, restarted_kernel).execute(
+            execution, command_id="cancel-ambiguous-live",
+            principal=Principal("operator", "operator", "test"), request=request,
+        )
+        self.assertEqual(first, after_restart)
+        restarted = self.scheduler(
+            restarted_kernel, FakePreparation(self.ledger), FakePreparedRunner([])
+        ).tick()
+        self.assertEqual("idle", restarted.disposition)
+        self.assertEqual(1, self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE execution_id=? "
+            "AND event_type='runner_canceled'", (execution,),
+        ).fetchone()[0])
+        self.assertEqual(1, self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE execution_id=? "
+            "AND event_type='scheduler_dispatch_superseded'", (execution,),
+        ).fetchone()[0])
+        self.assertEqual(1, self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE execution_id=? "
+            "AND event_type='attention_resolved'", (execution,),
+        ).fetchone()[0])
+
+    def test_investigation_retry_commits_the_conditional_resume_edge(self):
+        kernel, execution, _claim = self.work("TASK-RECOVERY-RETRY")
+        runner = FakePreparedRunner([
+            RunnerResult("failed", "failed", EVIDENCE),
+            RunnerResult("recovered", "retry", EVIDENCE),
+        ])
+        scheduler = self.scheduler(kernel, FakePreparation(self.ledger), runner)
+        failed = scheduler.tick()
+        self.assertEqual("completed", failed.disposition)
+        self.assertEqual(
+            "Investigating", self.ledger.current(execution)["current_state_id"]
+        )
+        retried = scheduler.tick()
+        self.assertEqual("completed", retried.disposition)
+        self.assertEqual(
+            "Autoplanning", self.ledger.current(execution)["current_state_id"]
+        )
+        self.assertEqual(
+            "investigating.autoplanning",
+            [
+                item["payload"]["edge_id"]
+                for item in self.ledger.run_history(execution)["events"]
+                if item["event_type"] == "transition_accepted"
+            ][-1],
+        )
+
+    def test_result_ready_attention_replays_without_duplicate_runner(self):
+        (
+            _kernel, execution, attempt, preparation, runner, scheduler, tick,
+        ) = self.result_ready_attention()
+        dispatch_before = self.ledger.dispatch(tick.dispatch_id)
+        resolved = scheduler.remedy_attention(
+            execution, attention_id=tick.detail["attention_id"], remedy="retry",
+            command_id="operator:result-ready:retry",
+            expected_attempt_id=attempt["attempt_id"],
+        )
+        replay = scheduler.remedy_attention(
+            execution, attention_id=tick.detail["attention_id"], remedy="retry",
+            command_id="operator:result-ready:retry",
+            expected_attempt_id=attempt["attempt_id"],
+        )
+        self.assertEqual("resolved", resolved["attention"]["status"])
+        self.assertEqual(resolved["attention"], replay["attention"])
+        with self.assertRaises(StaleAttempt):
+            scheduler.remedy_attention(
+                execution, attention_id=tick.detail["attention_id"], remedy="retry",
+                command_id="operator:result-ready:retry",
+                expected_attempt_id="stale-attempt",
+            )
+        self.assertEqual("attention", self.ledger.dispatch(tick.dispatch_id)["status"])
+        self.assertEqual(1, self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE execution_id=? "
+            "AND event_type='attention_resolved' AND attempt_id=?",
+            (execution, attempt["attempt_id"]),
+        ).fetchone()[0])
+        resumed = scheduler.tick()
+        self.assertEqual("resumed", resumed.disposition)
+        self.assertEqual("result_ready", resumed.detail["phase"])
+        self.assertEqual(
+            dispatch_before["result"], self.ledger.dispatch(tick.dispatch_id)["result"]
+        )
+        recovered = scheduler.tick()
+        self.assertEqual("recovered", recovered.disposition)
+        self.assertEqual("Autoplanning", self.ledger.current(execution)["current_state_id"])
+        self.assertEqual("completed", self.ledger.dispatch(tick.dispatch_id)["status"])
+        self.assertEqual(1, len(runner.launches))
+        self.assertEqual(2, len(preparation.requests))
+
+    def test_failed_result_replay_opens_fresh_attention_until_fixed(self):
+        (
+            kernel, execution, attempt, preparation, runner, scheduler, first,
+        ) = self.result_ready_attention("TASK-REPLAY-FAILS-AGAIN")
+        scheduler.remedy_attention(
+            execution, attention_id=first.detail["attention_id"], remedy="retry",
+            command_id="operator:first-retry",
+            expected_attempt_id=attempt["attempt_id"],
+        )
+        self.assertEqual("resumed", scheduler.tick().disposition)
+        original_dispatch = self.ledger.dispatch(first.dispatch_id)
+        complete_attempt = kernel.complete_attempt
+
+        def still_broken(*_args, **_kwargs):
+            raise RuntimeError("result commit is still unavailable")
+
+        kernel.complete_attempt = still_broken
+        try:
+            repeated = scheduler.tick()
+        finally:
+            kernel.complete_attempt = complete_attempt
+        self.assertEqual("needs_attention", repeated.disposition)
+        self.assertEqual("result-commit", repeated.detail["category"])
+        self.assertNotEqual(
+            first.detail["attention_id"], repeated.detail["attention_id"]
+        )
+        second = self.ledger.attention(repeated.detail["attention_id"])
+        self.assertEqual("open", second["status"])
+        self.assertEqual(attempt["attempt_id"], second["attempt_id"])
+        self.assertEqual(
+            original_dispatch["preparation_id"], second["preparation_id"]
+        )
+        self.assertEqual(["retry"], second["detail"]["allowed_actions"])
+        dispatch = self.ledger.dispatch(repeated.dispatch_id)
+        self.assertEqual("attention", dispatch["status"])
+        self.assertEqual(original_dispatch["result"], dispatch["result"])
+        self.assertEqual(1, len(runner.launches))
+
+        scheduler.remedy_attention(
+            execution, attention_id=second["id"], remedy="retry",
+            command_id="operator:second-retry",
+            expected_attempt_id=attempt["attempt_id"],
+        )
+        self.assertEqual("resumed", scheduler.tick().disposition)
+        self.assertEqual("recovered", scheduler.tick().disposition)
+        self.assertEqual("Autoplanning", self.ledger.current(execution)["current_state_id"])
+        self.assertEqual(1, len(runner.launches))
+
+    def test_result_rehydration_error_has_a_readable_recovery_category(self):
+        (
+            _kernel, execution, attempt, preparation, runner, scheduler, first,
+        ) = self.result_ready_attention("TASK-REHYDRATION-ERROR")
+        scheduler.remedy_attention(
+            execution, attention_id=first.detail["attention_id"], remedy="retry",
+            command_id="operator:rehydration-retry",
+            expected_attempt_id=attempt["attempt_id"],
+        )
+        self.assertEqual("resumed", scheduler.tick().disposition)
+        prepare = preparation.prepare
+
+        def broken_rehydration(_request):
+            raise RuntimeError("prepared launch could not be reconstructed")
+
+        preparation.prepare = broken_rehydration
+        try:
+            repeated = scheduler.tick()
+        finally:
+            preparation.prepare = prepare
+        self.assertEqual("needs_attention", repeated.disposition)
+        self.assertEqual("result-recovery", repeated.detail["category"])
+        attention = self.ledger.attention(repeated.detail["attention_id"])
+        self.assertEqual(["retry"], attention["detail"]["allowed_actions"])
+        self.assertEqual(1, len(runner.launches))
+
+    def test_scheduler_attention_rejects_stale_attempt_and_wrong_link(self):
+        (
+            _kernel, execution, attempt, _preparation, _runner, scheduler, tick,
+        ) = self.result_ready_attention("TASK-RESULT-GUARDS")
+        with self.assertRaises(StaleAttempt):
+            scheduler.remedy_attention(
+                execution, attention_id=tick.detail["attention_id"], remedy="retry",
+                command_id="operator:stale", expected_attempt_id="stale-attempt",
+            )
+        self.assertEqual(
+            "open", self.ledger.attention(tick.detail["attention_id"])["status"]
+        )
+        dispatch = self.ledger.dispatch(tick.dispatch_id)
+        wrong = self.ledger.open_attention(
+            execution_id=execution, attempt_id=attempt["attempt_id"],
+            preparation_id=dispatch["preparation_id"],
+            dedupe_key="scheduler:wrong-link", category="result-commit",
+            provider="scheduler", detail={
+                "dispatch_id": tick.dispatch_id, "last_safe_step": "result_ready",
+                "allowed_actions": ["retry"],
+            },
+        )
+        with self.assertRaisesRegex(LedgerError, "not linked"):
+            scheduler.remedy_attention(
+                execution, attention_id=wrong["id"], remedy="retry",
+                command_id="operator:wrong-link",
+                expected_attempt_id=attempt["attempt_id"],
+            )
+        foreign = self.ledger.open_attention(
+            execution_id=execution, attempt_id=attempt["attempt_id"],
+            preparation_id=dispatch["preparation_id"],
+            dedupe_key="fixture:wrong-provider", category="result-commit",
+            provider="fixture", detail={
+                "dispatch_id": tick.dispatch_id, "last_safe_step": "result_ready",
+                "allowed_actions": ["retry"],
+            },
+        )
+        with self.assertRaisesRegex(LedgerError, "not scheduler-owned"):
+            scheduler.remedy_attention(
+                execution, attention_id=foreign["id"], remedy="retry",
+                command_id="operator:wrong-provider",
+                expected_attempt_id=attempt["attempt_id"],
+            )
+
+    def test_resolved_attention_for_inactive_project_is_not_resumed(self):
+        self.ledger.register_project(
+            "beta", display_name="Beta", tracker_kind="linear",
+            tracker_project_id="linear-beta",
+        )
+        (
+            _kernel, execution, attempt, _preparation, _runner,
+            beta_scheduler, attention_tick,
+        ) = self.result_ready_attention("TASK-BETA-REPLAY", project="beta")
+        beta_scheduler.remedy_attention(
+            execution, attention_id=attention_tick.detail["attention_id"],
+            remedy="retry", command_id="operator:beta:retry",
+            expected_attempt_id=attempt["attempt_id"],
+        )
+        before = self.ledger.dispatch(attention_tick.dispatch_id)
+        alpha_kernel = DurableKernel(
+            self.ledger, ROOT / "workflows" / "default.dot",
+            factory_defaults={"runner": "codex", "resources": []},
+        )
+        tick = self.scheduler(
+            alpha_kernel, FakePreparation(self.ledger),
+            runner=FakePreparedRunner([]), project="alpha",
+        ).tick()
+        self.assertEqual("idle", tick.disposition)
+        self.assertEqual(before, self.ledger.dispatch(attention_tick.dispatch_id))
+
+    def test_inactive_project_attempt_is_not_claimed(self):
+        self.ledger.register_project(
+            "beta", display_name="Beta", tracker_kind="linear",
+            tracker_project_id="linear-beta",
+        )
+        _beta_kernel, _execution, claim = self.work(
+            "TASK-BETA-CLAIM", project="beta",
+        )
+        alpha_kernel = DurableKernel(
+            self.ledger, ROOT / "workflows" / "default.dot",
+            factory_defaults={"runner": "codex", "resources": []},
+        )
+        tick = self.scheduler(
+            alpha_kernel, FakePreparation(self.ledger),
+            runner=FakePreparedRunner([]), project="alpha",
+        ).tick()
+        self.assertEqual("idle", tick.disposition)
+        self.assertIsNone(self.ledger.dispatch_for_attempt(claim["attempt_id"]))
+
+    def test_stale_resolved_attention_is_superseded_without_wedging(self):
+        (
+            kernel, execution, attempt, _preparation, _runner,
+            scheduler, attention_tick,
+        ) = self.result_ready_attention("TASK-STALE-REPLAY")
+        scheduler.remedy_attention(
+            execution, attention_id=attention_tick.detail["attention_id"],
+            remedy="retry", command_id="operator:stale:retry",
+            expected_attempt_id=attempt["attempt_id"],
+        )
+        kernel.complete_attempt(
+            execution, preferred_label="blocked", outcome="blocked elsewhere",
+            evidence=[{"kind": "decision", "uri": "local://stale-replay"}],
+            attempt_id=attempt["attempt_id"],
+            fence_token=attempt["fence_token"], owner="owner-TASK-STALE-REPLAY",
+            command_id="advance-before-replay",
+        )
+        tick = scheduler.tick()
+        self.assertEqual("superseded", tick.disposition)
+        self.assertEqual(
+            "superseded", self.ledger.dispatch(attention_tick.dispatch_id)["status"]
+        )
+        self.assertEqual("Blocked", self.ledger.current(execution)["current_state_id"])
 
     def test_capacity_limits_are_atomic_and_data_driven(self):
         self.ledger.register_project(
@@ -327,6 +834,8 @@ class SchedulerTests(unittest.TestCase):
         recovered = self.scheduler(kernel, preparation, runner).tick()
         self.assertEqual("needs_attention", recovered.disposition)
         self.assertEqual("ambiguous-dispatch", recovered.detail["category"])
+        attention = self.ledger.attention(recovered.detail["attention_id"])
+        self.assertEqual([], attention["detail"]["allowed_actions"])
         self.assertEqual(0, len(runner.launches))
 
     def test_unrecorded_runner_result_is_ambiguous_and_not_rerun(self):
@@ -383,6 +892,8 @@ class SchedulerTests(unittest.TestCase):
         recovered = self.scheduler(kernel, preparation, runner).tick()
         self.assertEqual("needs_attention", recovered.disposition)
         self.assertEqual("ambiguous-preparation", recovered.detail["category"])
+        attention = self.ledger.attention(recovered.detail["attention_id"])
+        self.assertEqual(["retry"], attention["detail"]["allowed_actions"])
         self.assertEqual(0, len(runner.launches))
         controller = PreparationEngine(
             self.ledger, workspace_provider=object(), providers={},
@@ -471,6 +982,38 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual("recovered", recovered.disposition)
         self.assertEqual(1, len(runner.launches))
 
+    def test_recovery_error_after_commit_does_not_open_stale_attention(self):
+        kernel, execution, _claim = self.work("TASK-POST-COMMIT-RECOVERY")
+        preparation = FakePreparation(self.ledger)
+        runner = FakePreparedRunner([
+            RunnerResult("succeeded", "complete", EVIDENCE)
+        ])
+
+        def stop_after_result(boundary):
+            if boundary == "after_result_recorded":
+                raise SimulatedCrash()
+
+        with self.assertRaises(SimulatedCrash):
+            self.scheduler(
+                kernel, preparation, runner, fault_hook=stop_after_result,
+            ).tick()
+
+        def fail_after_commit(boundary):
+            if boundary == "after_workflow_commit":
+                raise RuntimeError("receipt write was interrupted")
+
+        recovered = self.scheduler(
+            kernel, preparation, runner, fault_hook=fail_after_commit,
+        ).tick()
+        self.assertEqual("recovered", recovered.disposition)
+        self.assertEqual("workflow_committed", recovered.detail["phase"])
+        self.assertEqual("Ready", self.ledger.current(execution)["current_state_id"])
+        self.assertEqual(
+            "completed", self.ledger.dispatch(recovered.dispatch_id)["status"]
+        )
+        self.assertEqual([], self.ledger.run_snapshot(execution)["attention_requests"])
+        self.assertEqual(1, len(runner.launches))
+
     def test_cleaned_result_recovers_without_rerunning_runner(self):
         kernel, execution, _claim = self.work()
         preparation = FakePreparation(self.ledger)
@@ -550,6 +1093,7 @@ class SchedulerTests(unittest.TestCase):
     def test_scheduler_uses_stored_workflow_after_source_changes(self):
         workflow_path = self.root / "workflow.dot"
         workflow_path.write_text((ROOT / "workflows" / "default.dot").read_text())
+        shutil.copytree(ROOT / "workflows" / "prompts", self.root / "prompts")
         kernel = DurableKernel(
             self.ledger, workflow_path,
             factory_defaults={"runner": "codex", "resources": []},
@@ -649,7 +1193,7 @@ class SchemaEightMigrationTests(unittest.TestCase):
             ledger.connection.execute("PRAGMA user_version=7")
             ledger.close()
             migrated = SQLiteLedger(path)
-            self.assertEqual(10, migrated.connection.execute(
+            self.assertEqual(11, migrated.connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0])
             self.assertIsNotNone(migrated.connection.execute(

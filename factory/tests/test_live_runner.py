@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -15,6 +16,7 @@ from dotfactory import (
     RunnerProtocolError, RunnerProviderError, RunnerRoute, SQLiteLedger,
 )
 from dotfactory.ledger import StaleAttempt
+from dotfactory.observability import stable_trace_id
 from dotfactory.resources import PreparationError
 from dotfactory.runner import runner_request
 
@@ -47,7 +49,7 @@ class LiveRunnerTests(unittest.TestCase):
             },
         )
         execution = kernel.begin(
-            "alpha", f"IMP-{runner}", {"title": runner},
+            "alpha", f"TASK-{runner}", {"title": runner},
             command_id=f"begin-{runner}",
         )
         kernel.transition(
@@ -88,6 +90,8 @@ class LiveRunnerTests(unittest.TestCase):
         return {
             "codex": RunnerRoute(
                 "codex", "codex", "codex", "0.147.0", "approve-for-me",
+                disabled_mcp_servers=("linear",),
+                configured_mcp_servers=("linear",),
             ),
             "claude": RunnerRoute(
                 "claude", "claude-code", "claude", "2.1.251", "auto",
@@ -123,7 +127,166 @@ class LiveRunnerTests(unittest.TestCase):
             command = adapter.command(route, launch, session_id=None)
             self.assertNotIn("Do the task", command)
             self.assertIn("Do the task", adapter.stdin(launch, prompt_text="Do the task"))
+            self.assertIn(
+                "preferred_label must be exactly one of: complete, failed",
+                adapter.stdin(launch, prompt_text="Do the task"),
+            )
+            self.assertIn(
+                "every object must contain non-empty kind and uri strings",
+                adapter.stdin(launch, prompt_text="Do the task"),
+            )
+            self.assertIn(
+                "outcome must be a non-empty JSON string",
+                adapter.stdin(launch, prompt_text="Do the task"),
+            )
             self.assertNotIn("secret", " ".join(command).lower())
+
+    def test_codex_command_enforces_the_result_envelope_schema(self):
+        _kernel, _execution, launch = self.launch("codex")
+        command = CodexAdapter().command(
+            self.routes()["codex"], launch, session_id=None,
+        )
+        schema_flag = command.index("--output-schema")
+        schema_path = Path(command[schema_flag + 1])
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["dotfactory_result", "outcome", "preferred_label", "evidence"],
+            schema["required"],
+        )
+        self.assertEqual("string", schema["properties"]["outcome"]["type"])
+        self.assertEqual(1, schema["properties"]["outcome"]["minLength"])
+        self.assertEqual("\\S", schema["properties"]["outcome"]["pattern"])
+        evidence = schema["properties"]["evidence"]
+        self.assertEqual("array", evidence["type"])
+        self.assertEqual(1, evidence["minItems"])
+        self.assertEqual(["kind", "uri"], evidence["items"]["required"])
+        self.assertEqual("\\S", evidence["items"]["properties"]["kind"]["pattern"])
+        self.assertEqual("\\S", evidence["items"]["properties"]["uri"]["pattern"])
+        self.assertFalse(evidence["items"]["additionalProperties"])
+        self.assertFalse(schema["additionalProperties"])
+        self.assertIn("mcp_servers.linear.enabled=false", command)
+
+    def test_codex_resume_keeps_schema_options_before_the_session(self):
+        _kernel, _execution, launch = self.launch("codex")
+        session = "44444444-4444-4444-8444-444444444444"
+        command = CodexAdapter().command(
+            self.routes()["codex"], launch, session_id=session,
+        )
+        self.assertLess(command.index("--output-schema"), command.index(session))
+        self.assertLess(
+            command.index("mcp_servers.linear.enabled=false"),
+            command.index(session),
+        )
+        self.assertEqual("-", command[-1])
+
+    def test_codex_only_disables_mcp_servers_present_in_the_workspace(self):
+        _kernel, _execution, launch = self.launch("codex")
+        route = RunnerRoute(
+            "codex", "codex", "codex", "0.147.0", "approve-for-me",
+            disabled_mcp_servers=("linear",),
+        )
+        calls = []
+
+        def discover(command, **options):
+            calls.append((command, options))
+            return subprocess.CompletedProcess(command, 0, "[]", "")
+
+        runner = LiveRunner(
+            self.ledger, routes={"codex": route},
+            observed_versions={"codex": "0.147.0"},
+            environment={"HOME": str(self.root), "PATH": os.environ["PATH"]},
+            run_command=discover,
+        )
+        resolved = runner._resolve_workspace_integrations(route, launch)
+        command = CodexAdapter().command(resolved, launch)
+        self.assertNotIn("mcp_servers.linear.enabled=false", command)
+        self.assertEqual(["codex", "mcp", "list", "--json"], calls[0][0])
+        self.assertEqual(launch.workspace_path, calls[0][1]["cwd"])
+        self.assertEqual(10, calls[0][1]["timeout"])
+
+    def test_codex_mcp_discovery_fails_closed(self):
+        _kernel, _execution, launch = self.launch("codex")
+        route = RunnerRoute(
+            "codex", "codex", "codex", "0.147.0", "approve-for-me",
+            disabled_mcp_servers=("linear",),
+        )
+        runner = LiveRunner(
+            self.ledger, routes={"codex": route},
+            observed_versions={"codex": "0.147.0"},
+            environment={"HOME": str(self.root), "PATH": os.environ["PATH"]},
+            run_command=lambda command, **options: subprocess.CompletedProcess(
+                command, 0, "not-json", ""
+            ),
+        )
+        with self.assertRaisesRegex(RunnerProtocolError, "malformed JSON"):
+            runner._resolve_workspace_integrations(route, launch)
+
+    def test_codex_mcp_discovery_nonzero_and_timeout_fail_closed(self):
+        _kernel, _execution, launch = self.launch("codex")
+        route = RunnerRoute(
+            "codex", "codex", "codex", "0.147.0", "approve-for-me",
+            disabled_mcp_servers=("linear",),
+        )
+
+        def nonzero(command, **options):
+            return subprocess.CompletedProcess(
+                command, 2, "", "configuration invalid"
+            )
+
+        runner = LiveRunner(
+            self.ledger, routes={"codex": route},
+            observed_versions={"codex": "0.147.0"},
+            environment={"HOME": str(self.root), "PATH": os.environ["PATH"]},
+            run_command=nonzero,
+        )
+        with self.assertRaisesRegex(
+            RunnerProtocolError, "code 2: configuration invalid"
+        ):
+            runner._resolve_workspace_integrations(route, launch)
+
+        def timeout(command, **options):
+            raise subprocess.TimeoutExpired(command, options["timeout"])
+
+        runner = LiveRunner(
+            self.ledger, routes={"codex": route},
+            observed_versions={"codex": "0.147.0"},
+            environment={"HOME": str(self.root), "PATH": os.environ["PATH"]},
+            run_command=timeout,
+        )
+        with self.assertRaisesRegex(RunnerProtocolError, "timed out after 10"):
+            runner._resolve_workspace_integrations(route, launch)
+
+    def test_codex_command_rejects_unresolved_mcp_deny_policy(self):
+        _kernel, _execution, launch = self.launch("codex")
+        route = RunnerRoute(
+            "codex", "codex", "codex", "0.147.0", "approve-for-me",
+            disabled_mcp_servers=("linear",),
+        )
+        with self.assertRaisesRegex(RunnerProtocolError, "was not resolved"):
+            CodexAdapter().command(route, launch)
+
+    def test_disabled_linear_is_withheld_and_forbidden_in_runner_prompt(self):
+        _kernel, execution, launch = self.launch("codex")
+        current = self.ledger.current(execution)
+        intent = json.loads(current["intent_snapshot_json"])
+        intent.update({
+            "url": "https://tracker.example/issue/EX-1",
+            "linear_issue_id": "linear-issue-1",
+        })
+        self.ledger.connection.execute(
+            "UPDATE workflow_executions SET intent_snapshot_json=? WHERE id=?",
+            (json.dumps(intent), execution),
+        )
+        self.ledger.connection.commit()
+        runner = LiveRunner(
+            self.ledger, routes=self.routes(), environment={},
+        )
+        prompt = runner._prompt(launch, self.routes()["codex"])
+        self.assertIn("Direct access to these systems is disabled: linear", prompt)
+        self.assertIn("Do not contact them through MCP, browser, web, CLI", prompt)
+        self.assertNotIn("tracker.example", prompt)
+        self.assertNotIn("linear-issue-1", prompt)
+        self.assertIn('"disabled_mcp_servers":["linear"]', prompt)
 
     def test_prompt_requires_an_immutable_snapshot(self):
         _kernel, execution, launch = self.launch("codex")
@@ -157,6 +320,49 @@ class LiveRunnerTests(unittest.TestCase):
             adapter.parse([json.dumps({"type": "turn.completed"})])
         with self.assertRaisesRegex(RunnerProtocolError, "code 1"):
             adapter.parse(self.lines("codex-0.147.0-success.jsonl"), exit_code=1)
+
+    def test_structured_outcome_remains_invalid_if_provider_ignores_schema(self):
+        proof = {
+            "dotfactory_result": 1,
+            "outcome": {
+                "state": "Autoplanning",
+                "plan": ["Run the no-change canary"],
+            },
+            "preferred_label": "complete",
+            "evidence": [{"kind": "test", "uri": "local://proof"}],
+        }
+        frames = [
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": json.dumps(proof)},
+            },
+            {"type": "turn.completed"},
+        ]
+        with self.assertRaisesRegex(RunnerProtocolError, "requires outcome"):
+            CodexAdapter().parse([json.dumps(frame) for frame in frames])
+
+    def test_result_scalar_fields_are_trimmed_after_strict_validation(self):
+        proof = {
+            "dotfactory_result": 1,
+            "outcome": "  succeeded  ",
+            "preferred_label": "  complete  ",
+            "evidence": [{"kind": "  test  ", "uri": "  local://proof  "}],
+        }
+        frames = [
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": json.dumps(proof)},
+            },
+            {"type": "turn.completed"},
+        ]
+        result = CodexAdapter().parse(
+            [json.dumps(frame) for frame in frames]
+        ).result
+        self.assertEqual("succeeded", result.outcome)
+        self.assertEqual("complete", result.preferred_label)
+        self.assertEqual(
+            {"kind": "test", "uri": "local://proof"}, result.evidence[0],
+        )
 
     def test_every_adapter_rejects_malformed_exit_failure_and_missing_evidence(self):
         for adapter, fixture in (
@@ -329,6 +535,41 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertEqual(len(stored["events"]), len(runner_trace))
         self.assertNotIn(secret, json.dumps(runner_trace, sort_keys=True))
 
+    def test_result_ready_replay_needs_no_live_runner_or_mcp_discovery(self):
+        _kernel, _execution, launch = self.launch("codex")
+        lines = self.lines("codex-0.147.0-success.jsonl")
+        executable = self.executable(f"""
+            import sys
+
+            sys.stdin.read()
+            for line in {lines!r}:
+                sys.stdout.write(line + "\\n")
+                sys.stdout.flush()
+        """)
+        first = LiveRunner(
+            self.ledger,
+            routes={"codex": RunnerRoute(
+                "codex", "codex", str(executable), "0.147.0", "approve-for-me",
+            )},
+            observed_versions={"codex": "0.147.0"},
+            environment={"HOME": str(self.root), "PATH": os.environ["PATH"]},
+        ).run(launch)
+        self.assertEqual("succeeded", first.outcome)
+
+        def forbidden_discovery(command, **options):
+            raise AssertionError("stored result replay contacted Codex")
+
+        replay = LiveRunner(
+            self.ledger,
+            routes={"codex": RunnerRoute(
+                "codex", "codex", "missing-codex", "0.147.0", "approve-for-me",
+                disabled_mcp_servers=("linear",),
+            )},
+            environment={"HOME": str(self.root), "PATH": os.environ["PATH"]},
+            run_command=forbidden_discovery,
+        ).run(launch)
+        self.assertEqual(first, replay)
+
     def test_tool_result_span_is_parented_to_its_tool_call(self):
         _kernel, execution, launch = self.launch("codex")
         proof = {
@@ -387,6 +628,34 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertEqual(2, len(tool_spans))
         self.assertEqual(tool_spans[0]["span_id"], tool_spans[1]["span_id"])
         self.assertEqual(tool_spans[0]["parent_span_id"], tool_spans[1]["parent_span_id"])
+        stored = self.ledger.runner_run_for_attempt(launch.request.attempt_id)
+        runner_records = [item for item in trace if item["domain"] == "runner"]
+        self.assertTrue(all(
+            item["trace_id"] == stable_trace_id(execution)
+            for item in runner_records
+        ))
+        lifecycle = [
+            item for item in runner_records if item["source_kind"] == "event"
+        ]
+        self.assertTrue(lifecycle)
+        self.assertTrue(all(
+            item["span_id"] == stored["root_span_id"] for item in lifecycle
+        ))
+        provider_records = [
+            item for item in runner_records
+            if item["source_kind"] == "runner_event"
+        ]
+        self.assertTrue(any(
+            item["parent_span_id"] == stored["root_span_id"]
+            for item in provider_records
+        ))
+        self.assertTrue(all(item["parent_span_id"] for item in provider_records))
+        self.assertTrue(all(
+            item["links"] == [{
+                "kind": "provider_trace", "trace_id": stored["trace_id"],
+            }]
+            for item in provider_records
+        ))
 
     def test_silence_timeout_terminates_owned_runner_and_records_error(self):
         _kernel, execution, launch = self.launch("codex")
@@ -559,7 +828,7 @@ class LiveRunnerTests(unittest.TestCase):
             self.ledger, kernel, attention_controllers={"omp": runner},
         ).execute(
             execution, command_id="resume-omp", principal=Principal(
-                "toma", "operator", "test"
+                "operator@example.test", "operator", "test"
             ), request={
                 "action": "attention", "expected_state": "Autoplanning",
                 "parameters": {
@@ -755,7 +1024,7 @@ class LiveRunnerTests(unittest.TestCase):
         database.commit()
         database.close()
         migrated = SQLiteLedger(path)
-        self.assertEqual(10, migrated.connection.execute(
+        self.assertEqual(11, migrated.connection.execute(
             "PRAGMA user_version"
         ).fetchone()[0])
         tables = {
@@ -797,6 +1066,7 @@ class RunnerConfigurationTests(unittest.TestCase):
         self.assertEqual(
             ("ANTHROPIC_API_KEY",), runners["omp"]["environment_envs"]
         )
+        self.assertEqual(("linear",), runners["codex"]["disabled_mcp_servers"])
         self.assertEqual("codex", config.validate_runner_name("codex"))
 
     def test_invalid_runner_registry_blocks_activation(self):
@@ -820,6 +1090,19 @@ class RunnerConfigurationTests(unittest.TestCase):
         self.assertEqual(30, resolved["silence_timeout_seconds"])
         runner["environment_envs"] = ["not-an-env"]
         with self.assertRaisesRegex(ValueError, "environment variable names"):
+            FactoryConfig.load(self.write())
+
+    def test_disabled_mcp_servers_are_codex_only_and_validated(self):
+        codex = self.values["runners"]["codex"]
+        codex["disabled_mcp_servers"] = ["linear", "linear"]
+        with self.assertRaisesRegex(ValueError, "must not contain duplicates"):
+            FactoryConfig.load(self.write())
+        codex["disabled_mcp_servers"] = ["linear.bad"]
+        with self.assertRaisesRegex(ValueError, "MCP server names"):
+            FactoryConfig.load(self.write())
+        codex["disabled_mcp_servers"] = ["linear"]
+        self.values["runners"]["claude"]["disabled_mcp_servers"] = ["linear"]
+        with self.assertRaisesRegex(ValueError, "only for Codex"):
             FactoryConfig.load(self.write())
 
     def test_schema_five_has_no_live_runners(self):

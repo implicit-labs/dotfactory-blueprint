@@ -126,6 +126,21 @@ profile, permission mode, and native capability declarations there. A node's
 `runner` must resolve to one active registry entry before launch. Do not put
 credentials, personal sessions, or executable paths in DOT.
 
+Codex routes may set `disabled_mcp_servers`. In each prepared workspace, the
+factory discovers configured servers with `codex mcp list --json`, disables
+matching servers, withholds the remote URL and internal ID from the prompt, and
+records the policy in the runner context. An absent server needs no override.
+Discovery failure blocks launch. The prompt forbids browser, web, CLI, and API
+fallbacks, but that part is cooperative unless a separate sandbox or network
+policy enforces it. Disable `linear` when the durable kernel owns Linear
+synchronization; disabling the projection alone does not disable a runner's
+personal connector.
+
+Linear projection configuration stores only environment-variable names and
+stable remote IDs. Enabling it requires one team ID per Linear project. Project
+preflight resolves every referenced workflow status to one exact status ID;
+missing, duplicated, or wrong-team values stop that project lane.
+
 The example OMP route uses the isolated `dotfactory-claude-api` profile and
 names `ANTHROPIC_API_KEY` in `environment_envs`. Export the key in the Factory
 process environment and configure the profile locally. The value is injected

@@ -83,8 +83,14 @@ class ControlHTTPApp:
             return self._respond(
                 start_response, 200, self.observation.run(run_match.group(1))
             )
+        waterfall_match = re.fullmatch(r"/v1/runs/([^/]+)/waterfall\.html", path)
+        if waterfall_match:
+            return self._respond_html(
+                start_response, 200,
+                self.observation.waterfall_html(waterfall_match.group(1)),
+            )
         child_match = re.fullmatch(
-            r"/v1/runs/([^/]+)/(events|artifacts|feedback)", path
+            r"/v1/runs/([^/]+)/(events|artifacts|feedback|trace|errors|summary|waterfall)", path
         )
         if child_match:
             execution_id, child = child_match.groups()
@@ -93,6 +99,20 @@ class ControlHTTPApp:
                     execution_id, after_seq=self._integer(query, "after_seq", 0),
                     limit=self._integer(query, "limit", 100),
                 )
+            elif child == "trace":
+                payload = self.observation.trace(
+                    execution_id, after_seq=self._integer(query, "after_seq", 0),
+                    limit=self._integer(query, "limit", 100),
+                )
+            elif child == "errors":
+                payload = self.observation.errors(
+                    execution_id, after_seq=self._integer(query, "after_seq", 0),
+                    limit=self._integer(query, "limit", 100),
+                )
+            elif child == "summary":
+                payload = self.observation.summary(execution_id)
+            elif child == "waterfall":
+                payload = self.observation.waterfall(execution_id)
             elif child == "artifacts":
                 payload = self.observation.artifacts(
                     execution_id, kind=self._one(query, "kind"),
@@ -179,3 +199,14 @@ class ControlHTTPApp:
              ("Content-Length", str(len(body))), ("Cache-Control", "no-store")],
         )
         return [body]
+
+    def _respond_html(
+        self, start_response: StartResponse, status: int, body: str
+    ) -> list[bytes]:
+        encoded = body.encode("utf-8")
+        start_response(
+            f"{status} OK",
+            [("Content-Type", "text/html; charset=utf-8"),
+             ("Content-Length", str(len(encoded))), ("Cache-Control", "no-store")],
+        )
+        return [encoded]

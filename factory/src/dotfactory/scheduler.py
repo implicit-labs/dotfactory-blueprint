@@ -118,6 +118,103 @@ class Scheduler:
             raise LedgerError(f"scheduler project is not active: {project_key}")
         return self.projects[project_key]
 
+    def remedy_attention(
+        self, execution_id: str, *, attention_id: str, remedy: str,
+        command_id: str, expected_attempt_id: str | None,
+    ) -> dict[str, Any]:
+        """Authorize replay from a scheduler-owned durable safe point."""
+        if remedy != "retry":
+            raise LedgerError("scheduler attention currently supports only retry")
+        if not command_id.strip():
+            raise LedgerError("scheduler attention requires a command ID")
+        attention = self.ledger.attention(attention_id)
+        if attention["execution_id"] != execution_id:
+            raise LedgerError("attention request belongs to another execution")
+        if attention.get("provider") != "scheduler":
+            raise LedgerError("attention request is not scheduler-owned")
+        detail = dict(attention["detail"])
+        resolution = detail.get("resolution", {})
+        attempt_id = str(attention.get("attempt_id") or "")
+        if not attempt_id or expected_attempt_id != attempt_id:
+            raise StaleAttempt("scheduler attention does not match the expected attempt")
+        if attention["status"] != "open":
+            if (
+                attention["status"] == "resolved"
+                and isinstance(resolution, dict)
+                and resolution.get("remedy") == remedy
+                and resolution.get("command_id") == command_id
+            ):
+                dispatch_id = detail.get("dispatch_id")
+                return {
+                    "attention": attention, "remedy": remedy,
+                    "dispatch": (
+                        self.ledger.dispatch(str(dispatch_id))
+                        if isinstance(dispatch_id, str) and dispatch_id else None
+                    ),
+                }
+            raise LedgerError("scheduler attention is already resolved")
+        if remedy not in detail.get("allowed_actions", []):
+            raise LedgerError(f"{remedy} is not allowed for this attention request")
+        dispatch_id = detail.get("dispatch_id")
+        if not isinstance(dispatch_id, str) or not dispatch_id:
+            raise LedgerError("scheduler attention has no durable dispatch")
+        dispatch = self.ledger.dispatch(dispatch_id)
+        self._project(dispatch)
+        if (
+            dispatch["execution_id"] != execution_id
+            or dispatch["attempt_id"] != attempt_id
+            or dispatch["attention_id"] != attention_id
+            or dispatch["status"] != "attention"
+        ):
+            raise LedgerError("scheduler attention is not linked to its dispatch")
+        error = dispatch.get("error")
+        resume_phase = error.get("resume_phase") if isinstance(error, dict) else None
+        if (
+            resume_phase != detail.get("last_safe_step")
+            or resume_phase not in ("claimed", "preparing", "prepared", "result_ready")
+        ):
+            raise LedgerError("scheduler attention has no retryable safe phase")
+        self.ledger.assert_attempt_active(
+            attempt_id, str(dispatch["attempt_fence_token"])
+        )
+        if resume_phase == "result_ready":
+            result = dispatch.get("result")
+            evidence = result.get("evidence") if isinstance(result, dict) else None
+            if (
+                not isinstance(result, dict)
+                or not isinstance(result.get("outcome"), str)
+                or not isinstance(result.get("preferred_label"), str)
+                or not isinstance(evidence, list) or not evidence
+                or any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("kind"), str) or not item["kind"]
+                    or not isinstance(item.get("uri"), str) or not item["uri"]
+                    for item in evidence
+                )
+            ):
+                raise LedgerError("scheduler result-ready payload is invalid")
+            preparation_id = dispatch.get("preparation_id")
+            if (
+                not isinstance(preparation_id, str)
+                or attention.get("preparation_id") != preparation_id
+            ):
+                raise LedgerError("scheduler result is not linked to its preparation")
+            preparation = self.ledger.preparation(preparation_id)
+            if (
+                preparation["status"] != "ready"
+                or preparation["attempt_id"] != attempt_id
+                or preparation["result_digest"] != dispatch["preparation_digest"]
+            ):
+                raise LedgerError("scheduler result preparation is not replayable")
+        resolved = self.ledger.resolve_attention(
+            attention_id, resolution="resolved",
+            detail={"remedy": remedy, "command_id": command_id},
+        )
+        return {
+            "attention": resolved, "remedy": remedy,
+            "dispatch": self.ledger.dispatch(dispatch_id),
+        }
+
     def _request(
         self, dispatch: Mapping[str, Any], project: ScheduledProject,
     ) -> RunnerRequest:
@@ -131,8 +228,13 @@ class Scheduler:
 
     def _attention(
         self, dispatch: Mapping[str, Any], *, category: str, message: str,
-        allowed_actions: tuple[str, ...], resume_phase: str,
+        resume_phase: str,
     ) -> SchedulerTick:
+        allowed_actions = (
+            ("retry",) if resume_phase in (
+                "claimed", "preparing", "prepared", "result_ready",
+            ) else ()
+        )
         preparation = self.ledger.preparation_for_attempt(
             str(dispatch["attempt_id"])
         )
@@ -274,7 +376,7 @@ class Scheduler:
             ))
             return self._attention(
                 current, category="preparation-fatal", message=message,
-                allowed_actions=("retry", "cancel"), resume_phase="preparing",
+                resume_phase="preparing",
             )
         if preparation.disposition != "ready" or not preparation.launch:
             raise PreparationError("preparation returned an invalid disposition")
@@ -296,7 +398,21 @@ class Scheduler:
             str(dispatch["id"]), claim_token=str(current["claim_token"])
         )
         self._fault("after_dispatch_intent")
-        result = self.dispatch_prepared(launch)
+        try:
+            result = self.dispatch_prepared(launch)
+        except Exception:
+            runner_run = self.ledger.runner_run_for_attempt(
+                str(dispatch["attempt_id"])
+            )
+            if not runner_run or runner_run["status"] not in ("failed", "canceled"):
+                raise
+            result = RunnerResult(
+                outcome="failed", preferred_label="failed",
+                evidence=({
+                    "kind": "runner_error",
+                    "uri": f"ledger://runner-runs/{runner_run['id']}",
+                },),
+            )
         self._fault("after_runner_result")
         result_payload = {
             "outcome": result.outcome,
@@ -313,11 +429,30 @@ class Scheduler:
         )
 
     def reconcile(self) -> SchedulerTick | None:
-        resumable = self.ledger.resumable_dispatches()
+        project_keys = tuple(sorted(self.projects))
+        resumable = self.ledger.resumable_dispatches(project_keys=project_keys)
         if resumable:
-            resumed = self.ledger.resume_attention_dispatch(
-                str(resumable[0]["id"]), scheduler_owner=self.owner,
-            )
+            dispatch = resumable[0]
+            self._project(dispatch)
+            try:
+                resumed = self.ledger.resume_attention_dispatch(
+                    str(dispatch["id"]), scheduler_owner=self.owner,
+                    project_keys=project_keys,
+                )
+            except StaleAttempt:
+                try:
+                    self.ledger.supersede_dispatch(
+                        str(dispatch["id"]),
+                        claim_token=str(dispatch["claim_token"]),
+                        reason="active attempt changed before attention replay",
+                    )
+                except StaleAttempt:
+                    pass
+                return self._emit(SchedulerTick(
+                    "superseded", dispatch_id=str(dispatch["id"]),
+                    execution_id=str(dispatch["execution_id"]),
+                    attempt_id=str(dispatch["attempt_id"]),
+                ))
             return self._emit(SchedulerTick(
                 "resumed", dispatch_id=str(resumed["id"]),
                 execution_id=str(resumed["execution_id"]),
@@ -325,15 +460,19 @@ class Scheduler:
                 detail={"phase": resumed["status"]},
             ))
         for dispatch in self.ledger.recoverable_dispatches(
-            scheduler_owner=self.owner,
+            scheduler_owner=self.owner, project_keys=project_keys,
         ):
+            command_key = (
+                f"execution:{dispatch['execution_id']}:transition:"
+                f"scheduler:{dispatch['id']}:complete"
+            )
+            recovery_category = "scheduler-recovery"
             try:
                 project = self._project(dispatch)
                 if dispatch["status"] == "dispatching":
                     return self._attention(
                         dispatch, category="ambiguous-dispatch",
                         message="runner launch intent exists without a durable result",
-                        allowed_actions=("retain", "cancel"),
                         resume_phase="dispatching",
                     )
                 if dispatch["status"] == "preparing":
@@ -344,7 +483,6 @@ class Scheduler:
                         return self._attention(
                             dispatch, category="ambiguous-preparation",
                             message="preparation stopped before a durable disposition",
-                            allowed_actions=("retry", "quarantine", "cancel"),
                             resume_phase="preparing" if preparation else "claimed",
                         )
                     recovered_dispatch = self.ledger.takeover_preparing_dispatch(
@@ -354,10 +492,6 @@ class Scheduler:
                     return self._handle_preparation(
                         recovered_dispatch, project, request, recovered=True,
                     )
-                command_key = (
-                    f"execution:{dispatch['execution_id']}:transition:"
-                    f"scheduler:{dispatch['id']}:complete"
-                )
                 if self.ledger.decision_for_command(command_key):
                     completed = self.ledger.complete_dispatch(
                         str(dispatch["id"]), claim_token=str(dispatch["claim_token"])
@@ -372,12 +506,12 @@ class Scheduler:
                     str(dispatch["id"]), scheduler_owner=self.owner,
                 )
                 request = self._request(recovered_dispatch, project)
+                recovery_category = "result-recovery"
                 preparation = project.preparation.prepare(request)
                 if preparation.disposition != "ready" or not preparation.launch:
                     return self._attention(
                         recovered_dispatch, category="result-recovery",
                         message="stored result could not rehydrate its prepared launch",
-                        allowed_actions=("retry", "retain", "cancel"),
                         resume_phase="result_ready",
                     )
                 payload = recovered_dispatch["result"]
@@ -388,15 +522,17 @@ class Scheduler:
                     preferred_label=str(payload["preferred_label"]),
                     evidence=tuple(dict(item) for item in payload["evidence"]),
                 )
+                recovery_category = "result-commit"
                 return self._commit_result(
                     recovered_dispatch, project, preparation.launch, result,
                     recovered=True,
                 )
             except StaleAttempt:
+                current = self.ledger.dispatch(str(dispatch["id"]))
                 try:
                     self.ledger.supersede_dispatch(
                         str(dispatch["id"]),
-                        claim_token=str(dispatch["claim_token"]),
+                        claim_token=str(current["claim_token"]),
                         reason="active attempt changed during scheduler recovery",
                     )
                 except StaleAttempt:
@@ -406,6 +542,39 @@ class Scheduler:
                     execution_id=str(dispatch["execution_id"]),
                     attempt_id=str(dispatch["attempt_id"]),
                 ))
+            except Exception as error:
+                current = self.ledger.dispatch(str(dispatch["id"]))
+                if (
+                    current["status"] == "result_ready"
+                    and self.ledger.decision_for_command(command_key)
+                ):
+                    completed = self.ledger.complete_dispatch(
+                        str(current["id"]),
+                        claim_token=str(current["claim_token"]),
+                    )
+                    return self._emit(SchedulerTick(
+                        "recovered", dispatch_id=str(completed["id"]),
+                        execution_id=str(completed["execution_id"]),
+                        attempt_id=str(completed["attempt_id"]),
+                        detail={"phase": "workflow_committed"},
+                    ))
+                phase = str(current["status"])
+                if phase == "dispatching":
+                    category = "ambiguous-dispatch"
+                elif phase == "result_ready":
+                    category = recovery_category
+                else:
+                    category = "scheduler-recovery"
+                resume_phase = (
+                    phase if phase in (
+                        "claimed", "preparing", "prepared", "dispatching",
+                        "result_ready",
+                    ) else "claimed"
+                )
+                return self._attention(
+                    current, category=category, message=str(error),
+                    resume_phase=resume_phase,
+                )
         return None
 
     def tick(self) -> SchedulerTick:
@@ -416,6 +585,7 @@ class Scheduler:
             scheduler_owner=self.owner,
             claim_ttl_seconds=self.policy.claim_ttl_seconds,
             limits=self.policy.as_limits(),
+            project_keys=tuple(sorted(self.projects)),
         )
         if claim["disposition"] != "claimed":
             return self._emit(SchedulerTick(
@@ -468,18 +638,15 @@ class Scheduler:
             if phase == "dispatching":
                 return self._attention(
                     current, category="ambiguous-dispatch", message=str(error),
-                    allowed_actions=("retain", "cancel"),
                     resume_phase="dispatching",
                 )
             if phase == "result_ready":
                 return self._attention(
                     current, category="result-commit", message=str(error),
-                    allowed_actions=("retry", "retain", "cancel"),
                     resume_phase="result_ready",
                 )
             return self._attention(
                 current, category="scheduler-infrastructure", message=str(error),
-                allowed_actions=("retry", "cancel"),
                 resume_phase=phase if phase in ("claimed", "preparing", "prepared")
                 else "claimed",
             )

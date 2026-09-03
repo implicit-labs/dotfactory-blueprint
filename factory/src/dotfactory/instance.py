@@ -12,6 +12,7 @@ from typing import Any
 
 ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 PROJECT_KEY = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+MCP_SERVER_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 SECRET_WORDS = ("authorization", "password", "secret", "token", "api_key")
 RESOURCE_SCOPES = {"attempt", "execution"}
 RESOURCE_MODES = {"exclusive", "namespaced", "capacity", "prerequisite"}
@@ -259,12 +260,77 @@ def _validate_projects(projects: Any, workflow_names: set[str] | None = None) ->
             raise FactoryConfigError(
                 f"{path}.tracker requires exactly one of project_id or project_id_env"
             )
+        team_ids = [name for name in ("team_id", "team_id_env") if tracker.get(name)]
+        if len(team_ids) > 1:
+            raise FactoryConfigError(
+                f"{path}.tracker accepts at most one of team_id or team_id_env"
+            )
+        if tracker.get("kind") == "linear" and team_ids:
+            for name in team_ids:
+                if not isinstance(tracker[name], str) or not tracker[name].strip():
+                    raise FactoryConfigError(f"{path}.tracker.{name} must be non-empty")
         repository_paths = [
             name for name in ("repository_path", "repository_path_env") if project.get(name)
         ]
         if len(repository_paths) != 1:
             raise FactoryConfigError(
                 f"{path} requires exactly one of repository_path or repository_path_env"
+            )
+
+
+def _validate_projections(values: dict[str, Any]) -> None:
+    projections = values.get("projections", {})
+    if not isinstance(projections, dict):
+        raise FactoryConfigError("config.projections must be an object")
+    linear = projections.get("linear")
+    if linear is None:
+        return
+    if not isinstance(linear, dict):
+        raise FactoryConfigError("config.projections.linear must be an object")
+    allowed = {
+        "enabled", "token_env", "endpoint", "timeout_seconds",
+        "poll_interval_seconds", "webhook_secret_env",
+    }
+    if set(linear) - allowed:
+        raise FactoryConfigError("config.projections.linear contains unknown fields")
+    if not isinstance(linear.get("enabled"), bool):
+        raise FactoryConfigError("config.projections.linear.enabled must be true or false")
+    token_env = linear.get("token_env")
+    if not isinstance(token_env, str) or not ENV_NAME.fullmatch(token_env):
+        raise FactoryConfigError(
+            "config.projections.linear.token_env must name an environment variable"
+        )
+    if "webhook_secret_env" in linear and (
+        not isinstance(linear["webhook_secret_env"], str)
+        or not ENV_NAME.fullmatch(linear["webhook_secret_env"])
+    ):
+        raise FactoryConfigError(
+            "config.projections.linear.webhook_secret_env must name an environment variable"
+        )
+    endpoint = linear.get("endpoint", "https://api.linear.app/graphql")
+    if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
+        raise FactoryConfigError("config.projections.linear.endpoint must use HTTPS")
+    for key, default, maximum in (
+        ("timeout_seconds", 15, 60), ("poll_interval_seconds", 30, 3600),
+    ):
+        value = linear.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+            raise FactoryConfigError(
+                f"config.projections.linear.{key} must be between 1 and {maximum}"
+            )
+    if linear["enabled"]:
+        missing_teams = sorted(
+            project_key for project_key, project in values["projects"].items()
+            if project.get("tracker", {}).get("kind") == "linear"
+            and not (
+                project["tracker"].get("team_id")
+                or project["tracker"].get("team_id_env")
+            )
+        )
+        if missing_teams:
+            raise FactoryConfigError(
+                "enabled Linear projection requires tracker team IDs for: "
+                + ", ".join(missing_teams)
             )
 
 
@@ -327,6 +393,7 @@ def _validate_runners(values: dict[str, Any]) -> None:
     allowed = {
         "kind", "command", "minimum_version", "permission_mode", "profile",
         "capabilities", "environment_envs", "silence_timeout_seconds",
+        "disabled_mcp_servers",
         "termination_grace_seconds", "maximum_frame_bytes",
         "maximum_reassembled_frame_bytes", "maximum_events",
         "maximum_payload_bytes",
@@ -363,6 +430,22 @@ def _validate_runners(values: dict[str, Any]) -> None:
         ):
             raise FactoryConfigError(
                 f"{path}.environment_envs must contain environment variable names"
+            )
+        disabled_mcp_servers = runner.get("disabled_mcp_servers", [])
+        if not isinstance(disabled_mcp_servers, list) or any(
+            not isinstance(item, str) or not MCP_SERVER_NAME.fullmatch(item)
+            for item in disabled_mcp_servers
+        ):
+            raise FactoryConfigError(
+                f"{path}.disabled_mcp_servers must contain MCP server names"
+            )
+        if len(disabled_mcp_servers) != len(set(disabled_mcp_servers)):
+            raise FactoryConfigError(
+                f"{path}.disabled_mcp_servers must not contain duplicates"
+            )
+        if disabled_mcp_servers and runner["kind"] != "codex":
+            raise FactoryConfigError(
+                f"{path}.disabled_mcp_servers is supported only for Codex"
             )
         defaults = {
             "silence_timeout_seconds": 300,
@@ -407,6 +490,7 @@ class FactoryConfig:
         _validate_projects(values.get("projects"), workflow_names)
         _validate_scheduler(values)
         _validate_runners(values)
+        _validate_projections(values)
         return cls(resolved, values)
 
     @classmethod
@@ -459,6 +543,17 @@ class FactoryConfig:
                 raise FactoryConfigError(
                     f"config.projects.{project_key}.tracker requires environment variable {env_name}"
                 )
+        tracker_team_id = None
+        if "team_id" in tracker:
+            tracker_team_id = str(tracker["team_id"])
+        elif "team_id_env" in tracker:
+            team_env = str(tracker["team_id_env"])
+            tracker_team_id = environment.get(team_env)
+            if not tracker_team_id:
+                raise FactoryConfigError(
+                    f"config.projects.{project_key}.tracker requires environment variable "
+                    f"{team_env}"
+                )
         repository_path = Path(resolve(
             "repository_path", "repository_path_env",
             f"config.projects.{project_key}.repository_path",
@@ -473,8 +568,39 @@ class FactoryConfig:
             "tracker_kind": tracker["kind"],
             "tracker_project_id": tracker_project_id,
             "tracker_project_slug": tracker.get("project_slug"),
+            "tracker_team_id": tracker_team_id,
             "workflow": project.get("workflow", self.values.get("default_workflow")),
         }
+
+    def resolve_linear_projection(
+        self, *, environment: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        environment = os.environ if environment is None else environment
+        linear = self.values.get("projections", {}).get("linear")
+        if not linear:
+            return {"enabled": False}
+        result = {
+            "enabled": bool(linear["enabled"]),
+            "endpoint": str(linear.get("endpoint", "https://api.linear.app/graphql")),
+            "timeout_seconds": int(linear.get("timeout_seconds", 15)),
+            "poll_interval_seconds": int(linear.get("poll_interval_seconds", 30)),
+            "token_env": str(linear["token_env"]),
+            "webhook_secret_env": linear.get("webhook_secret_env"),
+        }
+        if result["enabled"] and not environment.get(result["token_env"]):
+            raise FactoryConfigError(
+                "Linear projection requires environment variable " + result["token_env"]
+            )
+        return result
+
+    def linear_authorization(
+        self, *, environment: dict[str, str] | None = None,
+    ) -> str:
+        environment = os.environ if environment is None else environment
+        projection = self.resolve_linear_projection(environment=environment)
+        if not projection.get("enabled"):
+            raise FactoryConfigError("Linear projection is disabled")
+        return str(environment[projection["token_env"]])
 
     def resolve_workflow(self, project_key: str) -> dict[str, Any]:
         if project_key not in self.values["projects"]:
@@ -615,6 +741,9 @@ class FactoryConfig:
                 "profile": value.get("profile"),
                 "capabilities": tuple(value.get("capabilities", [])),
                 "environment_envs": tuple(value.get("environment_envs", [])),
+                "disabled_mcp_servers": tuple(
+                    value.get("disabled_mcp_servers", [])
+                ),
                 "silence_timeout_seconds": int(
                     value.get("silence_timeout_seconds", 300)
                 ),

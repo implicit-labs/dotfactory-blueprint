@@ -358,6 +358,105 @@ def _generated_edge_id(source: str, target: str, used: set[str]) -> str:
     return candidate
 
 
+def _validate_reverse_linear_routes(
+    states: list[dict[str, Any]], edges: list[dict[str, Any]],
+) -> None:
+    """A human status observation must select at most one edge per source."""
+    state_by_id = {str(item["id"]): item for item in states}
+    terminal = {
+        state_id for state_id, item in state_by_id.items()
+        if item["node_type"] == "terminal"
+    }
+    for source in sorted(state_by_id):
+        by_status: dict[str, list[str]] = defaultdict(list)
+        for edge in edges:
+            source_matches = edge["from"] == source or (
+                edge["from"] == "@any_nonterminal" and source not in terminal
+            )
+            if not source_matches or {
+                "actor": "human", "signal": "linear_status_change"
+            } not in edge["evocations"]:
+                continue
+            target = state_by_id[str(edge["to"])]
+            status = str(target.get("linear_status", ""))
+            if not status:
+                raise WorkflowError(
+                    f"human Linear route {edge['id']} targets a state without linear_status"
+                )
+            by_status[status].append(str(edge["id"]))
+        for status, edge_ids in sorted(by_status.items()):
+            if len(edge_ids) > 1:
+                raise WorkflowError(
+                    "ambiguous human Linear reverse route from "
+                    f"{source} for status {status}: {', '.join(sorted(edge_ids))}"
+                )
+
+
+def _state_definition_v1(
+    state: dict[str, Any], edges: list[dict[str, Any]],
+) -> dict[str, Any]:
+    state_id = str(state["id"])
+    incoming = sorted(
+        (edge for edge in edges if edge["to"] == state_id),
+        key=lambda item: str(item["id"]),
+    )
+    outgoing = sorted(
+        (
+            edge for edge in edges
+            if edge["from"] == state_id or edge["from"] == "@any_nonterminal"
+        ),
+        key=lambda item: str(item["id"]),
+    )
+    execution = dict(state.get("execution", {}))
+    entry_guards = []
+    for edge in incoming:
+        guard = {"edge_id": edge["id"], "from": edge["from"]}
+        for key in (
+            "condition", "confirmation", "required_role", "requires_evidence",
+            "requires_feedback", "requires_outcome",
+        ):
+            if key in edge:
+                guard[key] = edge[key]
+        entry_guards.append(guard)
+    retry_edges = [
+        edge["id"] for edge in outgoing
+        if edge.get("on") == "retry" or edge.get("action") == "retry"
+    ]
+    exhausted_edges = [
+        edge["id"] for edge in outgoing if edge.get("on") == "exhausted"
+    ]
+    return {
+        "version": 1,
+        "id": state_id,
+        "node_type": state["node_type"],
+        "kind": state["kind"],
+        "linear_status": state.get("linear_status") or None,
+        "entry_guards": entry_guards,
+        "exit_contract": execution.get("exit_contract"),
+        "retry_policy": {
+            "max_retries": execution.get("max_retries"),
+            "retry_edge_ids": retry_edges,
+            "exhausted_edge_ids": exhausted_edges,
+        },
+        "evidence_policy": {
+            "declared": execution.get("evidence"),
+            "required_exit_edge_ids": [
+                edge["id"] for edge in outgoing
+                if edge.get("requires_evidence") is True
+            ],
+        },
+        "runner_policy": {
+            key: execution[key] for key in (
+                "profile", "runner", "model", "reasoning_effort", "timeout"
+            ) if key in execution
+        },
+        "skills": list(execution.get("skills", [])),
+        "capabilities": list(execution.get("capabilities", [])),
+        "resources": list(execution.get("resources", [])),
+        "config_sources": dict(state.get("config_sources", {})),
+    }
+
+
 def compile_dot(
     graph: DotGraph, *, profile_paths: Iterable[str | Path] = (),
     factory_defaults: dict[str, Any] | None = None,
@@ -476,6 +575,7 @@ def compile_dot(
                         graph, located.line, located.column,
                         f"node {node_id} prompt does not exist: {prompt}",
                     )
+                execution["prompt"] = prompt_path.read_text(encoding="utf-8")
             state["execution"] = execution
             state["config_sources"] = {
                 key: sources[key] for key in execution if key in sources
@@ -559,6 +659,7 @@ def compile_dot(
     ids = [item["id"] for item in compiled_edges]
     if len(ids) != len(set(ids)):
         raise WorkflowError("workflow edge IDs must be unique")
+    _validate_reverse_linear_routes(states, compiled_edges)
     adjacency: dict[str, set[str]] = defaultdict(set)
     for edge in compiled_edges:
         if edge["from"] in state_ids:
@@ -602,9 +703,12 @@ def compile_dot(
     global_transitions = tuple(
         item for item in compiled_edges if item["from"] == "@any_nonterminal"
     )
+    for state in states:
+        state["state_definition"] = _state_definition_v1(state, compiled_edges)
     name = str(graph.attributes.get("name", graph.graph_id))
     normalized = {
         "schema_version": schema_version,
+        "state_definition_version": 1,
         "name": name,
         "scope": scope,
         "states": states,

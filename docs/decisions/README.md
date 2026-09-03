@@ -19,6 +19,8 @@ configured by dotfactory belong to their owning repository.
 | [0014](0014-expand-readable-dot-before-execution.md) | Expand readable DOT before execution | Accepted | — |
 | [0015](0015-run-live-agents-through-versioned-protocols.md) | Run live agents through versioned protocols | Accepted | — |
 | [0017](0017-keep-execution-traces-authoritative.md) | Keep execution traces authoritative | Accepted | — |
+| [0018](0018-reconcile-linear-through-the-durable-kernel.md) | Reconcile Linear through the durable kernel | Accepted | 0008 and 0011 (partial) |
+| [0019](0019-compose-one-recoverable-lifecycle.md) | Compose one recoverable lifecycle | Accepted | — |
 
 ## Lifecycle
 

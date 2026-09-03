@@ -6,11 +6,13 @@
   "workflows": {
     "default": {
       "path": "./workflows/default.dot",
-      "profile_paths": []
+      "profile_paths": [],
+      "defaults": {"runner": "codex", "resources": []}
     },
     "three-step": {
       "path": "./workflows/three-step.dot",
-      "profile_paths": []
+      "profile_paths": [],
+      "defaults": {"runner": "codex", "resources": []}
     }
   },
   "scheduler": {
@@ -28,6 +30,7 @@
       "command": "codex",
       "minimum_version": "0.147.0",
       "permission_mode": "approve-for-me",
+      "disabled_mcp_servers": ["linear"],
       "capabilities": []
     },
     "claude": {
@@ -88,7 +91,8 @@
       "tracker": {
         "kind": "linear",
         "project_slug": "example-ios",
-        "project_id_env": "DOTFACTORY_EXAMPLE_IOS_LINEAR_PROJECT_ID"
+        "project_id_env": "DOTFACTORY_EXAMPLE_IOS_LINEAR_PROJECT_ID",
+        "team_id_env": "DOTFACTORY_EXAMPLE_IOS_LINEAR_TEAM_ID"
       }
     },
     "example-service": {
@@ -99,12 +103,20 @@
       "tracker": {
         "kind": "linear",
         "project_slug": "example-service",
-        "project_id_env": "DOTFACTORY_EXAMPLE_SERVICE_LINEAR_PROJECT_ID"
+        "project_id_env": "DOTFACTORY_EXAMPLE_SERVICE_LINEAR_PROJECT_ID",
+        "team_id_env": "DOTFACTORY_EXAMPLE_SERVICE_LINEAR_TEAM_ID"
       }
     }
   },
   "projections": {
-    "linear": {"enabled": false, "token_env": "LINEAR_API_KEY"},
+    "linear": {
+      "enabled": false,
+      "token_env": "LINEAR_API_KEY",
+      "endpoint": "https://api.linear.app/graphql",
+      "timeout_seconds": 15,
+      "poll_interval_seconds": 30,
+      "webhook_secret_env": "LINEAR_WEBHOOK_SECRET"
+    },
     "logfire": {
       "enabled": false,
       "endpoint_env": "OTEL_EXPORTER_OTLP_ENDPOINT",

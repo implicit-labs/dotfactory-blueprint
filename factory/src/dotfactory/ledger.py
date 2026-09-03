@@ -14,13 +14,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from .linear_reconciliation import (
+    LinearObservationV1, LinearStatusBindingV1, TRANSITION_SOURCES,
+)
 from .observability import (
     ErrorFactV1, ProjectionReceiptV1, TraceRecordV1, canonical_json,
     error_fingerprint, stable_record_id, stable_span_id, stable_trace_id,
 )
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 LEGACY_STATE_IDS = {
     "todo": "Todo",
@@ -288,6 +291,7 @@ class SQLiteLedger:
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
+                self._create_schema_eleven_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 1:
@@ -393,6 +397,7 @@ class SQLiteLedger:
                     self._create_schema_eight_additions(db)
                     self._create_schema_nine_additions(db)
                     self._create_schema_ten_additions(db)
+                    self._create_schema_eleven_additions(db)
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             finally:
                 self.connection.execute(
@@ -413,6 +418,7 @@ class SQLiteLedger:
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
+                self._create_schema_eleven_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 3:
@@ -424,6 +430,7 @@ class SQLiteLedger:
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
+                self._create_schema_eleven_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 4:
@@ -434,6 +441,7 @@ class SQLiteLedger:
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
+                self._create_schema_eleven_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 5:
@@ -443,6 +451,7 @@ class SQLiteLedger:
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
+                self._create_schema_eleven_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 6:
@@ -451,6 +460,7 @@ class SQLiteLedger:
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
+                self._create_schema_eleven_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 7:
@@ -458,17 +468,25 @@ class SQLiteLedger:
                 self._create_schema_eight_additions(db)
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
+                self._create_schema_eleven_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 8:
             with self.transaction() as db:
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
+                self._create_schema_eleven_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 9:
             with self.transaction() as db:
                 self._create_schema_ten_additions(db)
+                self._create_schema_eleven_additions(db)
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            return
+        if version == 10:
+            with self.transaction() as db:
+                self._create_schema_eleven_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         raise LedgerError(f"no migration from ledger schema {version}")
@@ -778,6 +796,78 @@ class SQLiteLedger:
         )
         self._backfill_schema_ten(db)
 
+    def _create_schema_eleven_additions(self, db: sqlite3.Connection) -> None:
+        transition_columns = {
+            str(row["name"]) for row in db.execute(
+                "PRAGMA table_info(transition_decisions)"
+            )
+        }
+        if transition_columns and "source_kind" not in transition_columns:
+            db.execute(
+                "ALTER TABLE transition_decisions ADD COLUMN source_kind TEXT"
+            )
+            db.execute(
+                "UPDATE transition_decisions SET source_kind=actor "
+                "WHERE source_kind IS NULL"
+            )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_status_bindings ("
+            "project_key TEXT NOT NULL REFERENCES projects(project_key),"
+            "workflow_digest TEXT NOT NULL,team_id TEXT NOT NULL,status_id TEXT NOT NULL,"
+            "status_name TEXT NOT NULL,status_type TEXT NOT NULL,binding_digest TEXT NOT NULL,"
+            "schema_version INTEGER NOT NULL,created_at TEXT NOT NULL,"
+            "PRIMARY KEY(project_key,workflow_digest,status_id),"
+            "UNIQUE(project_key,workflow_digest,status_name))"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_observations ("
+            "id TEXT PRIMARY KEY,execution_id TEXT NOT NULL "
+            "REFERENCES workflow_executions(id),"
+            "project_key TEXT NOT NULL REFERENCES projects(project_key),"
+            "workflow_digest TEXT NOT NULL,observation_key TEXT NOT NULL UNIQUE,"
+            "source TEXT NOT NULL,delivery_id TEXT,issue_id TEXT NOT NULL,"
+            "issue_identifier TEXT NOT NULL,status_id TEXT NOT NULL,status_name TEXT NOT NULL,"
+            "remote_updated_at TEXT NOT NULL,actor_id TEXT,payload_hash TEXT NOT NULL,"
+            "schema_version INTEGER NOT NULL,disposition TEXT NOT NULL,reason TEXT,"
+            "event_seq INTEGER REFERENCES events(seq),received_at TEXT NOT NULL,"
+            "observed_at TEXT NOT NULL,reconciled_at TEXT)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS linear_observations_pending "
+            "ON linear_observations(disposition,received_at)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_mutations ("
+            "id TEXT PRIMARY KEY,execution_id TEXT NOT NULL "
+            "REFERENCES workflow_executions(id),"
+            "event_seq INTEGER NOT NULL REFERENCES events(seq),"
+            "semantic_key TEXT NOT NULL UNIQUE,mutation_kind TEXT NOT NULL,"
+            "desired_status TEXT NOT NULL,expected_observed_status TEXT,"
+            "request_hash TEXT NOT NULL,request_json TEXT NOT NULL,status TEXT NOT NULL,"
+            "attempt_count INTEGER NOT NULL DEFAULT 0,remote_id TEXT,"
+            "confirmation_hash TEXT,last_error_json TEXT,next_attempt_at TEXT,"
+            "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,confirmed_at TEXT,"
+            "UNIQUE(event_seq,mutation_kind))"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS linear_mutations_pending "
+            "ON linear_mutations(status,next_attempt_at,created_at)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_mutation_attempts ("
+            "id TEXT PRIMARY KEY,mutation_id TEXT NOT NULL REFERENCES linear_mutations(id),"
+            "attempt_number INTEGER NOT NULL,request_hash TEXT NOT NULL,status TEXT NOT NULL,"
+            "response_hash TEXT,error_json TEXT,started_at TEXT NOT NULL,completed_at TEXT,"
+            "UNIQUE(mutation_id,attempt_number))"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_confirmations ("
+            "id TEXT PRIMARY KEY,mutation_id TEXT NOT NULL REFERENCES linear_mutations(id),"
+            "observation_id TEXT REFERENCES linear_observations(id),remote_id TEXT,"
+            "observed_status TEXT NOT NULL,response_hash TEXT NOT NULL,status TEXT NOT NULL,"
+            "recorded_at TEXT NOT NULL,UNIQUE(mutation_id,response_hash))"
+        )
+
     @staticmethod
     def _table_exists(db: sqlite3.Connection, table: str) -> bool:
         return db.execute(
@@ -1041,6 +1131,13 @@ class SQLiteLedger:
         )
         started_at, ended_at = self._event_times(event_type, occurred_at)
         status = self._event_status(event_type)
+        span_id = stable_span_id(entity_kind, entity_id)
+        if entity_kind == "runner_run":
+            runner = db.execute(
+                "SELECT root_span_id FROM runner_runs WHERE id=?", (entity_id,)
+            ).fetchone()
+            if runner and runner["root_span_id"]:
+                span_id = str(runner["root_span_id"])
         record = TraceRecordV1(
             record_id=stable_record_id(source_kind, event_id), execution_id=execution_id,
             source_kind=source_kind, source_id=event_id,
@@ -1050,7 +1147,7 @@ class SQLiteLedger:
                 if isinstance(payload.get("runner_run_id"), str) else None
             ),
             trace_id=stable_trace_id(execution_id),
-            span_id=stable_span_id(entity_kind, entity_id),
+            span_id=span_id,
             parent_span_id=self._parent_span_id(
                 entity_kind, execution_id=execution_id, state_run_id=state_run_id,
                 attempt_id=attempt_id, payload=payload,
@@ -1088,6 +1185,8 @@ class SQLiteLedger:
         )
         kind = str(row["kind"])
         parent_span_id = row["parent_span_id"]
+        if str(row["span_id"]) == str(run["root_span_id"]) and not parent_span_id:
+            parent_span_id = stable_span_id("attempt", str(run["attempt_id"]))
         if kind == "tool_result" and operation_id and parent_span_id:
             opening = db.execute(
                 "SELECT parent_span_id FROM runner_events WHERE runner_run_id=? "
@@ -1111,7 +1210,7 @@ class SQLiteLedger:
             execution_id=str(row["execution_id"]), source_kind="runner_event",
             source_id=str(row["event_id"]), state_run_id=run["state_run_id"],
             attempt_id=str(row["attempt_id"]), runner_run_id=str(row["runner_run_id"]),
-            trace_id=stable_trace_id(str(row["execution_id"])), span_id=span_id,
+            trace_id=str(run["execution_trace_id"]), span_id=span_id,
             parent_span_id=parent_span_id,
             record_kind=(
                 "error" if kind == "error" else
@@ -1129,7 +1228,9 @@ class SQLiteLedger:
             observed_at=str(row["observed_at"]), origin=str(row["origin"]),
             trust_class=("reconstructed" if reconstructed else str(row["trust_class"])),
             ordering_quality="reconstructed" if reconstructed else "exact",
-            completeness=completeness, payload=payload,
+            links=({
+                "kind": "provider_trace", "trace_id": str(run["trace_id"]),
+            },), completeness=completeness, payload=payload,
         )
         self._insert_trace_record(db, record, source_seq=int(row["seq"]))
         if kind == "error":
@@ -1169,6 +1270,93 @@ class SQLiteLedger:
                 (self.id_factory(), destination, seq, "pending", occurred_at),
             )
         return seq
+
+    def _queue_linear_status_mutation(
+        self, db: sqlite3.Connection, *, execution_id: str, event_seq: int,
+        desired_status: str, expected_observed_status: str | None,
+    ) -> str:
+        execution = db.execute(
+            "SELECT wi.project_key,wi.identifier FROM workflow_executions we "
+            "JOIN work_items wi ON wi.id=we.work_item_id WHERE we.id=?",
+            (execution_id,),
+        ).fetchone()
+        if not execution:
+            raise LedgerError("execution not found")
+        semantic_key = f"execution:{execution_id}:event:{event_seq}:linear-status"
+        request = redact_payload({
+            "schema_version": 1,
+            "mutation_kind": "set_status",
+            "project_key": execution["project_key"],
+            "issue_identifier": execution["identifier"],
+            "execution_id": execution_id,
+            "desired_status": desired_status,
+        })
+        request_json = canonical_json(request)
+        request_hash = hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+        mutation_id = stable_record_id("linear_mutation", semantic_key)
+        now = self.clock()
+        confirmed = expected_observed_status == desired_status
+        db.execute(
+            "INSERT OR IGNORE INTO linear_mutations("
+            "id,execution_id,event_seq,semantic_key,mutation_kind,desired_status,"
+            "expected_observed_status,request_hash,request_json,status,attempt_count,"
+            "remote_id,confirmation_hash,last_error_json,next_attempt_at,created_at,"
+            "updated_at,confirmed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (mutation_id, execution_id, event_seq, semantic_key, "set_status",
+             desired_status, expected_observed_status, request_hash, request_json,
+             "confirmed" if confirmed else "pending", 0, None,
+             request_hash if confirmed else None, None, None, now, now,
+             now if confirmed else None),
+        )
+        if confirmed:
+            confirmation_id = stable_record_id("linear_confirmation", semantic_key)
+            db.execute(
+                "INSERT OR IGNORE INTO linear_confirmations("
+                "id,mutation_id,observation_id,remote_id,observed_status,response_hash,"
+                "status,recorded_at) VALUES(?,?,?,?,?,?,?,?)",
+                (confirmation_id, mutation_id, None, None, desired_status,
+                 request_hash, "confirmed", now),
+            )
+        self._fault("after_linear_mutation_queued")
+        return mutation_id
+
+    def _confirm_linear_status_mutations(
+        self, db: sqlite3.Connection, *, execution_id: str,
+        observed_status: str, observation_id: str | None,
+        evidence: dict[str, Any],
+    ) -> int:
+        evidence_json = canonical_json(redact_payload(evidence))
+        response_hash = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+        rows = db.execute(
+            "SELECT id FROM linear_mutations WHERE execution_id=? AND desired_status=? "
+            "AND status IN ('pending','retry','sending','ambiguous','conflict')",
+            (execution_id, observed_status),
+        ).fetchall()
+        now = self.clock()
+        for row in rows:
+            mutation_id = str(row["id"])
+            db.execute(
+                "UPDATE linear_mutations SET status='confirmed',confirmation_hash=?,"
+                "last_error_json=NULL,next_attempt_at=NULL,updated_at=?,confirmed_at=? "
+                "WHERE id=?", (response_hash, now, now, mutation_id),
+            )
+            db.execute(
+                "UPDATE linear_mutation_attempts SET status='confirmed',response_hash=?,"
+                "completed_at=COALESCE(completed_at,?) WHERE mutation_id=? "
+                "AND status IN ('sending','ambiguous')",
+                (response_hash, now, mutation_id),
+            )
+            confirmation_id = stable_record_id(
+                "linear_confirmation", f"{mutation_id}:{response_hash}"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO linear_confirmations("
+                "id,mutation_id,observation_id,remote_id,observed_status,response_hash,"
+                "status,recorded_at) VALUES(?,?,?,?,?,?,?,?)",
+                (confirmation_id, mutation_id, observation_id, None,
+                 observed_status, response_hash, "confirmed", now),
+            )
+        return len(rows)
 
     def configure_factory(self, factory_id: str) -> None:
         row = self.connection.execute(
@@ -1351,7 +1539,7 @@ class SQLiteLedger:
                         db, attempt_id=initial_attempt, workflow_digest=workflow_digest,
                         state_id=state_id, resolved_node=resolved_node or {},
                     )
-            self._event(
+            seq = self._event(
                 db, execution_id=execution_id, state_run_id=state_run_id,
                 attempt_id=initial_attempt, event_type="execution_started",
                 payload={
@@ -1362,6 +1550,10 @@ class SQLiteLedger:
                 },
                 idempotency_key=idempotency_key,
             )
+            self._queue_linear_status_mutation(
+                db, execution_id=execution_id, event_seq=seq,
+                desired_status=linear_status, expected_observed_status=None,
+            )
         return execution_id
 
     def accept_transition(
@@ -1369,7 +1561,8 @@ class SQLiteLedger:
         to_kind: str, desired_linear_status: str, actor: str, signal: str,
         owner: str | None, attempt_id: str | None, fence_token: str | None,
         outcome: str | None, evidence: list[dict[str, Any]], idempotency_key: str,
-        terminal: bool, feedback: list[dict[str, Any]] | None = None,
+        terminal: bool, source_kind: str | None = None,
+        feedback: list[dict[str, Any]] | None = None,
         observed_linear_status: str | None = None,
         observation: dict[str, Any] | None = None,
         stored_feedback_ids: list[str] | None = None,
@@ -1378,7 +1571,12 @@ class SQLiteLedger:
         feedback_kind: str | None = None,
         resolved_node: dict[str, Any] | None = None,
         workflow_digest: str | None = None,
+        observation_id: str | None = None,
+        resume_state_id: str | None = None,
     ) -> dict[str, Any]:
+        source_kind = source_kind or actor
+        if source_kind not in TRANSITION_SOURCES:
+            raise LedgerError(f"unsupported transition source: {source_kind}")
         prior = self.connection.execute(
             "SELECT td.* FROM transition_decisions td JOIN events e ON e.seq=td.event_seq "
             "WHERE e.idempotency_key=?", (idempotency_key,),
@@ -1426,6 +1624,9 @@ class SQLiteLedger:
             ).fetchone()
             released_lease_ids = []
             release_pending_allocation_ids = []
+            canceled_runner_run_ids: list[str] = []
+            superseded_dispatch_ids: list[str] = []
+            canceled_attention_ids: list[str] = []
             completed_attempt_facts = None
             if current_run["state_kind"] == "work":
                 active = db.execute(
@@ -1477,6 +1678,15 @@ class SQLiteLedger:
                     "UPDATE resource_allocations SET status='release_pending' "
                     "WHERE attempt_id=? AND status='active'", (attempt_id,),
                 )
+                if terminal and outcome == "canceled":
+                    terminalized = self._terminalize_canceled_attempt(
+                        db, execution_id=execution_id,
+                        state_run_id=str(current_run["id"]),
+                        attempt_id=str(attempt_id),
+                    )
+                    canceled_runner_run_ids = terminalized["runner_run_ids"]
+                    superseded_dispatch_ids = terminalized["dispatch_ids"]
+                    canceled_attention_ids = terminalized["attention_ids"]
                 self._fault("after_leases_released")
             db.execute(
                 "UPDATE state_runs SET status='completed',completed_at=? WHERE id=?",
@@ -1489,7 +1699,8 @@ class SQLiteLedger:
             db.execute(
                 "INSERT INTO state_runs VALUES(?,?,?,?,?,?,?,?,?)",
                 (next_run_id, execution_id, to_state, to_kind, ordinal,
-                 "completed" if terminal else "active", None, next_run_started_at,
+                 "completed" if terminal else "active", resume_state_id,
+                 next_run_started_at,
                  self.clock() if terminal else None),
             )
             self._fault("after_next_state_run_created")
@@ -1580,15 +1791,20 @@ class SQLiteLedger:
                     (self.clock(), *superseded_request_ids),
                 )
             payload = {"edge_id": edge_id, "from": from_state, "to": to_state,
-                       "actor": actor, "signal": signal, "outcome": outcome,
+                       "actor": actor, "source_kind": source_kind,
+                       "signal": signal, "outcome": outcome,
                        "evidence": evidence, "attempt_id": next_attempt,
                        "artifact_ids": artifact_ids,
                        "released_lease_ids": released_lease_ids,
                        "release_pending_allocation_ids": release_pending_allocation_ids,
+                       "canceled_runner_run_ids": canceled_runner_run_ids,
+                       "superseded_dispatch_ids": superseded_dispatch_ids,
+                       "canceled_attention_ids": canceled_attention_ids,
                        "feedback": review_feedback, "feedback_ids": feedback_ids,
                        "completed_attempt": completed_attempt_facts,
                        "entered_attempt": entered_attempt_facts,
                        "superseded_transition_request_ids": superseded_request_ids,
+                       "resume_state_id": resume_state_id,
                        "observation": observation,
                        "workflow_digest": workflow_digest,
                        "resolved_node": resolved_node or {}}
@@ -1597,9 +1813,12 @@ class SQLiteLedger:
                               payload=payload, idempotency_key=idempotency_key)
             self._fault("after_event_recorded")
             db.execute(
-                "INSERT INTO transition_decisions VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (decision_id, execution_id, edge_id, from_state, to_state, actor, signal,
-                 desired_linear_status, seq, self.clock()),
+                "INSERT INTO transition_decisions("
+                "id,execution_id,edge_id,from_state,to_state,actor,signal,"
+                "desired_linear_status,event_seq,decided_at,source_kind) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (decision_id, execution_id, edge_id, from_state, to_state, actor,
+                 signal, desired_linear_status, seq, self.clock(), source_kind),
             )
             self._fault("after_transition_decision_recorded")
             db.execute(
@@ -1610,6 +1829,35 @@ class SQLiteLedger:
                  observed_linear_status, next_run_id,
                  self.clock() if terminal else None, execution_id),
             )
+            self._queue_linear_status_mutation(
+                db, execution_id=execution_id, event_seq=seq,
+                desired_status=desired_linear_status,
+                expected_observed_status=(
+                    observed_linear_status
+                    if observed_linear_status is not None
+                    else execution["observed_linear_status"]
+                ),
+            )
+            if observed_linear_status == desired_linear_status:
+                self._confirm_linear_status_mutations(
+                    db, execution_id=execution_id,
+                    observed_status=observed_linear_status,
+                    observation_id=observation_id,
+                    evidence={
+                        "kind": "linear_observation",
+                        "observation_id": observation_id,
+                        "source_event_id": (observation or {}).get("source_event_id"),
+                        "observed_status": observed_linear_status,
+                    },
+                )
+            if observation_id:
+                updated = db.execute(
+                    "UPDATE linear_observations SET disposition='accepted',reason=?,"
+                    "event_seq=?,reconciled_at=? WHERE id=? AND disposition='pending'",
+                    ("authorized human transition", seq, self.clock(), observation_id),
+                ).rowcount
+                if updated != 1:
+                    raise LedgerError("Linear observation is missing or already reconciled")
             if transition_request_id:
                 db.execute(
                     "UPDATE transition_requests SET status='consumed',consumed_at=? WHERE id=?",
@@ -1620,6 +1868,110 @@ class SQLiteLedger:
         return {"id": decision_id, "event_seq": seq, "attempt_id": next_attempt,
                 "fence_token": next_fence, "to_state": to_state,
                 "feedback_ids": feedback_ids}
+
+    def _terminalize_canceled_attempt(
+        self, db: sqlite3.Connection, *, execution_id: str,
+        state_run_id: str, attempt_id: str,
+    ) -> dict[str, list[str]]:
+        """Close only live records owned by an attempt canceled at a terminal."""
+        now = self.clock()
+        dispatches = db.execute(
+            "SELECT * FROM scheduler_dispatches WHERE attempt_id=? AND status IN "
+            "('claimed','preparing','prepared','dispatching','result_ready','waiting',"
+            "'attention') ORDER BY created_at,id",
+            (attempt_id,),
+        ).fetchall()
+        ambiguous_side_effect = any(
+            row["status"] == "dispatching"
+            or json.loads(row["error_json"] or "{}").get("category")
+            == "ambiguous-dispatch"
+            for row in dispatches
+        )
+
+        runner_run_ids = []
+        for row in db.execute(
+            "SELECT * FROM runner_runs WHERE attempt_id=? AND status IN "
+            "('planned','starting','running','waiting_input','resume_authorized') "
+            "ORDER BY created_at,id",
+            (attempt_id,),
+        ).fetchall():
+            runner_run_id = str(row["id"])
+            error = {
+                "class": "canceled",
+                "message": "runner canceled by terminal workflow transition",
+                "retryable": False,
+                "ambiguous_side_effect": ambiguous_side_effect,
+                "safe_remedy": "No retry is pending; inspect the preserved trace if needed.",
+            }
+            db.execute(
+                "UPDATE runner_runs SET status='canceled',error_json=?,"
+                "last_activity_at=?,completed_at=? WHERE id=?",
+                (json.dumps(error, sort_keys=True), now, now, runner_run_id),
+            )
+            self._event(
+                db, execution_id=execution_id, state_run_id=state_run_id,
+                attempt_id=attempt_id, event_type="runner_canceled",
+                payload={"runner_run_id": runner_run_id,
+                         "trace_id": row["trace_id"], "error": error},
+                idempotency_key=f"runner:{runner_run_id}:canceled",
+            )
+            runner_run_ids.append(runner_run_id)
+
+        attention_ids = []
+        for row in db.execute(
+            "SELECT * FROM attention_requests WHERE attempt_id=? AND status='open' "
+            "ORDER BY created_at,id",
+            (attempt_id,),
+        ).fetchall():
+            attention_id = str(row["id"])
+            detail = json.loads(row["detail_json"])
+            resolution = {
+                "reason": "execution canceled by terminal workflow transition",
+                "attempt_id": attempt_id,
+            }
+            detail["resolution"] = resolution
+            db.execute(
+                "UPDATE attention_requests SET status='canceled',detail_json=?,"
+                "updated_at=?,resolved_at=? WHERE id=?",
+                (json.dumps(detail, sort_keys=True), now, now, attention_id),
+            )
+            self._event(
+                db, execution_id=execution_id, state_run_id=state_run_id,
+                attempt_id=attempt_id, event_type="attention_resolved",
+                payload={"attention_id": attention_id, "resolution": "canceled",
+                         "detail": resolution},
+                idempotency_key=f"attention:{attention_id}:canceled",
+            )
+            attention_ids.append(attention_id)
+
+        dispatch_ids = []
+        for row in dispatches:
+            dispatch_id = str(row["id"])
+            preserved_error = row["error_json"] or json.dumps({
+                "message": "dispatch superseded by terminal workflow cancellation"
+            }, sort_keys=True)
+            db.execute(
+                "UPDATE scheduler_dispatches SET status='superseded',expires_at=NULL,"
+                "error_json=?,updated_at=?,completed_at=? WHERE id=?",
+                (preserved_error, now, now, dispatch_id),
+            )
+            self._event(
+                db, execution_id=execution_id, state_run_id=state_run_id,
+                attempt_id=attempt_id,
+                event_type="scheduler_dispatch_superseded",
+                payload={"dispatch_id": dispatch_id,
+                         "reason": "execution canceled by terminal transition"},
+                idempotency_key=(
+                    f"dispatch:{dispatch_id}:superseded:terminal-cancel"
+                ),
+            )
+            dispatch_ids.append(dispatch_id)
+
+        return {
+            "runner_run_ids": runner_run_ids,
+            "dispatch_ids": dispatch_ids,
+            "attention_ids": attention_ids,
+        }
 
     def acquire_resource(
         self, resource_id: str, *, attempt_id: str, fence_token: str,
@@ -2913,7 +3265,9 @@ class SQLiteLedger:
 
     def recoverable_dispatches(
         self, *, scheduler_owner: str,
+        project_keys: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
+        allowed = set(project_keys) if project_keys is not None else None
         return [
             self._dispatch_dict(row) for row in self.connection.execute(
                 "SELECT * FROM scheduler_dispatches "
@@ -2921,9 +3275,13 @@ class SQLiteLedger:
                 "AND scheduler_owner=? ORDER BY created_at,id",
                 (scheduler_owner,),
             )
+            if allowed is None or str(row["project_key"]) in allowed
         ]
 
-    def resumable_dispatches(self) -> list[dict[str, Any]]:
+    def resumable_dispatches(
+        self, *, project_keys: tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        allowed = set(project_keys) if project_keys is not None else None
         items = []
         rows = self.connection.execute(
             "SELECT sd.*,ar.status AS attention_status,ar.detail_json "
@@ -2938,13 +3296,16 @@ class SQLiteLedger:
                 row["attention_status"] == "resolved"
                 and detail.get("resolution", {}).get("remedy") == "retry"
                 and error.get("resume_phase")
+                and (allowed is None or str(row["project_key"]) in allowed)
             ):
                 items.append(self.dispatch(str(row["id"])))
         return items
 
     def resume_attention_dispatch(
         self, dispatch_id: str, *, scheduler_owner: str,
+        project_keys: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
+        allowed = set(project_keys) if project_keys is not None else None
         with self.transaction() as db:
             row = db.execute(
                 "SELECT sd.*,ar.status AS attention_status,ar.detail_json "
@@ -2954,6 +3315,8 @@ class SQLiteLedger:
             ).fetchone()
             if not row:
                 raise StaleAttempt("scheduler attention is no longer resumable")
+            if allowed is not None and str(row["project_key"]) not in allowed:
+                raise LedgerError("scheduler dispatch belongs to an inactive project")
             detail = json.loads(row["detail_json"])
             error = json.loads(row["error_json"] or "{}")
             resume_phase = error.get("resume_phase")
@@ -2993,8 +3356,9 @@ class SQLiteLedger:
 
     def claim_dispatch(
         self, *, scheduler_owner: str, claim_ttl_seconds: int,
-        limits: dict[str, Any],
+        limits: dict[str, Any], project_keys: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
+        allowed = set(project_keys) if project_keys is not None else None
         now = self.clock()
         now_value = parse_timestamp(now)
         expires_at = (now_value + timedelta(seconds=claim_ttl_seconds)).isoformat()
@@ -3031,6 +3395,11 @@ class SQLiteLedger:
             ).fetchall()
             blocked: list[dict[str, str]] = []
             for candidate in candidates:
+                if (
+                    allowed is not None
+                    and str(candidate["project_key"]) not in allowed
+                ):
+                    continue
                 existing = db.execute(
                     "SELECT * FROM scheduler_dispatches WHERE attempt_id=?",
                     (candidate["attempt_id"],),
@@ -3639,6 +4008,7 @@ class SQLiteLedger:
         source_event_id: str | None = None,
         requires_feedback: bool = False,
         feedback_kind: str | None = None,
+        observation_id: str | None = None,
     ) -> dict[str, Any]:
         prior = self.event_for_command(idempotency_key)
         if prior:
@@ -3676,7 +4046,8 @@ class SQLiteLedger:
                 )
                 feedback_ids.append(feedback_id)
             payload = {
-                "actor": actor, "from": from_state, "to": to_state,
+                "actor": actor, "source_kind": "human",
+                "from": from_state, "to": to_state,
                 "signal": signal, "observed_status": observed_linear_status,
                 "disposition": "pending", "source_event_id": source_event_id,
                 "feedback": combined, "feedback_ids": feedback_ids,
@@ -3697,6 +4068,15 @@ class SQLiteLedger:
                 "UPDATE workflow_executions SET observed_linear_status=? WHERE id=?",
                 (observed_linear_status, execution_id),
             )
+            if observation_id:
+                updated = db.execute(
+                    "UPDATE linear_observations SET disposition='deferred',reason=?,"
+                    "event_seq=?,reconciled_at=? WHERE id=? AND disposition='pending'",
+                    ("authorized transition awaits an execution owner", seq,
+                     self.clock(), observation_id),
+                ).rowcount
+                if updated != 1:
+                    raise LedgerError("Linear observation is missing or already reconciled")
         return {
             "request_id": request_id, "event_seq": seq, "event_type": "transition_requested",
             "to_state": to_state, "disposition": "pending", "feedback_ids": feedback_ids,
@@ -3726,12 +4106,425 @@ class SQLiteLedger:
         result["feedback"] = [json.loads(item["body_json"]) for item in feedback_rows]
         return result
 
+    def bind_linear_statuses(
+        self, project_key: str, workflow_digest: str, team_id: str,
+        bindings: list[LinearStatusBindingV1 | dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not bindings:
+            raise LedgerError("at least one Linear status binding is required")
+        normalized = [
+            item if isinstance(item, LinearStatusBindingV1)
+            else LinearStatusBindingV1(**item)
+            for item in bindings
+        ]
+        if any(
+            item.project_key != project_key
+            or item.workflow_digest != workflow_digest
+            or item.team_id != team_id
+            for item in normalized
+        ):
+            raise LedgerError("Linear status bindings do not share one project workflow team")
+        if len({item.status_id for item in normalized}) != len(normalized):
+            raise LedgerError("Linear status IDs must be unique")
+        if len({item.status_name for item in normalized}) != len(normalized):
+            raise LedgerError("Linear status names must be unique")
+        if not self.connection.execute(
+            "SELECT 1 FROM projects WHERE project_key=?", (project_key,)
+        ).fetchone():
+            raise LedgerError(f"unknown project: {project_key}")
+        with self.transaction() as db:
+            for item in normalized:
+                prior = db.execute(
+                    "SELECT binding_digest FROM linear_status_bindings WHERE "
+                    "project_key=? AND workflow_digest=? AND status_id=?",
+                    (project_key, workflow_digest, item.status_id),
+                ).fetchone()
+                if prior and prior["binding_digest"] != item.binding_digest:
+                    raise LedgerError("Linear status binding identity was reused with new content")
+                try:
+                    db.execute(
+                        "INSERT OR IGNORE INTO linear_status_bindings("
+                        "project_key,workflow_digest,team_id,status_id,status_name,status_type,"
+                        "binding_digest,schema_version,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (item.project_key, item.workflow_digest, item.team_id,
+                         item.status_id, item.status_name, item.status_type,
+                         item.binding_digest, item.schema_version, self.clock()),
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise LedgerError("Linear status name is already bound") from error
+        return [item.as_dict() for item in normalized]
+
+    def linear_status_binding(
+        self, project_key: str, workflow_digest: str, status_id: str,
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM linear_status_bindings WHERE project_key=? "
+            "AND workflow_digest=? AND status_id=?",
+            (project_key, workflow_digest, status_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def require_linear_status_bindings(
+        self, project_key: str, workflow_digest: str,
+        required_status_names: list[str],
+    ) -> list[dict[str, Any]]:
+        if len(set(required_status_names)) != len(required_status_names):
+            raise LedgerError("required Linear status names must be unique")
+        rows = [dict(row) for row in self.connection.execute(
+            "SELECT * FROM linear_status_bindings WHERE project_key=? "
+            "AND workflow_digest=? ORDER BY status_name,status_id",
+            (project_key, workflow_digest),
+        ).fetchall()]
+        by_name = {str(row["status_name"]): row for row in rows}
+        missing = sorted(set(required_status_names) - set(by_name))
+        if missing:
+            raise LedgerError(
+                "missing Linear status bindings: " + ", ".join(missing)
+            )
+        return [by_name[name] for name in required_status_names]
+
+    def record_linear_observation_input(self, data: dict[str, Any]) -> dict[str, Any]:
+        observation = LinearObservationV1(**data)
+        current = self.current(observation.execution_id)
+        if current["project_key"] != observation.project_key:
+            raise LedgerError("Linear observation project does not own the execution")
+        workflow_digest = current.get("workflow_digest")
+        if not workflow_digest:
+            raise LedgerError("execution has no durable workflow snapshot")
+        identity = {
+            "execution_id": observation.execution_id,
+            "project_key": observation.project_key,
+            "workflow_digest": workflow_digest,
+            "source": observation.source,
+            "delivery_id": observation.delivery_id,
+            "issue_id": observation.issue_id,
+            "issue_identifier": observation.issue_identifier,
+            "status_id": observation.status_id,
+            "status_name": observation.status_name,
+            "remote_updated_at": observation.remote_updated_at,
+            "actor_id": observation.actor_id,
+            "payload_hash": observation.payload_hash,
+            "schema_version": observation.schema_version,
+        }
+        observation_id = stable_record_id("linear_observation", observation.observation_key)
+        prior = self.connection.execute(
+            "SELECT * FROM linear_observations WHERE observation_key=?",
+            (observation.observation_key,),
+        ).fetchone()
+        if prior:
+            if any(prior[key] != value for key, value in identity.items()):
+                raise LedgerError("Linear observation key was reused with new content")
+            return dict(prior)
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO linear_observations("
+                "id,execution_id,project_key,workflow_digest,observation_key,source,"
+                "delivery_id,issue_id,issue_identifier,status_id,status_name,remote_updated_at,"
+                "actor_id,payload_hash,schema_version,disposition,reason,event_seq,received_at,"
+                "observed_at,reconciled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (observation_id, observation.execution_id, observation.project_key,
+                 workflow_digest, observation.observation_key, observation.source,
+                 observation.delivery_id, observation.issue_id,
+                 observation.issue_identifier, observation.status_id,
+                 observation.status_name, observation.remote_updated_at,
+                 observation.actor_id, observation.payload_hash,
+                 observation.schema_version, "pending", None, None, self.clock(),
+                 observation.observed_at, None),
+            )
+            self._fault("after_linear_observation_recorded")
+        return self.linear_observation(observation_id)
+
+    def linear_observation(self, observation_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM linear_observations WHERE id=?", (observation_id,)
+        ).fetchone()
+        if not row:
+            raise LedgerError("Linear observation not found")
+        return dict(row)
+
+    def pending_linear_observations(self, limit: int = 100) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 100:
+            raise LedgerError("Linear observation limit must be between 1 and 100")
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM linear_observations WHERE disposition='pending' "
+            "ORDER BY received_at,id LIMIT ?", (limit,)
+        ).fetchall()]
+
+    def resolve_linear_observation(
+        self, observation_id: str, *, disposition: str, reason: str,
+    ) -> dict[str, Any]:
+        if disposition not in {"stale", "rejected", "no_change", "self_authored"}:
+            raise LedgerError("unsupported Linear observation disposition")
+        observation = self.linear_observation(observation_id)
+        if observation["disposition"] != "pending":
+            if observation["disposition"] != disposition:
+                raise LedgerError("Linear observation is already reconciled differently")
+            return observation
+        current = self.current(observation["execution_id"])
+        command = f"linear-observation:{observation_id}:{disposition}"
+        with self.transaction() as db:
+            payload = {
+                "actor": "human", "source_kind": "human",
+                "observed_status": observation["status_name"],
+                "desired_status": current["desired_linear_status"],
+                "current_state": current["current_state_id"],
+                "disposition": disposition, "reason": reason,
+                "source_event_id": observation["observation_key"],
+                "observation_id": observation_id,
+            }
+            seq = self._event(
+                db, execution_id=observation["execution_id"],
+                state_run_id=current["current_state_run_id"], attempt_id=None,
+                event_type="linear_status_observed", payload=payload,
+                idempotency_key=command,
+            )
+            db.execute(
+                "UPDATE linear_observations SET disposition=?,reason=?,event_seq=?,"
+                "reconciled_at=? WHERE id=?",
+                (disposition, reason, seq, self.clock(), observation_id),
+            )
+            db.execute(
+                "UPDATE workflow_executions SET observed_linear_status=? WHERE id=?",
+                (observation["status_name"], observation["execution_id"]),
+            )
+            if observation["status_name"] == current["desired_linear_status"]:
+                self._confirm_linear_status_mutations(
+                    db, execution_id=observation["execution_id"],
+                    observed_status=observation["status_name"],
+                    observation_id=observation_id,
+                    evidence={
+                        "kind": "linear_observation",
+                        "observation_id": observation_id,
+                        "source_event_id": observation["observation_key"],
+                        "observed_status": observation["status_name"],
+                    },
+                )
+            else:
+                self._queue_linear_status_mutation(
+                    db, execution_id=observation["execution_id"], event_seq=seq,
+                    desired_status=current["desired_linear_status"],
+                    expected_observed_status=observation["status_name"],
+                )
+        return self.linear_observation(observation_id)
+
+    def pending_linear_mutations(self, limit: int = 100) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 100:
+            raise LedgerError("Linear mutation limit must be between 1 and 100")
+        now = self.clock()
+        rows = self.connection.execute(
+            "SELECT * FROM linear_mutations WHERE status IN ('pending','retry') "
+            "AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+            "ORDER BY created_at,id LIMIT ?", (now, limit),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["request"] = json.loads(item.pop("request_json"))
+            result.append(item)
+        return result
+
+    def start_linear_mutation_attempt(self, mutation_id: str) -> dict[str, Any]:
+        with self.transaction() as db:
+            mutation = db.execute(
+                "SELECT * FROM linear_mutations WHERE id=?", (mutation_id,)
+            ).fetchone()
+            if not mutation or mutation["status"] not in ("pending", "retry"):
+                raise LedgerError("Linear mutation is not ready to send")
+            attempt_number = int(mutation["attempt_count"]) + 1
+            attempt_id = stable_record_id(
+                "linear_mutation_attempt", f"{mutation_id}:{attempt_number}"
+            )
+            now = self.clock()
+            db.execute(
+                "INSERT INTO linear_mutation_attempts("
+                "id,mutation_id,attempt_number,request_hash,status,response_hash,"
+                "error_json,started_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (attempt_id, mutation_id, attempt_number, mutation["request_hash"],
+                 "sending", None, None, now, None),
+            )
+            db.execute(
+                "UPDATE linear_mutations SET status='sending',attempt_count=?,"
+                "updated_at=?,next_attempt_at=NULL WHERE id=?",
+                (attempt_number, now, mutation_id),
+            )
+        return {"attempt_id": attempt_id, "attempt_number": attempt_number,
+                "mutation_id": mutation_id, "request_hash": mutation["request_hash"]}
+
+    def mark_linear_mutation_ambiguous(
+        self, mutation_id: str, attempt_id: str, *, error: dict[str, Any],
+    ) -> None:
+        error_json = canonical_json(redact_payload(error))
+        with self.transaction() as db:
+            attempt = db.execute(
+                "SELECT status FROM linear_mutation_attempts WHERE id=? AND mutation_id=?",
+                (attempt_id, mutation_id),
+            ).fetchone()
+            if not attempt or attempt["status"] != "sending":
+                raise LedgerError("Linear mutation attempt is not in flight")
+            now = self.clock()
+            db.execute(
+                "UPDATE linear_mutation_attempts SET status='ambiguous',error_json=?,"
+                "completed_at=? WHERE id=?", (error_json, now, attempt_id),
+            )
+            db.execute(
+                "UPDATE linear_mutations SET status='ambiguous',last_error_json=?,"
+                "updated_at=? WHERE id=?", (error_json, now, mutation_id),
+            )
+
+    def fail_linear_mutation(
+        self, mutation_id: str, attempt_id: str, *, retryable: bool,
+        error: dict[str, Any], next_attempt_at: str | None = None,
+    ) -> None:
+        if retryable and not next_attempt_at:
+            raise LedgerError("retryable Linear mutation requires next_attempt_at")
+        if next_attempt_at:
+            parse_timestamp(next_attempt_at)
+        error_json = canonical_json(redact_payload(error))
+        with self.transaction() as db:
+            attempt = db.execute(
+                "SELECT status FROM linear_mutation_attempts WHERE id=? AND mutation_id=?",
+                (attempt_id, mutation_id),
+            ).fetchone()
+            if not attempt or attempt["status"] != "sending":
+                raise LedgerError("Linear mutation attempt is not in flight")
+            now = self.clock()
+            status = "retry" if retryable else "failed"
+            db.execute(
+                "UPDATE linear_mutation_attempts SET status=?,error_json=?,completed_at=? "
+                "WHERE id=?", (status, error_json, now, attempt_id),
+            )
+            db.execute(
+                "UPDATE linear_mutations SET status=?,last_error_json=?,next_attempt_at=?,"
+                "updated_at=? WHERE id=?",
+                (status, error_json, next_attempt_at, now, mutation_id),
+            )
+
+    def confirm_linear_mutation(
+        self, mutation_id: str, attempt_id: str, *, observed_status: str,
+        response: dict[str, Any], remote_id: str | None = None,
+        observation_id: str | None = None,
+    ) -> dict[str, Any]:
+        response_json = canonical_json(redact_payload(response))
+        response_hash = hashlib.sha256(response_json.encode("utf-8")).hexdigest()
+        with self.transaction() as db:
+            mutation = db.execute(
+                "SELECT * FROM linear_mutations WHERE id=?", (mutation_id,)
+            ).fetchone()
+            if not mutation:
+                raise LedgerError("Linear mutation not found")
+            if mutation["status"] == "confirmed":
+                if mutation["confirmation_hash"] != response_hash:
+                    raise LedgerError("Linear mutation was confirmed with different evidence")
+                return dict(mutation)
+            attempt = db.execute(
+                "SELECT status FROM linear_mutation_attempts WHERE id=? AND mutation_id=?",
+                (attempt_id, mutation_id),
+            ).fetchone()
+            if not attempt or attempt["status"] not in ("sending", "ambiguous"):
+                raise LedgerError("Linear mutation attempt cannot be confirmed")
+            now = self.clock()
+            status = (
+                "confirmed" if observed_status == mutation["desired_status"] else "conflict"
+            )
+            db.execute(
+                "UPDATE linear_mutation_attempts SET status=?,response_hash=?,completed_at=? "
+                "WHERE id=?", (status, response_hash, now, attempt_id),
+            )
+            db.execute(
+                "UPDATE linear_mutations SET status=?,remote_id=?,confirmation_hash=?,"
+                "updated_at=?,confirmed_at=? WHERE id=?",
+                (status, remote_id, response_hash, now,
+                 now if status == "confirmed" else None, mutation_id),
+            )
+            confirmation_id = stable_record_id(
+                "linear_confirmation", f"{mutation_id}:{response_hash}"
+            )
+            db.execute(
+                "INSERT INTO linear_confirmations("
+                "id,mutation_id,observation_id,remote_id,observed_status,response_hash,"
+                "status,recorded_at) VALUES(?,?,?,?,?,?,?,?)",
+                (confirmation_id, mutation_id, observation_id, remote_id,
+                 observed_status, response_hash, status, now),
+            )
+        result = dict(mutation)
+        result.update({"status": status, "remote_id": remote_id,
+                       "confirmation_hash": response_hash})
+        return result
+
+    def recover_linear_mutations(self) -> int:
+        with self.transaction() as db:
+            rows = db.execute(
+                "SELECT id FROM linear_mutations WHERE status='sending'"
+            ).fetchall()
+            if not rows:
+                return 0
+            now = self.clock()
+            ids = [str(row["id"]) for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            recovery_error = canonical_json({
+                "code": "process_interrupted",
+                "message": "sender stopped before the remote result was known",
+            })
+            db.execute(
+                f"UPDATE linear_mutations SET status='ambiguous',last_error_json=?,"
+                f"updated_at=? WHERE id IN ({placeholders})",
+                (recovery_error, now, *ids),
+            )
+            db.execute(
+                f"UPDATE linear_mutation_attempts SET status='ambiguous',error_json=?,"
+                f"completed_at=? WHERE mutation_id IN ({placeholders}) AND status='sending'",
+                (recovery_error, now, *ids),
+            )
+            return len(ids)
+
+    def linear_reconciliation_records(self, execution_id: str) -> dict[str, Any]:
+        if not self.connection.execute(
+            "SELECT 1 FROM workflow_executions WHERE id=?", (execution_id,)
+        ).fetchone():
+            raise LedgerError("execution not found")
+        observations = [dict(row) for row in self.connection.execute(
+            "SELECT * FROM linear_observations WHERE execution_id=? "
+            "ORDER BY received_at,id", (execution_id,)
+        ).fetchall()]
+        mutations = []
+        for row in self.connection.execute(
+            "SELECT * FROM linear_mutations WHERE execution_id=? ORDER BY event_seq,id",
+            (execution_id,),
+        ).fetchall():
+            item = dict(row)
+            item["request"] = json.loads(item.pop("request_json"))
+            mutations.append(item)
+        mutation_ids = [item["id"] for item in mutations]
+        attempts: list[dict[str, Any]] = []
+        confirmations: list[dict[str, Any]] = []
+        if mutation_ids:
+            placeholders = ",".join("?" for _ in mutation_ids)
+            attempts = [dict(row) for row in self.connection.execute(
+                f"SELECT * FROM linear_mutation_attempts WHERE mutation_id IN "
+                f"({placeholders}) ORDER BY mutation_id,attempt_number",
+                tuple(mutation_ids),
+            ).fetchall()]
+            confirmations = [dict(row) for row in self.connection.execute(
+                f"SELECT * FROM linear_confirmations WHERE mutation_id IN "
+                f"({placeholders}) ORDER BY recorded_at,id",
+                tuple(mutation_ids),
+            ).fetchall()]
+        return {
+            "schema_version": 1,
+            "execution_id": execution_id,
+            "observations": observations,
+            "mutations": mutations,
+            "attempts": attempts,
+            "confirmations": confirmations,
+        }
+
     def record_linear_observation(
         self, execution_id: str, *, observed_status: str, actor: str,
         disposition: str, reason: str, idempotency_key: str,
         source_event_id: str | None = None,
         feedback: list[dict[str, Any]] | None = None,
         feedback_allowed: bool = False,
+        observation_id: str | None = None,
     ) -> dict[str, Any]:
         prior = self.event_for_command(idempotency_key)
         if prior:
@@ -3773,6 +4566,7 @@ class SQLiteLedger:
                 feedback_ids.append(feedback_id)
             payload = {
                 "actor": actor,
+                "source_kind": "human",
                 "observed_status": observed_status,
                 "desired_status": execution["desired_linear_status"],
                 "current_state": execution["current_state_id"],
@@ -3798,6 +4592,32 @@ class SQLiteLedger:
                 "UPDATE workflow_executions SET observed_linear_status=? WHERE id=?",
                 (observed_status, execution_id),
             )
+            if observed_status == execution["desired_linear_status"]:
+                self._confirm_linear_status_mutations(
+                    db, execution_id=execution_id, observed_status=observed_status,
+                    observation_id=observation_id,
+                    evidence={
+                        "kind": "linear_observation",
+                        "observation_id": observation_id,
+                        "source_event_id": source_event_id,
+                        "event_seq": seq,
+                        "observed_status": observed_status,
+                    },
+                )
+            if observed_status != execution["desired_linear_status"]:
+                self._queue_linear_status_mutation(
+                    db, execution_id=execution_id, event_seq=seq,
+                    desired_status=execution["desired_linear_status"],
+                    expected_observed_status=observed_status,
+                )
+            if observation_id:
+                updated = db.execute(
+                    "UPDATE linear_observations SET disposition=?,reason=?,event_seq=?,"
+                    "reconciled_at=? WHERE id=? AND disposition='pending'",
+                    (disposition, reason, seq, self.clock(), observation_id),
+                ).rowcount
+                if updated != 1:
+                    raise LedgerError("Linear observation is missing or already reconciled")
         return {"event_seq": seq, "event_type": "linear_status_observed", "payload": payload}
 
     def feedback_for_attempt(self, attempt_id: str) -> list[dict[str, Any]]:
@@ -3892,6 +4712,65 @@ class SQLiteLedger:
             "transition_requests": transition_requests,
             "workflow_snapshot": self.workflow_snapshot(execution_id),
         }
+
+    def trace_completion_facts(self, execution_id: str) -> list[dict[str, str]]:
+        """Return canonical close boundaries for durable trace entities."""
+        execution = self.connection.execute(
+            "SELECT id,completed_at FROM workflow_executions WHERE id=?",
+            (execution_id,),
+        ).fetchone()
+        if not execution:
+            raise LedgerError("execution not found")
+        facts = []
+        if execution["completed_at"]:
+            facts.append({
+                "entity_kind": "execution", "entity_id": str(execution["id"]),
+                "completed_at": str(execution["completed_at"]),
+            })
+        for row in self.connection.execute(
+            "SELECT id,completed_at FROM state_runs "
+            "WHERE execution_id=? AND completed_at IS NOT NULL ORDER BY ordinal",
+            (execution_id,),
+        ):
+            facts.append({
+                "entity_kind": "state_run", "entity_id": str(row["id"]),
+                "completed_at": str(row["completed_at"]),
+            })
+        for row in self.connection.execute(
+            "SELECT a.id,a.completed_at FROM attempts a "
+            "JOIN state_runs sr ON sr.id=a.state_run_id "
+            "WHERE sr.execution_id=? AND a.completed_at IS NOT NULL "
+            "ORDER BY sr.ordinal,a.started_at,a.id",
+            (execution_id,),
+        ):
+            facts.append({
+                "entity_kind": "attempt", "entity_id": str(row["id"]),
+                "completed_at": str(row["completed_at"]),
+            })
+        for row in self.connection.execute(
+            "SELECT id,completed_at FROM scheduler_dispatches "
+            "WHERE execution_id=? AND completed_at IS NOT NULL "
+            "ORDER BY created_at,id",
+            (execution_id,),
+        ):
+            entity_id = str(row["id"])
+            facts.append({
+                "entity_kind": "scheduler_dispatch", "entity_id": entity_id,
+                "span_id": stable_span_id("scheduler_dispatch", entity_id),
+                "completed_at": str(row["completed_at"]),
+            })
+        for row in self.connection.execute(
+            "SELECT id,root_span_id,completed_at FROM runner_runs "
+            "WHERE execution_id=? AND completed_at IS NOT NULL "
+            "ORDER BY created_at,id",
+            (execution_id,),
+        ):
+            facts.append({
+                "entity_kind": "runner_run", "entity_id": str(row["id"]),
+                "span_id": str(row["root_span_id"]),
+                "completed_at": str(row["completed_at"]),
+            })
+        return facts
 
     def overview(self) -> dict[str, Any]:
         identity = self.connection.execute(
