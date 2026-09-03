@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import selectors
@@ -20,6 +21,7 @@ from .workspace import WorkspaceHandle
 PORT_PATTERN = re.compile(r"\bPORT=(\d+)\b")
 URL_PATTERN = re.compile(r"\bPORTLESS_URL=(https?://[^\s]+)")
 LIST_PID_PATTERN = re.compile(r"\bpid\s+(\d+)\b", re.IGNORECASE)
+LIST_PORT_PATTERN = re.compile(r"->\s+(?:localhost|127\.0\.0\.1):(\d+)\b")
 BANNED_FLAGS = {
     "--force", "--lan", "--tailscale", "--funnel", "--ngrok",
     "--tunnel", "--wildcard", "--tld", "--cert", "--key", "--no-tls",
@@ -67,6 +69,7 @@ class PortlessProvider:
         self.preflight_command = preflight_command
         self.startup_timeout_seconds = startup_timeout_seconds
         self.process_identity = process_identity
+        self._confirm_native_routes = route_inspector is None
         self.route_inspector = route_inspector or self._inspect_route
         self.kill_process_group = kill_process_group
         self._active: dict[str, ProviderActivation] = {}
@@ -88,7 +91,12 @@ class PortlessProvider:
             if url not in line:
                 continue
             pid = LIST_PID_PATTERN.search(line)
-            return {"url": url, "pid": int(pid.group(1)) if pid else None}
+            port = LIST_PORT_PATTERN.search(line)
+            return {
+                "url": url,
+                "pid": int(pid.group(1)) if pid else None,
+                "app_port": int(port.group(1)) if port else None,
+            }
         return None
 
     def plan(
@@ -148,11 +156,20 @@ class PortlessProvider:
             env={**os.environ, "CI": "1"},
         )
         if result.returncode != 0:
+            report: Mapping[str, Any] = {}
+            try:
+                decoded = json.loads(result.stdout)
+                if isinstance(decoded, dict):
+                    report = decoded
+            except (json.JSONDecodeError, TypeError):
+                pass
             raise PreparationNeedsAttention(
                 "Portless preflight failed", category="unhealthy",
                 detail={"last_safe_step": "preflight",
                         "allowed_actions": ["retry", "cancel"],
-                        "remediation_command": self.preflight_command},
+                        "remediation_command": self.preflight_command,
+                        "checks": report.get("checks", {}),
+                        "remediation": report.get("remediation", [])},
                 provider="portless",
             )
 
@@ -206,6 +223,25 @@ class PortlessProvider:
                                     "allowed_actions": ["cancel"]},
                             capability=plan.capability, provider="portless",
                         )
+                    if self._confirm_native_routes:
+                        route = self.route_inspector(url)
+                        if route is None:
+                            continue
+                        if (
+                            route.get("pid") != process.pid
+                            or route.get("app_port") != int(port_match.group(1))
+                        ):
+                            raise PreparationNeedsAttention(
+                                "Portless route ownership does not match its child",
+                                category="conflict",
+                                detail={
+                                    "last_safe_step": "route registration",
+                                    "allowed_actions": [
+                                        "retain", "quarantine", "cancel",
+                                    ],
+                                },
+                                capability=plan.capability, provider="portless",
+                            )
                     identity = self.process_identity(process.pid)
                     if not identity:
                         raise PreparationNeedsAttention(

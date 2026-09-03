@@ -65,12 +65,18 @@ derived from the factory process working directory.
 Install and verify stable local services only when `local-web` is enabled:
 
 ```bash
+export PATH="/path/to/node-24-or-newer/bin:$PATH"
 skills/stable-local-services/scripts/install.sh
+portless trust
+portless service install
+dotfactory-portless-preflight
 ```
 
-The preflight must pass non-interactively. Do not bypass it with a raw port or
-Portless `--force`. Trust-changing, LAN, tunnel, wildcard, and custom-domain
-modes are outside the default capability.
+The installer refuses to change the global npm installation until Node is
+compatible. Trust and service installation are explicit operator actions. The
+preflight must then report zero doctor failures and warnings non-interactively.
+Do not bypass it with a raw port or Portless `--force`. LAN, tunnel, wildcard,
+and custom-domain modes are outside the default capability.
 
 Load and validate the configuration:
 
