@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from dotfactory import DurableKernel, SQLiteLedger  # noqa: E402
 from dotfactory.ledger import LedgerError  # noqa: E402
 from dotfactory.observability import ProjectionReceiptV1  # noqa: E402
+from dotfactory.projections import readable_error_groups  # noqa: E402
 
 
 class ObservabilityLedgerTests(unittest.TestCase):
@@ -106,6 +107,34 @@ class ObservabilityLedgerTests(unittest.TestCase):
             self.ledger.trace_page(execution_id), sort_keys=True
         ))
         self.assertNotIn("SECRET-SENTINEL", json.dumps(errors, sort_keys=True))
+
+    def test_readable_errors_group_repeated_fingerprints_without_losing_links(self):
+        common = {
+            "fingerprint_version": 1, "fingerprint": "f" * 64,
+            "code": "RUNNER_FAILED", "category": "runner", "severity": "error",
+            "retryable": False, "ambiguous_side_effect": False,
+            "message": "runner failed", "safe_remedy": "Inspect the trace.",
+            "responsible_span_id": "span-runner", "origin": "runtime",
+        }
+        groups = readable_error_groups([
+            {
+                **common, "seq": 4, "error_id": "error-provider",
+                "trace_record_id": "trace-provider",
+                "occurred_at": "2026-08-30T12:00:00+00:00",
+                "origin": "provider",
+            },
+            {
+                **common, "seq": 5, "error_id": "error-lifecycle",
+                "trace_record_id": "trace-lifecycle",
+                "occurred_at": "2026-08-30T12:00:01+00:00",
+            },
+        ])
+        self.assertEqual(1, len(groups))
+        self.assertEqual(2, groups[0]["occurrence_count"])
+        self.assertEqual(
+            ["trace-provider", "trace-lifecycle"],
+            [item["trace_record_id"] for item in groups[0]["occurrences"]],
+        )
 
     def test_projection_receipts_are_fixed_range_crash_safe_and_monotonic(self):
         execution_id, _claim = self.begin_attempt("projection")

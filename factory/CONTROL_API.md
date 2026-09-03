@@ -12,13 +12,20 @@ with `Cache-Control: no-store`.
 | `GET /v1/runs` | `project_key`, `status`, `state`, `limit` 1–100, `cursor` | Run summaries and `next_cursor`. |
 | `GET /v1/runs/{execution_id}` | — | Intent, state, active attempt, workspace summary, preparation, allocations, attention, projection lag, and available actions. |
 | `GET /v1/runs/{execution_id}/events` | `after_seq` ≥ 0, `limit` 1–100 | Ordered normalized events and `next_after_seq`. |
+| `GET /v1/runs/{execution_id}/trace` | `after_seq` ≥ 0, `limit` 1–100 | Canonical trace records and `next_after_seq`. |
+| `GET /v1/runs/{execution_id}/errors` | `after_seq` ≥ 0, `limit` 1–100 | Normalized error facts and `next_after_seq`. |
+| `GET /v1/runs/{execution_id}/summary` | — | Deterministic summary-fact v1 for sparse external projection. |
+| `GET /v1/runs/{execution_id}/waterfall` | — | Payload-free waterfall-fact v1 from one fixed trace range. |
+| `GET /v1/runs/{execution_id}/waterfall.html` | — | Self-contained accessible waterfall and grouped error view. |
 | `GET /v1/runs/{execution_id}/artifacts` | `kind`, `limit` 1–100, `cursor` | Evidence references and redacted metadata. |
 | `GET /v1/runs/{execution_id}/feedback` | `limit` 1–100, `cursor` | Feedback records. |
 | `GET /v1/resources` | `status`, `project_key`, `execution_id`, `limit` 1–100, `cursor` | Legacy leases and scoped allocations without fence tokens. |
 | `GET /v1/commands/{command_id}` | — | Durable request, principal, authorization, result/error, and audit events. |
 
-Cursor values are opaque. Missing `limit` defaults to 25, except events, which
-defaults to 100.
+Cursor values are opaque. Missing `limit` defaults to 25, except events, trace,
+and errors, which default to 100. Waterfall and summary facts share the same
+`through_trace_seq` boundary. The HTML view contains no trace payloads, prompts,
+commands, session IDs, fence tokens, or credentials.
 
 ## Commands
 

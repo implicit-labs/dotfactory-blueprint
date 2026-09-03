@@ -94,6 +94,123 @@ class DurableKernelTests(unittest.TestCase):
         self.assertEqual("Ready", current["current_state_id"])
         self.assertIsNone(current["attempt"])
 
+    def test_failed_attempt_uses_the_graph_recovery_signal(self):
+        execution = self.begin(command_id="begin-failure")
+        claim = self.kernel.transition(
+            execution, "Autoplanning", actor="agent", signal="listener_claim",
+            owner="planner-1", command_id="claim-failure",
+        )
+        failed = self.kernel.complete_attempt(
+            execution, preferred_label="failed", outcome="failed",
+            evidence=[{"kind": "error", "uri": "local://runner-error"}],
+            attempt_id=claim["attempt_id"], fence_token=claim["fence_token"],
+            owner="planner-1", command_id="finish-failure",
+        )
+        self.assertEqual("Investigating", failed["to_state"])
+        self.assertEqual(
+            "Investigating", self.ledger.current(execution)["current_state_id"]
+        )
+
+    def test_investigation_retry_uses_the_recorded_failure_origin(self):
+        execution = self.begin(command_id="begin-retry")
+        claim = self.kernel.transition(
+            execution, "Autoplanning", actor="agent", signal="listener_claim",
+            owner="planner-1", command_id="claim-retry",
+        )
+        investigating = self.kernel.complete_attempt(
+            execution, preferred_label="failed", outcome="failed",
+            evidence=[{"kind": "error", "uri": "local://runner-error"}],
+            attempt_id=claim["attempt_id"], fence_token=claim["fence_token"],
+            owner="planner-1", command_id="enter-investigation",
+        )
+        self.assertEqual(
+            "Autoplanning",
+            self.ledger.run_history(execution)["state_runs"][-1]["resume_state_id"],
+        )
+        retried = self.kernel.complete_attempt(
+            execution, preferred_label="retry", outcome="recovered",
+            evidence=[{"kind": "diagnosis", "uri": "local://diagnosis"}],
+            attempt_id=investigating["attempt_id"],
+            fence_token=investigating["fence_token"], owner="planner-1",
+            command_id="retry-origin",
+        )
+        self.assertEqual("Autoplanning", retried["to_state"])
+        self.assertIsNone(
+            self.ledger.run_history(execution)["state_runs"][-1]["resume_state_id"]
+        )
+
+    def test_investigation_retry_backfills_pre_recorded_origin_from_history(self):
+        execution = self.begin(command_id="begin-legacy-retry")
+        claim = self.kernel.transition(
+            execution, "Autoplanning", actor="agent", signal="listener_claim",
+            owner="planner-1", command_id="claim-legacy-retry",
+        )
+        investigating = self.kernel.complete_attempt(
+            execution, preferred_label="failed", outcome="failed",
+            evidence=[{"kind": "error", "uri": "local://runner-error"}],
+            attempt_id=claim["attempt_id"], fence_token=claim["fence_token"],
+            owner="planner-1", command_id="enter-legacy-investigation",
+        )
+        self.ledger.connection.execute(
+            "UPDATE state_runs SET resume_state_id=NULL WHERE id=?",
+            (self.ledger.current(execution)["current_state_run_id"],),
+        )
+        retried = self.kernel.complete_attempt(
+            execution, preferred_label="retry", outcome="recovered",
+            evidence=[{"kind": "diagnosis", "uri": "local://diagnosis"}],
+            attempt_id=investigating["attempt_id"],
+            fence_token=investigating["fence_token"], owner="planner-1",
+            command_id="retry-legacy-origin",
+        )
+        self.assertEqual("Autoplanning", retried["to_state"])
+
+    def test_matching_conditions_do_not_weaken_ambiguous_edge_rejection(self):
+        workflow = Path(self.temp.name) / "ambiguous-retry.dot"
+        workflow.write_text(
+            """digraph AmbiguousRetry {
+              graph [schema_version=2, conventions=linear, linear_statuses=node_ids]
+              start [shape=Mdiamond]
+              build [type=work]
+              alternative [type=work]
+              recover [type=work]
+              done [shape=Msquare]
+              start -> build [on=enter]
+              build -> recover [on=failed]
+              recover -> build [id=retry_build, on=retry,
+                condition="resume_state == build"]
+              recover -> alternative [id=retry_alternative, on=retry,
+                condition="resume_state == build"]
+              build -> done [on=complete]
+              alternative -> done [on=complete]
+              recover -> done [on=blocked]
+            }
+            """,
+            encoding="utf-8",
+        )
+        kernel = DurableKernel(self.ledger, workflow)
+        execution = kernel.begin(
+            "dotfactory", "TASK-AMBIGUOUS-RETRY", {"title": "ambiguous"},
+            command_id="begin-ambiguous-retry", owner="builder-1",
+        )
+        current = self.ledger.current(execution)
+        investigating = kernel.complete_attempt(
+            execution, preferred_label="failed", outcome="failed",
+            evidence=[{"kind": "error", "uri": "local://runner-error"}],
+            attempt_id=current["attempt"]["id"],
+            fence_token=current["attempt"]["fence_token"], owner="builder-1",
+            command_id="enter-ambiguous-recovery",
+        )
+        with self.assertRaisesRegex(
+            KernelError, "no unique agent edge for outcome label retry"
+        ):
+            kernel.complete_attempt(
+                execution, preferred_label="retry", outcome="recovered",
+                evidence=[{"kind": "diagnosis", "uri": "local://diagnosis"}],
+                attempt_id=investigating["attempt_id"],
+                fence_token=investigating["fence_token"], owner="builder-1",
+                command_id="ambiguous-retry",
+            )
+
     def test_process_kill_at_transition_boundaries_is_recoverable(self):
         boundaries = (
             "after_attempt_completed",
@@ -811,6 +928,7 @@ class DurableKernelTests(unittest.TestCase):
         resolved = config.resolve_project("example-ios", environment={
             "DOTFACTORY_EXAMPLE_IOS_REPOSITORY": "/tmp/example-ios",
             "DOTFACTORY_EXAMPLE_IOS_LINEAR_PROJECT_ID": "linear-example-ios",
+            "DOTFACTORY_EXAMPLE_IOS_LINEAR_TEAM_ID": "linear-team-ios",
         })
         self.assertEqual(
             str(Path("/tmp/example-ios").resolve()), resolved["repository_path"]
@@ -820,6 +938,7 @@ class DurableKernelTests(unittest.TestCase):
         config.configure_ledger(configured_ledger, environment={
             "DOTFACTORY_EXAMPLE_IOS_REPOSITORY": "/tmp/example-ios",
             "DOTFACTORY_EXAMPLE_IOS_LINEAR_PROJECT_ID": "linear-example-ios",
+            "DOTFACTORY_EXAMPLE_IOS_LINEAR_TEAM_ID": "linear-team-ios",
         })
         identity = configured_ledger.connection.execute(
             "SELECT factory_id FROM factory_identity"
@@ -858,7 +977,7 @@ class LedgerMigrationTests(unittest.TestCase):
                 "workflow_snapshots", "execution_workflow_snapshots", "attempt_bindings"
             }.issubset(tables))
             self.assertEqual(
-                10, ledger.connection.execute("PRAGMA user_version").fetchone()[0]
+                11, ledger.connection.execute("PRAGMA user_version").fetchone()[0]
             )
             ledger.close()
 
@@ -881,7 +1000,7 @@ class LedgerMigrationTests(unittest.TestCase):
             }
             self.assertIn("requested_by", columns)
             self.assertIn("through_event_seq", columns)
-            self.assertEqual(10, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(11, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
             ledger.close()
 
     def test_schema_one_gains_project_execution_and_exact_status_identity(self):
@@ -966,7 +1085,7 @@ class LedgerMigrationTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM work_items WHERE identifier='TASK-567'"
             ).fetchone()[0]
             self.assertEqual(2, count)
-            self.assertEqual(10, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(11, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
             ledger.close()
 
 

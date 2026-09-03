@@ -11,6 +11,8 @@ from typing import Any, Mapping
 
 from .kernel import DurableKernel
 from .ledger import LedgerError, SQLiteLedger
+from .projections import execution_waterfall, readable_error_groups, summary_fact
+from .waterfall import render_waterfall_html
 
 
 API_VERSION = "v1"
@@ -80,22 +82,6 @@ def _without_fences(value: Any) -> Any:
     return value
 
 
-def _condition_matches(
-    ledger: SQLiteLedger, execution_id: str, edge: dict[str, Any]
-) -> bool:
-    condition = edge.get("condition")
-    if not condition:
-        return True
-    prefix = "resume_state == "
-    if not str(condition).startswith(prefix):
-        return False
-    history = ledger.run_history(execution_id)["state_runs"]
-    prior_work = [
-        item["state_id"] for item in history[:-1] if item["state_kind"] == "work"
-    ]
-    return bool(prior_work and prior_work[-1] == str(condition)[len(prefix):])
-
-
 def _control_edges(
     ledger: SQLiteLedger, kernel: DurableKernel, execution_id: str, state: str
 ) -> list[dict[str, Any]]:
@@ -106,7 +92,7 @@ def _control_edges(
             continue
         if {"actor": "human", "signal": "control_command"} not in edge["evocations"]:
             continue
-        if _condition_matches(ledger, execution_id, edge):
+        if kernel.condition_matches(execution_id, edge):
             edges.append(edge)
     return edges
 
@@ -167,6 +153,93 @@ class ObservationService:
             "data": data,
             "next_after_seq": data[-1]["seq"] if has_more and data else None,
         }
+
+    def trace(
+        self, execution_id: str, *, after_seq: int = 0, limit: int = 100
+    ) -> dict[str, Any]:
+        self.ledger.current(execution_id)
+        if after_seq < 0:
+            raise ControlError("invalid_after_seq", "after_seq cannot be negative")
+        page_size = _limit(limit)
+        items = self.ledger.trace_page(
+            execution_id, after_seq=after_seq, limit=page_size + 1
+        )
+        has_more = len(items) > page_size
+        data = items[:page_size]
+        return {
+            "api_version": API_VERSION,
+            "data": data,
+            "next_after_seq": int(data[-1]["seq"]) if has_more and data else None,
+        }
+
+    def errors(
+        self, execution_id: str, *, after_seq: int = 0, limit: int = 100
+    ) -> dict[str, Any]:
+        self.ledger.current(execution_id)
+        if after_seq < 0:
+            raise ControlError("invalid_after_seq", "after_seq cannot be negative")
+        page_size = _limit(limit)
+        items = self.ledger.error_page(
+            execution_id, after_seq=after_seq, limit=page_size + 1
+        )
+        has_more = len(items) > page_size
+        data = items[:page_size]
+        return {
+            "api_version": API_VERSION,
+            "data": data,
+            "next_after_seq": int(data[-1]["seq"]) if has_more and data else None,
+        }
+
+    def execution_projection(self, execution_id: str) -> dict[str, Any]:
+        current = self.ledger.current(execution_id)
+        records: list[dict[str, Any]] = []
+        after_seq = 0
+        while True:
+            page = self.ledger.trace_page(
+                execution_id, after_seq=after_seq, limit=1000
+            )
+            records.extend(page)
+            if len(page) < 1000:
+                break
+            after_seq = int(page[-1]["seq"])
+        errors: list[dict[str, Any]] = []
+        after_seq = 0
+        while True:
+            page = self.ledger.error_page(
+                execution_id, after_seq=after_seq, limit=1000
+            )
+            errors.extend(page)
+            if len(page) < 1000:
+                break
+            after_seq = int(page[-1]["seq"])
+        trace_seq_by_id = {
+            str(record["record_id"]): int(record["seq"]) for record in records
+        }
+        enriched_errors = [
+            dict(item, trace_seq=trace_seq_by_id[str(item["trace_record_id"])])
+            for item in errors if str(item["trace_record_id"]) in trace_seq_by_id
+        ]
+        waterfall = execution_waterfall(
+            records, enriched_errors,
+            self.ledger.trace_completion_facts(execution_id),
+        )
+        groups = readable_error_groups(enriched_errors)
+        summary = summary_fact(current, waterfall, groups)
+        return {"waterfall": waterfall, "summary": summary, "error_groups": groups}
+
+    def summary(self, execution_id: str) -> dict[str, Any]:
+        projection = self.execution_projection(execution_id)
+        return {"api_version": API_VERSION, "data": projection["summary"]}
+
+    def waterfall(self, execution_id: str) -> dict[str, Any]:
+        projection = self.execution_projection(execution_id)
+        return {"api_version": API_VERSION, "data": projection["waterfall"]}
+
+    def waterfall_html(self, execution_id: str) -> str:
+        projection = self.execution_projection(execution_id)
+        return render_waterfall_html(
+            projection["waterfall"], projection["summary"]
+        )
 
     def artifacts(
         self, execution_id: str, *, kind: str | None = None, limit: int = 25,
@@ -276,11 +349,13 @@ class ControlService:
         self, ledger: SQLiteLedger, kernel: DurableKernel,
         resource_controller: Any | None = None,
         attention_controllers: Mapping[str, Any] | None = None,
+        *, project_key: str | None = None,
     ) -> None:
         self.ledger = ledger
         self.kernel = kernel
         self.resource_controller = resource_controller
         self.attention_controllers = dict(attention_controllers or {})
+        self.project_key = project_key
         self.observation = ObservationService(ledger, kernel)
 
     def execute(
@@ -300,6 +375,21 @@ class ControlService:
         parameters = request.get("parameters", {})
         if not isinstance(parameters, dict):
             raise ControlError("invalid_parameters", "parameters must be an object")
+        if self.project_key is not None:
+            try:
+                current = self.ledger.current(execution_id)
+            except LedgerError as error:
+                raise ControlError(
+                    "execution_not_found",
+                    f"execution is not available in project {self.project_key}",
+                    status=404,
+                ) from error
+            if current["project_key"] != self.project_key:
+                raise ControlError(
+                    "execution_not_found",
+                    f"execution is not available in project {self.project_key}",
+                    status=404,
+                )
         normalized = {
             "action": action,
             "expected_state": request["expected_state"],

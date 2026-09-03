@@ -45,6 +45,18 @@ def runner_request(kernel: DurableKernel, execution_id: str) -> RunnerRequest:
     binding = attempt.get("binding")
     if not binding:
         raise KernelError("active attempt has no resolved workflow binding")
+    _workflow, _states, edges = kernel.graph_for_execution(execution_id)
+    allowed_labels = sorted({
+        str(edge.get("on") or "complete")
+        for edge in edges
+        if edge["from"] == current["current_state_id"]
+        and any(
+            evocation.get("actor") == "agent"
+            for evocation in edge["evocations"]
+        )
+    })
+    config = dict(binding["resolved"])
+    config["allowed_preferred_labels"] = allowed_labels
     return RunnerRequest(
         execution_id=execution_id,
         attempt_id=str(attempt["id"]),
@@ -52,7 +64,7 @@ def runner_request(kernel: DurableKernel, execution_id: str) -> RunnerRequest:
         state_id=str(current["current_state_id"]),
         workflow_digest=str(binding["workflow_digest"]),
         owner=str(attempt["owner"]),
-        config=dict(binding["resolved"]),
+        config=config,
     )
 
 

@@ -10,8 +10,8 @@ Portable agent configuration and a crash-safe orchestration kernel.
 | `docs/decisions/` | durable architecture decisions |
 | [`review_protocol.md`](review_protocol.md) | change, review, and merge checklist |
 
-The factory currently provides runtime primitives and a durable scheduler core,
-not a hosted polling service or PR listener.
+The factory provides a one-process lifecycle command. It is not a hosted control
+service or PR listener.
 
 ## What the ledger does
 
@@ -73,6 +73,49 @@ The versioned [control API](factory/CONTROL_API.md) exposes bounded, redacted
 run views and audited `cancel`, `retry`, `approve`, and `transition` commands.
 The host must authenticate requests and supply verified roles. The package
 provides a WSGI adapter, not a hosted server or authentication provider.
+
+## Run one lifecycle
+
+Verify the complete Git-backed toy path without credentials:
+
+```bash
+PYTHONPATH=factory/src python3 -m dotfactory demo
+```
+
+The command prints persistent paths to a lifecycle receipt and local waterfall.
+
+Run a configured issue until the next human, attention, or terminal boundary:
+
+```bash
+export DOTFACTORY_CONFIG="$PWD/factory/factory.json"
+PYTHONPATH=factory/src python3 -m dotfactory run \
+  --project example-service --issue TASK-600
+```
+
+Omit `--issue` to discover the oldest Linear issue in a workflow pickup status.
+Add `--watch` to keep polling. The runtime holds one ledger instance lock and
+does not enable concurrent writers.
+
+Projection and runner access are independent. The example Codex route disables
+its configured Linear MCP so that connector cannot bypass the durable kernel.
+Manual Linear operation keeps both the projection disabled and this MCP rule.
+The prompt also forbids alternate Linear access; enforce shell and network
+isolation separately when a cooperative prompt policy is insufficient.
+
+Resolve scheduler attention as a separate audited step:
+
+```bash
+PYTHONPATH=factory/src python3 -m dotfactory attention \
+  --project example-service --execution EXECUTION_ID \
+  --attention-id ATTENTION_ID --expected-state Investigating \
+  --expected-attempt ATTEMPT_ID --remedy retry \
+  --command-id operator:ATTENTION_ID:retry
+```
+
+The command uses a control-only runtime: it does not preflight or launch runners
+and does not contact Linear. It authorizes recovery but does not execute the
+recorded safe phase. Restart `run` to reconcile it. Repeating the same command
+ID is idempotent.
 
 ## Set up Pydantic Logfire (optional)
 

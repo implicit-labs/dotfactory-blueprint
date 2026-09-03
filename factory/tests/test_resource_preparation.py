@@ -6,6 +6,7 @@ import unittest
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -723,7 +724,7 @@ class PreparationTests(unittest.TestCase):
             "workspace = pathlib.Path.cwd().name.lower()\n"
             "number = int(workspace.rsplit('-', 1)[1])\n"
             "print(f'PORT={4100 + number} '"
-            "f'PORTLESS_URL=https://{workspace}.{service}.localhost', flush=True)\n"
+            "f'PORTLESS_URL=https://{workspace}.{service}.localhost:1355', flush=True)\n"
             "while True:\n"
             "    time.sleep(1)\n"
         )
@@ -779,8 +780,8 @@ class PreparationTests(unittest.TestCase):
         second = second_result.launch
         try:
             self.assertNotEqual(first.urls, second.urls)
-            self.assertTrue(first.urls[0].endswith(".localhost"))
-            self.assertTrue(second.urls[0].endswith(".localhost"))
+            self.assertTrue(urlsplit(first.urls[0]).hostname.endswith(".localhost"))
+            self.assertTrue(urlsplit(second.urls[0]).hostname.endswith(".localhost"))
             self.assertNotEqual(first.allocation_ids, second.allocation_ids)
         finally:
             engine.cleanup_attempt(first)
@@ -871,7 +872,7 @@ class PortlessProviderTests(unittest.TestCase):
         self.workspace = WorkspaceHandle(
             repository_path="/repository", git_common_dir="/repository/.git",
             remote="origin", base_ref="main", base_sha="a" * 40,
-            branch_name="factory/imp-569-1", path="/worktrees/TASK-569-1",
+            branch_name="factory/task-569-1", path="/worktrees/TASK-569-1",
         )
         self.provider = PortlessProvider()
 
@@ -881,7 +882,7 @@ class PortlessProviderTests(unittest.TestCase):
             config={"service_name": "web", "command": ["npm", "run", "dev"]},
             workspace=self.workspace,
         )
-        self.assertEqual("portless:factory/imp-569-1:web", plan.resource_id)
+        self.assertEqual("portless:factory/task-569-1:web", plan.resource_id)
         self.assertNotIn("--force", plan.config["command"])
 
     def test_plan_rejects_takeover_and_exposure_flags(self):
@@ -935,9 +936,9 @@ class PortlessProviderTests(unittest.TestCase):
             )
 
     def test_reconcile_classifies_process_and_route_orphans(self):
-        url = "https://factory-imp-569-1.web.localhost"
+        url = "https://factory-task-569-1.web.localhost"
         allocation = {
-            "resource_id": "portless:factory/imp-569-1:web",
+            "resource_id": "portless:factory/task-569-1:web",
             "capability": "local-web",
             "metadata": {
                 "pid": 123, "process_identity": "started-once",
@@ -967,7 +968,7 @@ class PortlessProviderTests(unittest.TestCase):
                 self.assertEqual(expected, raised.exception.detail["orphan_state"])
 
     def test_reconciled_owned_process_can_be_cleaned_without_route_takeover(self):
-        url = "https://factory-imp-569-1.web.localhost"
+        url = "https://factory-task-569-1.web.localhost"
         identities = {123: "started-once"}
         routes = {url: {"url": url, "pid": 123}}
 
@@ -981,7 +982,7 @@ class PortlessProviderTests(unittest.TestCase):
             kill_process_group=stop,
         )
         allocation = {
-            "resource_id": "portless:factory/imp-569-1:web",
+            "resource_id": "portless:factory/task-569-1:web",
             "capability": "local-web",
             "metadata": {
                 "pid": 123, "process_identity": "started-once",
@@ -1013,7 +1014,7 @@ class SchemaSevenMigrationTests(unittest.TestCase):
                 "execution_workspaces", "preparations", "resource_allocations",
                 "resource_mutations", "attention_requests", "cleanup_plans",
             }.issubset(tables))
-            self.assertEqual(10, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(11, ledger.connection.execute("PRAGMA user_version").fetchone()[0])
             ledger.close()
 
 

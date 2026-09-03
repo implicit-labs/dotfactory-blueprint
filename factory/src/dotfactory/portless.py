@@ -11,6 +11,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from .resources import (
     CapabilityPlan, PreparationNeedsAttention, ProviderActivation,
@@ -216,7 +217,15 @@ class PortlessProvider:
                 url_match = URL_PATTERN.search(output)
                 if port_match and url_match:
                     url = url_match.group(1).rstrip(".,;)")
-                    if not url.endswith(".localhost"):
+                    parsed = urlsplit(url)
+                    if (
+                        parsed.scheme not in ("http", "https")
+                        or not parsed.hostname
+                        or not (
+                            parsed.hostname == "localhost"
+                            or parsed.hostname.endswith(".localhost")
+                        )
+                    ):
                         raise PreparationNeedsAttention(
                             "Portless returned a non-loopback route", category="unauthorized",
                             detail={"last_safe_step": "route validation",

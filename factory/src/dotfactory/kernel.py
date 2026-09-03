@@ -14,6 +14,7 @@ class KernelError(LedgerError):
 
 
 SUCCESS_LABELS = {"complete", "completed", "ready", "succeeded", "success"}
+RESUME_CONDITION_PREFIX = "resume_state == "
 
 
 class DurableKernel:
@@ -91,7 +92,8 @@ class DurableKernel:
         )
 
     def _matches(
-        self, from_state: str, to_state: str, *, actor: str, signal: str,
+        self, execution_id: str, from_state: str, to_state: str, *,
+        actor: str, signal: str,
         workflow: dict[str, Any], edges: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         terminal = set(workflow["scope"]["terminal_states"])
@@ -103,7 +105,94 @@ class DurableKernel:
             if source_matches and edge["to"] == to_state:
                 if {"actor": actor, "signal": signal} in edge["evocations"]:
                     matches.append(edge)
+        if any(edge.get("condition") for edge in matches):
+            resume_state = self._recorded_resume_state(
+                execution_id, from_state, edges
+            )
+            matches = [
+                edge for edge in matches
+                if self._condition_matches(edge, resume_state)
+            ]
         return matches
+
+    def _recorded_resume_state(
+        self, execution_id: str, state_id: str, edges: list[dict[str, Any]],
+    ) -> str | None:
+        history = self.ledger.run_history(execution_id)["state_runs"]
+        if not history or history[-1]["state_id"] != state_id:
+            raise KernelError("current state run does not match execution")
+        recorded = history[-1].get("resume_state_id")
+        if recorded:
+            return str(recorded)
+        origins = {
+            str(edge["condition"])[len(RESUME_CONDITION_PREFIX):]
+            for edge in edges
+            if edge["from"] == state_id
+            and str(edge.get("condition", "")).startswith(
+                RESUME_CONDITION_PREFIX
+            )
+        }
+        for previous, entered in reversed(list(zip(history, history[1:]))):
+            if (
+                entered["state_id"] == state_id
+                and previous["state_id"] in origins
+            ):
+                return str(previous["state_id"])
+        return None
+
+    @staticmethod
+    def _condition_matches(
+        edge: dict[str, Any], resume_state: str | None,
+    ) -> bool:
+        condition = edge.get("condition")
+        if not condition:
+            return True
+        value = str(condition)
+        if not value.startswith(RESUME_CONDITION_PREFIX):
+            return False
+        return resume_state == value[len(RESUME_CONDITION_PREFIX):]
+
+    def condition_matches(
+        self, execution_id: str, edge: dict[str, Any],
+    ) -> bool:
+        condition = edge.get("condition")
+        if not condition:
+            return True
+        if not str(condition).startswith(RESUME_CONDITION_PREFIX):
+            return False
+        current = self.ledger.current(execution_id)
+        _workflow, _states, edges = self.graph_for_execution(execution_id)
+        resume_state = self._recorded_resume_state(
+            execution_id, str(current["current_state_id"]), edges
+        )
+        return self._condition_matches(edge, resume_state)
+
+    def _next_resume_state(
+        self, execution_id: str, *, from_state: str, to_state: str,
+        edge: dict[str, Any], edges: list[dict[str, Any]], terminal: bool,
+    ) -> str | None:
+        if terminal or edge.get("condition"):
+            return None
+        origins = {
+            str(candidate["condition"])[len(RESUME_CONDITION_PREFIX):]
+            for candidate in edges
+            if candidate["from"] == to_state
+            and str(candidate.get("condition", "")).startswith(
+                RESUME_CONDITION_PREFIX
+            )
+        }
+        if from_state in origins:
+            return from_state
+        source_has_resume = any(
+            candidate["from"] == from_state
+            and str(candidate.get("condition", "")).startswith(
+                RESUME_CONDITION_PREFIX
+            )
+            for candidate in edges
+        )
+        if not origins and not source_has_resume:
+            return None
+        return self._recorded_resume_state(execution_id, from_state, edges)
 
     def transition(
         self, execution_id: str, to_state: str, *, actor: str, signal: str,
@@ -111,6 +200,7 @@ class DurableKernel:
         fence_token: str | None = None, outcome: str | None = None,
         evidence: list[dict[str, Any]] | None = None,
         feedback: list[dict[str, Any]] | None = None,
+        source_kind: str | None = None,
     ) -> dict[str, Any]:
         idempotency_key = f"execution:{execution_id}:transition:{command_id}"
         prior = self.ledger.decision_for_command(idempotency_key)
@@ -120,7 +210,7 @@ class DurableKernel:
         from_state = current["current_state_id"]
         workflow, states, edges = self.graph_for_execution(execution_id)
         matches = self._matches(
-            from_state, to_state, actor=actor, signal=signal,
+            execution_id, from_state, to_state, actor=actor, signal=signal,
             workflow=workflow, edges=edges,
         )
         if len(matches) != 1:
@@ -130,10 +220,15 @@ class DurableKernel:
         edge = matches[0]
         policy = self._edge_policy(edge)
         stored_feedback_ids = self._stored_feedback_ids(execution_id, edge)
+        resume_state_id = self._next_resume_state(
+            execution_id, from_state=from_state, to_state=to_state,
+            edge=edge, edges=edges, terminal=to_state in terminal,
+        )
         return self.ledger.accept_transition(
             execution_id=execution_id, edge_id=edge["id"],
             from_state=from_state, to_state=to_state, to_kind=target["kind"],
             desired_linear_status=target["linear_status"], actor=actor, signal=signal,
+            source_kind=source_kind,
             owner=owner, attempt_id=attempt_id, fence_token=fence_token,
             outcome=outcome, evidence=evidence or [], idempotency_key=idempotency_key,
             terminal=to_state in terminal, feedback=feedback or [],
@@ -142,6 +237,7 @@ class DurableKernel:
             feedback_kind=policy["feedback_kind"],
             resolved_node=target.get("execution", {}),
             workflow_digest=workflow.get("workflow_digest", self.definition.digest),
+            resume_state_id=resume_state_id,
         )
 
     def observe_linear_status(
@@ -150,6 +246,7 @@ class DurableKernel:
         attempt_id: str | None = None, fence_token: str | None = None,
         outcome: str | None = None, evidence: list[dict[str, Any]] | None = None,
         feedback: list[dict[str, Any]] | None = None,
+        observation_id: str | None = None,
     ) -> dict[str, Any]:
         idempotency_key = f"execution:{execution_id}:linear:{command_id}"
         prior_decision = self.ledger.decision_for_command(idempotency_key)
@@ -170,6 +267,7 @@ class DurableKernel:
                 idempotency_key=idempotency_key, source_event_id=source_event_id,
                 feedback=observation_feedback,
                 feedback_allowed=self._allows_state_feedback(from_state, edges),
+                observation_id=observation_id,
             )
         projected = [
             state_id for state_id, state in states.items()
@@ -178,7 +276,8 @@ class DurableKernel:
         candidates = []
         for state_id in projected:
             candidates.extend(self._matches(
-                from_state, state_id, actor="human", signal="linear_status_change",
+                execution_id, from_state, state_id, actor="human",
+                signal="linear_status_change",
                 workflow=workflow, edges=edges,
             ))
         if not projected:
@@ -187,6 +286,7 @@ class DurableKernel:
                 disposition="rejected", reason="status is not in the workflow contract",
                 idempotency_key=idempotency_key, source_event_id=source_event_id,
                 feedback=[], feedback_allowed=False,
+                observation_id=observation_id,
             )
         if len(candidates) != 1:
             reason = (
@@ -198,6 +298,7 @@ class DurableKernel:
                 disposition="rejected", reason=reason,
                 idempotency_key=idempotency_key, source_event_id=source_event_id,
                 feedback=[], feedback_allowed=False,
+                observation_id=observation_id,
             )
         edge = candidates[0]
         target_state = str(edge["to"])
@@ -210,6 +311,10 @@ class DurableKernel:
         }
         policy = self._edge_policy(edge)
         stored_feedback_ids = self._stored_feedback_ids(execution_id, edge)
+        resume_state_id = self._next_resume_state(
+            execution_id, from_state=from_state, to_state=target_state,
+            edge=edge, edges=edges, terminal=target_state in terminal,
+        )
         if target["kind"] == "work" and target_state not in terminal and not owner:
             try:
                 return self.ledger.defer_transition(
@@ -221,6 +326,7 @@ class DurableKernel:
                     source_event_id=source_event_id,
                     requires_feedback=policy["requires_feedback"],
                     feedback_kind=policy["feedback_kind"],
+                    observation_id=observation_id,
                 )
             except LedgerError as error:
                 return self.ledger.record_linear_observation(
@@ -228,6 +334,7 @@ class DurableKernel:
                     disposition="rejected", reason=str(error),
                     idempotency_key=idempotency_key, source_event_id=source_event_id,
                     feedback=[], feedback_allowed=False,
+                    observation_id=observation_id,
                 )
         try:
             return self.ledger.accept_transition(
@@ -235,6 +342,7 @@ class DurableKernel:
                 from_state=from_state, to_state=target_state,
                 to_kind=target["kind"], desired_linear_status=target["linear_status"],
                 actor="human", signal="linear_status_change", owner=owner,
+                source_kind="human",
                 attempt_id=attempt_id, fence_token=fence_token, outcome=outcome,
                 evidence=evidence or [], idempotency_key=idempotency_key,
                 terminal=target_state in terminal, feedback=observation_feedback,
@@ -244,6 +352,8 @@ class DurableKernel:
                 feedback_kind=policy["feedback_kind"],
                 resolved_node=target.get("execution", {}),
                 workflow_digest=workflow.get("workflow_digest", self.definition.digest),
+                observation_id=observation_id,
+                resume_state_id=resume_state_id,
             )
         except LedgerError as error:
             return self.ledger.record_linear_observation(
@@ -251,6 +361,7 @@ class DurableKernel:
                 disposition="rejected", reason=str(error),
                 idempotency_key=idempotency_key, source_event_id=source_event_id,
                 feedback=[], feedback_allowed=False,
+                observation_id=observation_id,
             )
 
     def complete_attempt(
@@ -289,18 +400,43 @@ class DurableKernel:
                 edge for edge in edges
                 if edge["from"] == state_id and not edge.get("on")
             ]
-        candidates = [
-            edge for edge in candidates
-            if {"actor": "agent", "signal": "agent_handoff"} in edge["evocations"]
+        if any(edge.get("condition") for edge in candidates):
+            resume_state = self._recorded_resume_state(
+                execution_id, state_id, edges
+            )
+            candidates = [
+                edge for edge in candidates
+                if self._condition_matches(edge, resume_state)
+            ]
+        candidates_with_signals = [
+            (
+                edge,
+                sorted({
+                    str(evocation["signal"])
+                    for evocation in edge["evocations"]
+                    if evocation.get("actor") == "agent"
+                }),
+            )
+            for edge in candidates
+            if any(
+                evocation.get("actor") == "agent"
+                for evocation in edge["evocations"]
+            )
         ]
-        if len(candidates) != 1:
+        if (
+            len(candidates_with_signals) != 1
+            or len(candidates_with_signals[0][1]) != 1
+        ):
             raise KernelError(f"no unique agent edge for outcome label {label}")
-        target = str(candidates[0]["to"])
+        edge, signals = candidates_with_signals[0]
+        target = str(edge["to"])
+        signal = signals[0]
         target_owner = owner if states[target]["kind"] == "work" else None
         return self.transition(
-            execution_id, target, actor="agent", signal="agent_handoff",
+            execution_id, target, actor="agent", signal=signal,
             command_id=command_id, owner=target_owner, attempt_id=attempt_id,
             fence_token=fence_token, outcome=outcome, evidence=evidence,
+            source_kind="agent",
         )
 
     def claim_pending_transition(
@@ -322,12 +458,20 @@ class DurableKernel:
         edge = next(
             item for item in edges if item["id"] == request["edge_id"]
         )
+        if not self.condition_matches(execution_id, edge):
+            raise KernelError("pending human transition condition no longer matches")
         policy = self._edge_policy(edge)
+        resume_state_id = self._next_resume_state(
+            execution_id, from_state=str(request["from_state"]),
+            to_state=str(request["to_state"]), edge=edge, edges=edges,
+            terminal=request["to_state"] in terminal,
+        )
         return self.ledger.accept_transition(
             execution_id=execution_id, edge_id=request["edge_id"],
             from_state=request["from_state"], to_state=request["to_state"],
             to_kind=target["kind"], desired_linear_status=target["linear_status"],
             actor=request["actor"], signal=request["signal"], owner=owner,
+            source_kind="human",
             attempt_id=None, fence_token=None, outcome=None, evidence=[],
             idempotency_key=idempotency_key,
             terminal=request["to_state"] in terminal, feedback=[],
@@ -343,4 +487,5 @@ class DurableKernel:
             feedback_kind=policy["feedback_kind"],
             resolved_node=target.get("execution", {}),
             workflow_digest=workflow.get("workflow_digest", self.definition.digest),
+            resume_state_id=resume_state_id,
         )

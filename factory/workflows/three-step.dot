@@ -1,6 +1,6 @@
 digraph ThreeStep {
   start [shape=Mdiamond]
-  build [type=agent]
+  build [type=agent, prompt="prompts/work.md"]
   review [type=human]
   done [shape=Msquare]
 
