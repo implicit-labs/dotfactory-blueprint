@@ -7,8 +7,14 @@
 | Preflight | `dotfactory-portless-preflight` |
 | Network | loopback `.localhost` only |
 
-`scripts/install.sh` installs the pinned npm package and copies the preflight
-into `DOTFACTORY_BIN_DIR`, defaulting to `$HOME/.local/bin`.
+Put Node 24 or newer first on `PATH`. `scripts/install.sh` verifies Node before
+it installs the pinned npm package, then copies the preflight into
+`DOTFACTORY_BIN_DIR`, defaulting to `$HOME/.local/bin`.
+
+Run `portless trust` and `portless service install` once. These remain explicit
+because they change the OS trust store and install a privileged service. The
+JSON preflight reports them as remediation until `portless doctor` has zero
+failures and zero warnings.
 
 Factory capability configuration supplies a logical service name and an argv
 array. The runtime invokes Portless from the execution worktree so Portless

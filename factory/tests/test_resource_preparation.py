@@ -893,6 +893,47 @@ class PortlessProviderTests(unittest.TestCase):
                     workspace=self.workspace,
                 )
 
+    def test_preflight_failure_preserves_machine_readable_remediation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preflight = Path(directory) / "preflight"
+            preflight.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "print(json.dumps({'ok': False, 'checks': "
+                "{'node_supported': False}, 'remediation': ['upgrade node']}))\n"
+                "raise SystemExit(2)\n"
+            )
+            preflight.chmod(0o755)
+            provider = PortlessProvider(preflight_command=str(preflight))
+            with self.assertRaises(PreparationNeedsAttention) as raised:
+                provider._preflight()
+            self.assertEqual(
+                {"node_supported": False}, raised.exception.detail["checks"],
+            )
+            self.assertEqual(
+                ["upgrade node"], raised.exception.detail["remediation"],
+            )
+
+    def test_native_route_inspection_reads_owner_and_target_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            portless = Path(directory) / "portless"
+            portless.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('Active routes:')\n"
+                "print('  https://worktree.web.localhost  ->  localhost:4123  "
+                "(pid 987)')\n"
+            )
+            portless.chmod(0o755)
+            provider = PortlessProvider(command=str(portless))
+            self.assertEqual(
+                {
+                    "url": "https://worktree.web.localhost",
+                    "pid": 987,
+                    "app_port": 4123,
+                },
+                provider._inspect_route("https://worktree.web.localhost"),
+            )
+
     def test_reconcile_classifies_process_and_route_orphans(self):
         url = "https://factory-imp-569-1.web.localhost"
         allocation = {
