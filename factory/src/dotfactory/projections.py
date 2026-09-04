@@ -45,6 +45,8 @@ def readable_error_groups(
             "responsible_span_id": error.get("responsible_span_id"),
             "occurred_at": error["occurred_at"],
             "origin": error.get("origin"),
+            "runner_run_id": error.get("runner_run_id"),
+            "attempt_id": error.get("attempt_id"),
         }
         group = grouped.get(key)
         if group is None:
@@ -58,6 +60,7 @@ def readable_error_groups(
             "safe_remedy": error["safe_remedy"],
             "retryable": bool(error["retryable"]),
             "ambiguous_side_effect": bool(error["ambiguous_side_effect"]),
+            "trust_class": error.get("trust_class"),
             "first_occurred_at": error["occurred_at"],
             "last_occurred_at": error["occurred_at"],
             "occurrence_count": 1,

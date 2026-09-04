@@ -13,6 +13,9 @@ from .linear_api import (
     LinearAPIError, LinearConvergenceWorker, LinearGraphQLClient,
     LinearWebhookVerifier,
 )
+from .linear_evidence import (
+    LinearEvidenceWorker, readable_incidents, render_linear_run_summary,
+)
 from .live_runner import (
     ClaudeCodeAdapter, CodexAdapter, LiveRunner, LiveRunnerRouter,
     OmpRpcAdapter, OmpRpcFrameDecoder, RunnerCapabilityReport, RunnerCanceled,
@@ -44,6 +47,7 @@ __all__ = [
     "LinearStatusBindingV1", "LinearTrackerPolicyV1",
     "LinearAPIError", "LinearConvergenceWorker", "LinearGraphQLClient",
     "LinearWebhookVerifier",
+    "LinearEvidenceWorker", "readable_incidents", "render_linear_run_summary",
     "FakePreparedRunner", "ObservationService", "PreparationEngine",
     "PreparationError", "PreparationResult", "PreparedLaunch", "Principal",
     "RunnerRequest", "RunnerResult",

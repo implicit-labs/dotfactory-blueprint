@@ -67,6 +67,15 @@ not special state names. A
 listener can record only changes it receives; webhook delivery is required to
 capture a status that changes back between polling intervals.
 
+For each Linear-backed execution, the lifecycle also creates one Dotfactory-owned
+comment and updates it in place. The comment shows the current outcome, attempts,
+attention, workspace cleanup, trace identity, and a compact incident/cause view.
+Its UUID and desired body are committed before network I/O; an unknown write is
+read back by exact ID before another mutation. Linear outages delay this view but
+cannot fail or roll back the run. The full waterfall remains outside the issue.
+The separate `evidence-to-linear` capability owns verification screenshots,
+recordings, and reports; it does not mutate the runtime summary comment.
+
 ## Observe and control runs
 
 The versioned [control API](factory/CONTROL_API.md) exposes bounded, redacted

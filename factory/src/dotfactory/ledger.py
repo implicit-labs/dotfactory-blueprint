@@ -21,9 +21,10 @@ from .observability import (
     ErrorFactV1, ProjectionReceiptV1, TraceRecordV1, canonical_json,
     error_fingerprint, stable_record_id, stable_span_id, stable_trace_id,
 )
+from .token_usage import normalize_token_usage
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 LEGACY_STATE_IDS = {
     "todo": "Todo",
@@ -292,6 +293,7 @@ class SQLiteLedger:
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 1:
@@ -398,6 +400,7 @@ class SQLiteLedger:
                     self._create_schema_nine_additions(db)
                     self._create_schema_ten_additions(db)
                     self._create_schema_eleven_additions(db)
+                    self._create_schema_twelve_additions(db)
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             finally:
                 self.connection.execute(
@@ -419,6 +422,7 @@ class SQLiteLedger:
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 3:
@@ -431,6 +435,7 @@ class SQLiteLedger:
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 4:
@@ -442,6 +447,7 @@ class SQLiteLedger:
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 5:
@@ -452,6 +458,7 @@ class SQLiteLedger:
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 6:
@@ -461,6 +468,7 @@ class SQLiteLedger:
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 7:
@@ -469,6 +477,7 @@ class SQLiteLedger:
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 8:
@@ -476,17 +485,25 @@ class SQLiteLedger:
                 self._create_schema_nine_additions(db)
                 self._create_schema_ten_additions(db)
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 9:
             with self.transaction() as db:
                 self._create_schema_ten_additions(db)
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         if version == 10:
             with self.transaction() as db:
                 self._create_schema_eleven_additions(db)
+                self._create_schema_twelve_additions(db)
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            return
+        if version == 11:
+            with self.transaction() as db:
+                self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
         raise LedgerError(f"no migration from ledger schema {version}")
@@ -866,6 +883,31 @@ class SQLiteLedger:
             "observation_id TEXT REFERENCES linear_observations(id),remote_id TEXT,"
             "observed_status TEXT NOT NULL,response_hash TEXT NOT NULL,status TEXT NOT NULL,"
             "recorded_at TEXT NOT NULL,UNIQUE(mutation_id,response_hash))"
+        )
+
+    def _create_schema_twelve_additions(self, db: sqlite3.Connection) -> None:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_evidence ("
+            "execution_id TEXT PRIMARY KEY REFERENCES workflow_executions(id),"
+            "issue_id TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,"
+            "desired_body TEXT NOT NULL,desired_digest TEXT NOT NULL,"
+            "applied_digest TEXT,remote_url TEXT,status TEXT NOT NULL,"
+            "attempt_count INTEGER NOT NULL DEFAULT 0,last_error_json TEXT,"
+            "next_attempt_at TEXT,"
+            "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,confirmed_at TEXT)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS linear_evidence_pending "
+            "ON linear_evidence(status,updated_at)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_evidence_attempts ("
+            "id TEXT PRIMARY KEY,execution_id TEXT NOT NULL "
+            "REFERENCES linear_evidence(execution_id),"
+            "attempt_number INTEGER NOT NULL,operation TEXT NOT NULL,"
+            "request_digest TEXT NOT NULL,status TEXT NOT NULL,response_hash TEXT,"
+            "error_json TEXT,started_at TEXT NOT NULL,completed_at TEXT,"
+            "UNIQUE(execution_id,attempt_number))"
         )
 
     @staticmethod
@@ -4106,6 +4148,211 @@ class SQLiteLedger:
         result["feedback"] = [json.loads(item["body_json"]) for item in feedback_rows]
         return result
 
+    @staticmethod
+    def _linear_evidence_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        last_error = item.pop("last_error_json")
+        item["last_error"] = json.loads(last_error) if last_error else None
+        return item
+
+    def stage_linear_evidence(
+        self, execution_id: str, *, issue_id: str, body: str, digest: str,
+    ) -> dict[str, Any]:
+        if not issue_id.strip() or not body.strip():
+            raise LedgerError("Linear evidence requires issue ID and body")
+        if hashlib.sha256(body.encode("utf-8")).hexdigest() != digest:
+            raise LedgerError("Linear evidence digest does not match body")
+        self.current(execution_id)
+        now = self.clock()
+        with self.transaction() as db:
+            prior = db.execute(
+                "SELECT * FROM linear_evidence WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            if not prior:
+                db.execute(
+                    "INSERT INTO linear_evidence("
+                    "execution_id,issue_id,comment_id,desired_body,desired_digest,"
+                    "applied_digest,remote_url,status,attempt_count,last_error_json,"
+                    "next_attempt_at,created_at,updated_at,confirmed_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        execution_id, issue_id, str(uuid.uuid4()), body, digest,
+                        None, None, "pending", 0, None, None, now, now, None,
+                    ),
+                )
+            else:
+                if str(prior["issue_id"]) != issue_id:
+                    raise LedgerError("Linear evidence issue identity changed")
+                if str(prior["desired_digest"]) != digest:
+                    db.execute(
+                        "UPDATE linear_evidence SET desired_body=?,desired_digest=?,"
+                        "status='pending',last_error_json=NULL,next_attempt_at=NULL,"
+                        "updated_at=? "
+                        "WHERE execution_id=?",
+                        (body, digest, now, execution_id),
+                    )
+        return self.linear_evidence(execution_id)
+
+    def linear_evidence(self, execution_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM linear_evidence WHERE execution_id=?", (execution_id,)
+        ).fetchone()
+        if not row:
+            raise LedgerError("Linear evidence not found")
+        return self._linear_evidence_dict(row)
+
+    def pending_linear_evidence(self, limit: int = 100) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 1000:
+            raise LedgerError("Linear evidence limit must be between 1 and 1000")
+        rows = self.connection.execute(
+            "SELECT * FROM linear_evidence WHERE status IN "
+            "('pending','sending','ambiguous') AND "
+            "(next_attempt_at IS NULL OR next_attempt_at<=?) "
+            "ORDER BY updated_at,execution_id LIMIT ?",
+            (self.clock(), limit),
+        ).fetchall()
+        return [self._linear_evidence_dict(row) for row in rows]
+
+    def begin_linear_evidence_attempt(
+        self, execution_id: str, *, operation: str,
+    ) -> dict[str, Any]:
+        if operation not in {"create", "update"}:
+            raise LedgerError("invalid Linear evidence operation")
+        now = self.clock()
+        with self.transaction() as db:
+            evidence = db.execute(
+                "SELECT * FROM linear_evidence WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            if not evidence or evidence["status"] == "failed":
+                raise LedgerError("Linear evidence is not deliverable")
+            attempt_number = int(evidence["attempt_count"]) + 1
+            attempt_id = self.id_factory()
+            db.execute(
+                "INSERT INTO linear_evidence_attempts VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    attempt_id, execution_id, attempt_number, operation,
+                    evidence["desired_digest"], "sending", None, None, now, None,
+                ),
+            )
+            db.execute(
+                "UPDATE linear_evidence SET status='sending',attempt_count=?,"
+                "last_error_json=NULL,next_attempt_at=NULL,updated_at=? WHERE execution_id=?",
+                (attempt_number, now, execution_id),
+            )
+        return {
+            "id": attempt_id, "execution_id": execution_id,
+            "attempt_number": attempt_number, "operation": operation,
+            "request_digest": str(evidence["desired_digest"]), "status": "sending",
+        }
+
+    def confirm_linear_evidence(
+        self, execution_id: str, *, remote_url: str = "",
+    ) -> dict[str, Any]:
+        now = self.clock()
+        with self.transaction() as db:
+            evidence = db.execute(
+                "SELECT * FROM linear_evidence WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            if not evidence:
+                raise LedgerError("Linear evidence not found")
+            db.execute(
+                "UPDATE linear_evidence_attempts SET status='confirmed_after_read',"
+                "response_hash=?,completed_at=? WHERE execution_id=? "
+                "AND status IN ('sending','ambiguous')",
+                (evidence["desired_digest"], now, execution_id),
+            )
+            db.execute(
+                "UPDATE linear_evidence SET applied_digest=desired_digest,remote_url=?,"
+                "status='confirmed',last_error_json=NULL,next_attempt_at=NULL,"
+                "updated_at=?,confirmed_at=? "
+                "WHERE execution_id=?",
+                (remote_url or evidence["remote_url"], now, now, execution_id),
+            )
+        return self.linear_evidence(execution_id)
+
+    def mark_linear_evidence_error(
+        self, execution_id: str, error: dict[str, Any], *, ambiguous: bool,
+        terminal: bool,
+    ) -> dict[str, Any]:
+        status = "failed" if terminal else "ambiguous" if ambiguous else "pending"
+        now = self.clock()
+        retry_at = None if terminal else (
+            datetime.fromisoformat(now.replace("Z", "+00:00"))
+            + timedelta(seconds=30)
+        ).isoformat()
+        with self.transaction() as db:
+            if db.execute(
+                "UPDATE linear_evidence SET status=?,last_error_json=?,"
+                "next_attempt_at=?,updated_at=? "
+                "WHERE execution_id=?",
+                (
+                    status, canonical_json(redact_payload(error)), retry_at, now,
+                    execution_id,
+                ),
+            ).rowcount != 1:
+                raise LedgerError("Linear evidence not found")
+        return self.linear_evidence(execution_id)
+
+    def finish_linear_evidence_attempt(
+        self, execution_id: str, attempt_number: int, *,
+        remote: dict[str, Any] | None = None, error: dict[str, Any] | None = None,
+        ambiguous: bool = False, terminal: bool = False,
+    ) -> dict[str, Any]:
+        if (remote is None) == (error is None):
+            raise LedgerError("Linear evidence attempt requires one result")
+        now = self.clock()
+        with self.transaction() as db:
+            evidence = db.execute(
+                "SELECT * FROM linear_evidence WHERE execution_id=?", (execution_id,)
+            ).fetchone()
+            attempt = db.execute(
+                "SELECT * FROM linear_evidence_attempts WHERE execution_id=? "
+                "AND attempt_number=?", (execution_id, attempt_number),
+            ).fetchone()
+            if not evidence or not attempt or attempt["status"] != "sending":
+                raise LedgerError("Linear evidence attempt is missing or complete")
+            if remote is not None:
+                if str(remote.get("id")) != str(evidence["comment_id"]):
+                    raise LedgerError("Linear returned a different comment ID")
+                body_digest = hashlib.sha256(
+                    str(remote.get("body", "")).encode("utf-8")
+                ).hexdigest()
+                if body_digest != str(evidence["desired_digest"]):
+                    raise LedgerError("Linear returned a different comment body")
+                response_hash = hashlib.sha256(
+                    canonical_json(redact_payload(remote)).encode("utf-8")
+                ).hexdigest()
+                db.execute(
+                    "UPDATE linear_evidence_attempts SET status='confirmed',"
+                    "response_hash=?,completed_at=? WHERE id=?",
+                    (response_hash, now, attempt["id"]),
+                )
+                db.execute(
+                    "UPDATE linear_evidence SET applied_digest=desired_digest,remote_url=?,"
+                    "status='confirmed',last_error_json=NULL,next_attempt_at=NULL,"
+                    "updated_at=?,confirmed_at=? "
+                    "WHERE execution_id=?",
+                    (str(remote.get("url") or ""), now, now, execution_id),
+                )
+            else:
+                status = "failed" if terminal else "ambiguous" if ambiguous else "pending"
+                safe_error = canonical_json(redact_payload(error or {}))
+                retry_at = None if terminal else (
+                    datetime.fromisoformat(now.replace("Z", "+00:00"))
+                    + timedelta(seconds=30)
+                ).isoformat()
+                db.execute(
+                    "UPDATE linear_evidence_attempts SET status=?,error_json=?,"
+                    "completed_at=? WHERE id=?",
+                    (status, safe_error, now, attempt["id"]),
+                )
+                db.execute(
+                    "UPDATE linear_evidence SET status=?,last_error_json=?,"
+                    "next_attempt_at=?,updated_at=? WHERE execution_id=?",
+                    (status, safe_error, retry_at, now, execution_id),
+                )
+        return self.linear_evidence(execution_id)
+
     def bind_linear_statuses(
         self, project_key: str, workflow_digest: str, team_id: str,
         bindings: list[LinearStatusBindingV1 | dict[str, Any]],
@@ -4643,6 +4890,66 @@ class SQLiteLedger:
         result["normalized"] = json.loads(result.pop("normalized_json"))
         return result
 
+    def _state_token_usage(
+        self, execution_id: str, state_runs: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Aggregate normalized runner usage without double-counting run totals."""
+        usage_by_state = {
+            str(item["id"]): {
+                "runner_runs": 0, "measured_runner_runs": 0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+                "total_tokens": 0,
+            }
+            for item in state_runs
+        }
+        runners = list(self.connection.execute(
+            "SELECT rr.id,a.state_run_id FROM runner_runs rr "
+            "JOIN attempts a ON a.id=rr.attempt_id WHERE rr.execution_id=? "
+            "ORDER BY rr.created_at,rr.id",
+            (execution_id,),
+        ))
+        facts: dict[str, dict[str, list[dict[str, int]]]] = {}
+        for row in self.connection.execute(
+            "SELECT runner_run_id,protocol_type,payload_json FROM runner_events "
+            "WHERE execution_id=? ORDER BY seq", (execution_id,),
+        ):
+            payload = json.loads(row["payload_json"])
+            usage = normalize_token_usage(payload.get("usage"))
+            if not usage:
+                continue
+            scope = payload.get("usage_scope")
+            if scope not in ("call", "run"):
+                scope = (
+                    "run" if row["protocol_type"] in ("turn.completed", "result")
+                    else "call"
+                )
+            facts.setdefault(str(row["runner_run_id"]), {
+                "call": [], "run": [],
+            })[scope].append(usage)
+
+        fields = (
+            "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_write_tokens", "total_tokens",
+        )
+        for runner in runners:
+            state_usage = usage_by_state[str(runner["state_run_id"])]
+            state_usage["runner_runs"] += 1
+            runner_facts = facts.get(str(runner["id"]), {"call": [], "run": []})
+            selected = runner_facts["run"] or runner_facts["call"]
+            if not selected:
+                continue
+            state_usage["measured_runner_runs"] += 1
+            for usage in selected:
+                for field in fields:
+                    state_usage[field] += int(usage.get(field, 0))
+        for item in usage_by_state.values():
+            item["complete"] = (
+                item["runner_runs"] > 0
+                and item["measured_runner_runs"] == item["runner_runs"]
+            )
+        return usage_by_state
+
     def run_history(self, execution_id: str) -> dict[str, Any]:
         execution = self.current(execution_id)
         state_runs = [
@@ -4705,6 +5012,7 @@ class SQLiteLedger:
             },
             "execution": execution,
             "state_runs": state_runs,
+            "state_token_usage": self._state_token_usage(execution_id, state_runs),
             "attempts": attempts,
             "events": events,
             "artifacts": artifacts,

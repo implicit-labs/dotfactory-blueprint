@@ -10,7 +10,7 @@ with `Cache-Control: no-store`.
 |---|---|---|
 | `GET /v1/overview` | — | Factory identity, projects, run counts, active leases and allocations, open attention, and projection outbox counts. |
 | `GET /v1/runs` | `project_key`, `status`, `state`, `limit` 1–100, `cursor` | Run summaries and `next_cursor`. |
-| `GET /v1/runs/{execution_id}` | — | Intent, state, active attempt, workspace summary, preparation, allocations, attention, projection lag, and available actions. |
+| `GET /v1/runs/{execution_id}` | — | Intent, state, active attempt, workspace summary, preparation, allocations, attention, Linear evidence delivery, projection lag, and available actions. |
 | `GET /v1/runs/{execution_id}/events` | `after_seq` ≥ 0, `limit` 1–100 | Ordered normalized events and `next_after_seq`. |
 | `GET /v1/runs/{execution_id}/trace` | `after_seq` ≥ 0, `limit` 1–100 | Canonical trace records and `next_after_seq`. |
 | `GET /v1/runs/{execution_id}/errors` | `after_seq` ≥ 0, `limit` 1–100 | Normalized error facts and `next_after_seq`. |
@@ -26,6 +26,11 @@ Cursor values are opaque. Missing `limit` defaults to 25, except events, trace,
 and errors, which default to 100. Waterfall and summary facts share the same
 `through_trace_seq` boundary. The HTML view contains no trace payloads, prompts,
 commands, session IDs, fence tokens, or credentials.
+
+`linear_evidence` is `null` before a Linear-backed execution is staged. Otherwise
+it reports the owned comment ID, desired/applied digest, `pending`, `sending`,
+`ambiguous`, `confirmed`, or `failed` state, last redacted error, and remote URL.
+The comment is a rebuildable view; its state never changes the workflow result.
 
 ## Commands
 

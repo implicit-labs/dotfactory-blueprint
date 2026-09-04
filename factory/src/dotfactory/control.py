@@ -19,6 +19,13 @@ API_VERSION = "v1"
 MAX_PAGE_SIZE = 100
 
 
+def _linear_evidence_view(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value for key, value in item.items()
+        if key not in {"desired_body"}
+    }
+
+
 class ControlError(RuntimeError):
     def __init__(self, code: str, message: str, *, status: int = 400) -> None:
         super().__init__(message)
@@ -133,6 +140,12 @@ class ObservationService:
 
     def run(self, execution_id: str) -> dict[str, Any]:
         snapshot = self.ledger.run_snapshot(execution_id)
+        try:
+            snapshot["linear_evidence"] = _linear_evidence_view(
+                self.ledger.linear_evidence(execution_id)
+            )
+        except LedgerError:
+            snapshot["linear_evidence"] = None
         snapshot["available_actions"] = self.available_actions(snapshot)
         return {"api_version": API_VERSION, "data": _without_fences(snapshot)}
 
@@ -212,12 +225,15 @@ class ObservationService:
             if len(page) < 1000:
                 break
             after_seq = int(page[-1]["seq"])
-        trace_seq_by_id = {
-            str(record["record_id"]): int(record["seq"]) for record in records
-        }
+        trace_by_id = {str(record["record_id"]): record for record in records}
         enriched_errors = [
-            dict(item, trace_seq=trace_seq_by_id[str(item["trace_record_id"])])
-            for item in errors if str(item["trace_record_id"]) in trace_seq_by_id
+            dict(
+                item,
+                trace_seq=int(trace_by_id[str(item["trace_record_id"])]["seq"]),
+                runner_run_id=trace_by_id[str(item["trace_record_id"])].get("runner_run_id"),
+                attempt_id=trace_by_id[str(item["trace_record_id"])].get("attempt_id"),
+            )
+            for item in errors if str(item["trace_record_id"]) in trace_by_id
         ]
         waterfall = execution_waterfall(
             records, enriched_errors,
@@ -225,7 +241,16 @@ class ObservationService:
         )
         groups = readable_error_groups(enriched_errors)
         summary = summary_fact(current, waterfall, groups)
-        return {"waterfall": waterfall, "summary": summary, "error_groups": groups}
+        try:
+            evidence = _linear_evidence_view(
+                self.ledger.linear_evidence(execution_id)
+            )
+        except LedgerError:
+            evidence = None
+        return {
+            "waterfall": waterfall, "summary": summary,
+            "error_groups": groups, "linear_evidence": evidence,
+        }
 
     def summary(self, execution_id: str) -> dict[str, Any]:
         projection = self.execution_projection(execution_id)
