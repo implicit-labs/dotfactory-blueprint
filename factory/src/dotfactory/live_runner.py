@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from .ledger import SQLiteLedger, StaleAttempt
 from .resources import PreparationError, PreparedLaunch
 from .runner import RunnerNeedsAttention, RunnerResult
+from .token_usage import normalize_token_usage
 
 
 RUNNER_KINDS = {"codex", "claude-code", "omp-rpc"}
@@ -193,9 +194,24 @@ def _durable_event_payload(
     session = _session_id(frame)
     if session:
         payload["session"] = session
-    usage = frame.get("usage")
-    if isinstance(usage, dict):
-        payload["usage"] = usage
+    usage = None
+    usage_scope = None
+    if event.protocol_type in ("turn.completed", "result"):
+        usage = normalize_token_usage(frame.get("usage"))
+        usage_scope = "run"
+    elif event.protocol_type in ("assistant", "message_end"):
+        message = frame.get("message")
+        if isinstance(message, dict):
+            usage = normalize_token_usage(message.get("usage"))
+            usage_scope = "call"
+    elif isinstance(frame.get("usage"), dict):
+        usage = normalize_token_usage(frame.get("usage"))
+        usage_scope = "call"
+    if usage:
+        payload["usage"] = {
+            key.removesuffix("_tokens"): value for key, value in usage.items()
+        }
+        payload["usage_scope"] = usage_scope
     if event.kind == "error":
         for key in ("error", "message"):
             item = frame.get(key)

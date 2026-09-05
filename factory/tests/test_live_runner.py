@@ -19,6 +19,7 @@ from dotfactory.ledger import StaleAttempt
 from dotfactory.observability import stable_trace_id
 from dotfactory.resources import PreparationError
 from dotfactory.runner import runner_request
+from dotfactory.token_usage import normalize_token_usage
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,6 +117,17 @@ class LiveRunnerTests(unittest.TestCase):
                 self.assertEqual("complete", receipt.result.preferred_label)
                 self.assertEqual("test", receipt.result.evidence[0]["kind"])
                 self.assertTrue(receipt.session_id)
+
+    def test_token_usage_normalizes_provider_cache_semantics(self):
+        self.assertEqual({
+            "input_tokens": 2, "output_tokens": 3, "cache_read_tokens": 4,
+            "cache_write_tokens": 5, "total_tokens": 14,
+        }, normalize_token_usage({
+            "input": 2, "output": 3, "cacheRead": 4, "cacheWrite": 5,
+        }))
+        self.assertEqual(15, normalize_token_usage({
+            "input_tokens": 10, "output_tokens": 5, "cached_input_tokens": 7,
+        })["total_tokens"])
 
     def test_commands_keep_prompt_and_secrets_out_of_argv(self):
         for runner, adapter in (
@@ -528,6 +540,12 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertNotIn(secret, durable)
         self.assertNotIn("dotfactory_result", durable)
         self.assertEqual(0, stored["receipt"]["exit_code"])
+        state_run_id = self.ledger.current(execution)["current_state_run_id"]
+        state_usage = self.ledger.run_history(execution)["state_token_usage"][
+            state_run_id
+        ]
+        self.assertEqual(15, state_usage["total_tokens"])
+        self.assertTrue(state_usage["complete"])
         runner_trace = [
             item for item in self.ledger.trace_page(execution, limit=1000)
             if item["source_kind"] == "runner_event"
@@ -747,6 +765,9 @@ class LiveRunnerTests(unittest.TestCase):
                 {"id": "protocol-1", "type": "response",
                  "command": "negotiate_protocol", "success": True,
                  "data": {"protocolVersion": 2}},
+                {"type": "message_end", "message": {"role": "assistant",
+                 "usage": {"input": 2, "output": 3, "cacheRead": 4,
+                           "cacheWrite": 5, "totalTokens": 14}}},
                 {"type": "extension_ui_request", "id": "approval-1",
                  "method": "confirm", "message": "Continue?"},
             ]
@@ -773,6 +794,10 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertEqual("runner-approval", attention["category"])
         self.assertEqual(["retry", "cancel"], attention["detail"]["allowed_actions"])
         self.assertNotIn("Continue?", json.dumps(stored, sort_keys=True))
+        state_run_id = self.ledger.current(_execution)["current_state_run_id"]
+        usage = self.ledger.run_history(_execution)["state_token_usage"][state_run_id]
+        self.assertEqual(14, usage["total_tokens"])
+        self.assertTrue(usage["complete"])
 
     def test_authorized_attention_retry_resumes_the_recorded_omp_session(self):
         kernel, execution, launch = self.launch("omp")
@@ -1024,7 +1049,7 @@ class LiveRunnerTests(unittest.TestCase):
         database.commit()
         database.close()
         migrated = SQLiteLedger(path)
-        self.assertEqual(11, migrated.connection.execute(
+        self.assertEqual(12, migrated.connection.execute(
             "PRAGMA user_version"
         ).fetchone()[0])
         tables = {

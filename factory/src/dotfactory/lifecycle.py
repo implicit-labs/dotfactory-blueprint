@@ -18,6 +18,7 @@ from .instance import FactoryConfig, FactoryConfigError
 from .kernel import DurableKernel
 from .ledger import SQLiteLedger
 from .linear_api import LinearConvergenceWorker, LinearGraphQLClient
+from .linear_evidence import LinearEvidenceWorker, render_linear_run_summary
 from .live_runner import LiveRunner, LiveRunnerRouter, RunnerRoute
 from .observability import canonical_json
 from .portless import PortlessProvider
@@ -129,6 +130,7 @@ class FactoryRuntime:
             self.engines: dict[str, PreparationEngine] = {}
             self.projects: dict[str, ScheduledProject] = {}
             self.linear_workers: dict[str, LinearConvergenceWorker] = {}
+            self.linear_evidence_workers: dict[str, LinearEvidenceWorker] = {}
             self.preflights: list[dict[str, Any]] = []
             self._build_projects()
             routes = _runner_routes(config)
@@ -274,6 +276,9 @@ class FactoryRuntime:
                 project_id=str(project["tracker_project_id"]),
             )
             self.linear_workers[project_key] = worker
+            self.linear_evidence_workers[project_key] = LinearEvidenceWorker(
+                self.ledger, client
+            )
             self.preflights.append({
                 "kind": "linear", "project_key": project_key,
                 "available": True, "binding_count": len(bindings),
@@ -340,6 +345,7 @@ class FactoryRuntime:
         if worker:
             self._drain_linear()
             worker.poll(execution_id, identifier)
+            self._sync_linear_evidence()
         return execution_id
 
     def discover_issue(self, project_key: str) -> dict[str, Any]:
@@ -393,6 +399,34 @@ class FactoryRuntime:
                 str(item["execution_id"])
             )["project_key"])
             self.linear_workers[project_key].drain_one(item)
+
+    def _sync_linear_evidence(self) -> None:
+        if not self.linear_evidence_workers:
+            return
+        for run in reversed(self.ledger.list_runs(limit=1000)):
+            execution_id = str(run["id"])
+            project_key = str(run["project_key"])
+            if project_key not in self.linear_evidence_workers:
+                continue
+            snapshot = self.ledger.run_snapshot(execution_id)
+            issue_id = str(snapshot["intent"].get("linear_issue_id") or "")
+            if not issue_id:
+                continue
+            service = ObservationService(self.ledger, self.kernels[project_key])
+            projection = service.execution_projection(execution_id)
+            body, digest = render_linear_run_summary(
+                snapshot, projection, self.ledger.run_history(execution_id)
+            )
+            self.ledger.stage_linear_evidence(
+                execution_id, issue_id=issue_id, body=body, digest=digest,
+            )
+        for item in self.ledger.pending_linear_evidence(1000):
+            project_key = str(self.ledger.current(
+                str(item["execution_id"])
+            )["project_key"])
+            worker = self.linear_evidence_workers.get(project_key)
+            if worker:
+                worker.drain_one(item)
 
     def _claim_pickups(self) -> list[str]:
         claimed = []
@@ -458,6 +492,7 @@ class FactoryRuntime:
         tick = self.scheduler.tick()
         self._drain_linear()
         cleanup = self._cleanup_terminal_workspaces()
+        self._sync_linear_evidence()
         return {"claimed": claimed, "scheduler": {
             "disposition": tick.disposition,
             "dispatch_id": tick.dispatch_id,
@@ -501,7 +536,9 @@ class FactoryRuntime:
                 self.kernels[str(self.ledger.current(execution_id)["project_key"])],
             )
             projection = service.execution_projection(execution_id)
-            executions.append(projection["summary"])
+            item = dict(projection["summary"])
+            item["linear_evidence"] = projection["linear_evidence"]
+            executions.append(item)
         payload: dict[str, Any] = {
             "schema_version": 1,
             "factory_id": str(self.config.values["factory_id"]),

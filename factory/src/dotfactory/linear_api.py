@@ -19,6 +19,7 @@ from .linear_reconciliation import (
 
 Transport = Callable[[str, Mapping[str, str], bytes, float], dict[str, Any]]
 RETRYABLE_CODES = {"INTERNAL_SERVER_ERROR", "RATELIMITED", "RATE_LIMITED", "TIMEOUT"}
+NOT_FOUND_CODES = {"ENTITY_NOT_FOUND", "NOT_FOUND", "R404"}
 
 
 class LinearAPIError(RuntimeError):
@@ -174,6 +175,80 @@ class LinearGraphQLClient:
         if not isinstance(issue, dict):
             raise LinearAPIError("issue_not_found", "Linear issue was not found", retryable=False)
         return issue
+
+    def comment(self, comment_id: str) -> dict[str, Any] | None:
+        try:
+            data = self.execute(
+                "FactoryComment",
+                "query FactoryComment($id:String!){comment(id:$id){id body url issue{id}}}",
+                {"id": comment_id},
+            )
+        except LinearAPIError as error:
+            if error.code.upper() in NOT_FOUND_CODES:
+                return None
+            raise
+        comment = data.get("comment")
+        if comment is None:
+            return None
+        if not isinstance(comment, dict) or not str(comment.get("id", "")).strip():
+            raise LinearAPIError(
+                "invalid_comment", "Linear returned an invalid comment", retryable=False
+            )
+        return dict(comment)
+
+    def create_comment(
+        self, *, issue_id: str, comment_id: str, body: str,
+    ) -> dict[str, Any]:
+        return self._mutate_comment(
+            operation="FactoryCommentCreate", field="commentCreate",
+            query=(
+                "mutation FactoryCommentCreate($input:CommentCreateInput!){"
+                "commentCreate(input:$input){success comment{id body url issue{id}}}}"
+            ),
+            variables={"input": {
+                "id": comment_id, "issueId": issue_id, "body": body,
+                "doNotSubscribeToIssue": True,
+            }},
+        )
+
+    def update_comment(self, *, comment_id: str, body: str) -> dict[str, Any]:
+        return self._mutate_comment(
+            operation="FactoryCommentUpdate", field="commentUpdate",
+            query=(
+                "mutation FactoryCommentUpdate($id:String!,$input:CommentUpdateInput!){"
+                "commentUpdate(id:$id,input:$input){success comment{id body url issue{id}}}}"
+            ),
+            variables={"id": comment_id, "input": {"body": body}},
+        )
+
+    def _mutate_comment(
+        self, *, operation: str, field: str, query: str,
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            data = self.execute(operation, query, variables)
+        except LinearAPIError as error:
+            if error.retryable and error.code.upper() not in {
+                "RATELIMITED", "RATE_LIMITED", "HTTP_429",
+            }:
+                raise LinearAPIError(
+                    error.code, "Linear comment mutation result is unknown",
+                    retryable=True, ambiguous=True,
+                ) from error
+            raise
+        result = data.get(field)
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise LinearAPIError(
+                "mutation_rejected", "Linear rejected the comment mutation",
+                retryable=False,
+            )
+        comment = result.get("comment")
+        if not isinstance(comment, dict) or not str(comment.get("id", "")).strip():
+            raise LinearAPIError(
+                "missing_mutation_comment", "Linear mutation returned no comment",
+                retryable=False,
+            )
+        return dict(comment)
 
     def eligible_issues(
         self, *, project_id: str, status_names: list[str], limit: int = 50,
