@@ -30,6 +30,8 @@
       "command": "codex",
       "minimum_version": "0.147.0",
       "permission_mode": "approve-for-me",
+      "default_model": "gpt-5.6-sol",
+      "default_reasoning_effort": "medium",
       "disabled_mcp_servers": ["linear"],
       "capabilities": []
     },

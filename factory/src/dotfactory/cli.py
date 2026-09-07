@@ -65,7 +65,9 @@ def _demo_config(root: Path) -> Path:
         },
         "runners": {"codex": {
             "kind": "codex", "command": "codex", "minimum_version": "0.1.0",
-            "permission_mode": "approve-for-me", "capabilities": [],
+            "permission_mode": "approve-for-me",
+            "default_model": "gpt-5.6-sol",
+            "default_reasoning_effort": "medium", "capabilities": [],
         }},
         "preparation": {
             "workspace": {"remote": "origin", "base_ref": "main",
@@ -99,6 +101,17 @@ def _install_signals(runtime: FactoryRuntime) -> None:
     signal.signal(signal.SIGTERM, stop)
 
 
+def _run_exit_code(runtime: FactoryRuntime, receipt: Any) -> int:
+    if receipt.shutdown_reason != "settled" or not receipt.ticks:
+        return 1
+    for execution in receipt.executions:
+        snapshot = runtime.ledger.run_snapshot(str(execution["execution_id"]))
+        if snapshot.get("attention_requests"):
+            return 1
+    final_disposition = receipt.ticks[-1]["scheduler"]["disposition"]
+    return 0 if final_disposition == "idle" else 1
+
+
 def _run(args: argparse.Namespace) -> int:
     config = FactoryConfig.load(args.config)
     with FactoryRuntime(config, project_keys=[args.project]) as runtime:
@@ -116,7 +129,8 @@ def _run(args: argparse.Namespace) -> int:
             [execution], watch=args.watch, max_ticks=args.max_ticks
         )
         print(json.dumps(receipt.as_dict(), indent=2, sort_keys=True))
-    return 0
+        exit_code = _run_exit_code(runtime, receipt)
+    return exit_code
 
 
 def _attention(args: argparse.Namespace) -> int:

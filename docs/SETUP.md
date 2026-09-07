@@ -56,6 +56,9 @@ prompt rule against alternate direct access. Use sandbox or network policy when
 alternate browser, shell, or API access must be mechanically blocked.
 The launch checks the prepared workspace's configured server list first, so the
 same policy also works on a clean Codex install where no Linear server exists.
+Codex routes default to `gpt-5.6-sol` with medium reasoning and pass both values
+explicitly at launch. Set `default_model` or `default_reasoning_effort` on the
+route to change that baseline; DOT node and profile values take precedence.
 
 For live Linear convergence, configure each Linear project's stable team and
 project IDs, export the variables named by their `_env` fields, and export the
@@ -116,7 +119,9 @@ PYTHONPATH=factory/src python3 -m dotfactory run \
 Omitting `--issue` enables Linear pickup discovery and therefore requires the
 configured token. `--watch` keeps polling after the run reaches a stable
 boundary. Without it, the command stops at a human checkpoint, attention
-request, or terminal state and prints a deterministic lifecycle receipt.
+request, or terminal state and prints a deterministic lifecycle receipt. It
+returns zero only after an idle settled boundary; attention, capacity, signal,
+or max-tick stops return nonzero while preserving the receipt on stdout.
 
 The first composition holds one process lock per ledger and permits one SQLite
 writer. It does not host the WSGI control API or webhook endpoint.

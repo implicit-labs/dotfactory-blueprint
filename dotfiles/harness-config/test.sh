@@ -73,7 +73,7 @@ PY
 check_codex() {
     config="$ROOT_DIR/codex/config.toml"
     assert_line 'model = "gpt-5.6-sol"' "$config" 'Codex model'
-    assert_line 'model_reasoning_effort = "high"' "$config" 'Codex reasoning'
+    assert_line 'model_reasoning_effort = "medium"' "$config" 'Codex reasoning'
     assert_line 'sandbox_mode = "workspace-write"' "$config" 'Codex sandbox'
     assert_line 'approval_policy = "on-request"' "$config" 'Codex approval'
     assert_line 'goals = true' "$config" 'Codex goals'

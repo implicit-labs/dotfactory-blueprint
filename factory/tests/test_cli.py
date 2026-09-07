@@ -7,12 +7,50 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from dotfactory import FactoryConfig, FactoryRuntime, SQLiteLedger
-from dotfactory.cli import _demo_config, main
+from dotfactory.cli import _demo_config, _run_exit_code, main
 from dotfactory.control import Principal
 from dotfactory.lifecycle import fixture_runner
 
 
 class FactoryCLITests(unittest.TestCase):
+    def test_run_exit_code_is_zero_only_for_an_idle_settled_boundary(self):
+        runtime = MagicMock()
+        runtime.ledger.run_snapshot.return_value = {"attention_requests": []}
+        receipt = MagicMock(
+            shutdown_reason="settled",
+            ticks=({"scheduler": {"disposition": "idle"}},),
+            executions=({"execution_id": "execution-1"},),
+        )
+        self.assertEqual(0, _run_exit_code(runtime, receipt))
+        for shutdown_reason, disposition in (
+            ("settled", "needs_attention"),
+            ("settled", "capacity"),
+            ("max_ticks", "completed"),
+            ("signal", "idle"),
+        ):
+            with self.subTest(
+                shutdown_reason=shutdown_reason, disposition=disposition,
+            ):
+                receipt.shutdown_reason = shutdown_reason
+                receipt.ticks = ({"scheduler": {"disposition": disposition}},)
+                self.assertEqual(1, _run_exit_code(runtime, receipt))
+
+    def test_run_exit_code_rejects_an_empty_receipt(self):
+        receipt = MagicMock(shutdown_reason="settled", ticks=(), executions=())
+        self.assertEqual(1, _run_exit_code(MagicMock(), receipt))
+
+    def test_run_exit_code_rejects_preexisting_open_attention(self):
+        runtime = MagicMock()
+        runtime.ledger.run_snapshot.return_value = {
+            "attention_requests": [{"id": "attention-1", "status": "open"}],
+        }
+        receipt = MagicMock(
+            shutdown_reason="settled",
+            ticks=({"scheduler": {"disposition": "idle"}},),
+            executions=({"execution_id": "execution-1"},),
+        )
+        self.assertEqual(1, _run_exit_code(runtime, receipt))
+
     def test_attention_records_control_without_starting_a_run(self):
         service = MagicMock()
         service.execute.return_value = {

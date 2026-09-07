@@ -392,6 +392,7 @@ def _validate_runners(values: dict[str, Any]) -> None:
         raise FactoryConfigError("config.runners must contain at least one runner")
     allowed = {
         "kind", "command", "minimum_version", "permission_mode", "profile",
+        "default_model", "default_reasoning_effort",
         "capabilities", "environment_envs", "silence_timeout_seconds",
         "disabled_mcp_servers",
         "termination_grace_seconds", "maximum_frame_bytes",
@@ -415,6 +416,11 @@ def _validate_runners(values: dict[str, Any]) -> None:
             not isinstance(runner["profile"], str) or not runner["profile"].strip()
         ):
             raise FactoryConfigError(f"{path}.profile must be a non-empty string")
+        for key in ("default_model", "default_reasoning_effort"):
+            if key in runner and (
+                not isinstance(runner[key], str) or not runner[key].strip()
+            ):
+                raise FactoryConfigError(f"{path}.{key} must be a non-empty string")
         capabilities = runner.get("capabilities", [])
         if not isinstance(capabilities, list) or any(
             not isinstance(item, str) or not PROJECT_KEY.fullmatch(item)
@@ -732,13 +738,29 @@ class FactoryConfig:
     def resolve_runners(self) -> dict[str, dict[str, Any]]:
         if self.values["schema_version"] < 6:
             return {}
-        return {
-            str(name): {
-                "name": str(name), "kind": str(value["kind"]),
+        result = {}
+        for name, value in self.values["runners"].items():
+            kind = str(value["kind"])
+            codex_defaults = (
+                {
+                    "default_model": "gpt-5.6-sol",
+                    "default_reasoning_effort": "medium",
+                }
+                if kind == "codex" else {}
+            )
+            result[str(name)] = {
+                "name": str(name), "kind": kind,
                 "command": str(value["command"]),
                 "minimum_version": str(value["minimum_version"]),
                 "permission_mode": str(value["permission_mode"]),
                 "profile": value.get("profile"),
+                "default_model": value.get(
+                    "default_model", codex_defaults.get("default_model")
+                ),
+                "default_reasoning_effort": value.get(
+                    "default_reasoning_effort",
+                    codex_defaults.get("default_reasoning_effort"),
+                ),
                 "capabilities": tuple(value.get("capabilities", [])),
                 "environment_envs": tuple(value.get("environment_envs", [])),
                 "disabled_mcp_servers": tuple(
@@ -761,8 +783,7 @@ class FactoryConfig:
                     value.get("maximum_payload_bytes", 256 * 1024)
                 ),
             }
-            for name, value in self.values["runners"].items()
-        }
+        return result
 
     def validate_runner_name(self, runner: Any) -> str:
         if not isinstance(runner, str) or not runner:
