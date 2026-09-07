@@ -240,7 +240,10 @@ class ObservationService:
             self.ledger.trace_completion_facts(execution_id),
         )
         groups = readable_error_groups(enriched_errors)
-        summary = summary_fact(current, waterfall, groups)
+        links = [{"kind": str(item["kind"]), "url": str(item["uri"])}
+                 for item in self.ledger.artifacts_page(execution_id, limit=1000)
+                 if str(item["uri"]).startswith("https://")]
+        summary = summary_fact(current, waterfall, groups, links=links)
         try:
             evidence = _linear_evidence_view(
                 self.ledger.linear_evidence(execution_id)
@@ -263,7 +266,8 @@ class ObservationService:
     def waterfall_html(self, execution_id: str) -> str:
         projection = self.execution_projection(execution_id)
         return render_waterfall_html(
-            projection["waterfall"], projection["summary"]
+            projection["waterfall"], projection["summary"],
+            projection["error_groups"],
         )
 
     def artifacts(

@@ -155,16 +155,28 @@ for full replay. See
    `factory/factory.json`, register the projects this factory may operate, then
    set `projections.logfire.enabled` to `true`.
 
-The current repository provides the durable outbox and fail-soft projection
-worker, but not the hosted runner or Logfire sink. Enabling the config alone
-does not transmit data yet. A runner supplies a sink using Logfire's
-[OpenTelemetry interface](https://pydantic.dev/docs/logfire/guides/alternative-clients/),
-then retries committed outbox items until delivery succeeds.
+The lifecycle maps its fixed canonical trace range to OTLP JSON and sends it to
+Logfire over HTTP. Each accepted or rejected source record gets a durable,
+redacted receipt. Missing or rejected credentials pause the projection without
+changing canonical run state. The runtime remains stdlib-only.
 Previously delivered events can be replayed through a durable session with a
 fixed event range, command ID, initiator, progress, and failure record. Retrying
 the same command resumes only unfinished items. Delivery is at least once, so
 every sink must deduplicate using the stable `event_id`. Run rebuilds with the
 ordinary worker stopped so live delivery and historical replay do not overlap.
+
+Export one deterministic local dataset without contacting Logfire:
+
+```bash
+PYTHONPATH=factory/src python3 -m dotfactory dataset \
+  --config factory/factory.json --project example-ios \
+  --execution EXECUTION_ID --output .dotfactory/datasets
+```
+
+The JSONL and content-addressed manifest exclude raw prompts, provider payloads,
+installed skill paths, and credentials. Set `dataset_enabled` and supply the
+separate project API key only when hosted Logfire dataset publication is wanted;
+then add `--publish-hosted`. Local export remains the canonical path.
 
 ## Quickstart
 

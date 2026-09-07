@@ -109,6 +109,28 @@ class FactoryCLITests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_dataset_cli_exports_one_deterministic_local_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = _demo_config(root)
+            config = FactoryConfig.load(config_path)
+            with FactoryRuntime(config, runner=fixture_runner()) as runtime:
+                execution = runtime.start_issue("demo", "DEMO-DATASET-1")
+                runtime.run([execution], max_ticks=20)
+            output_dir = root / "datasets"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = main([
+                    "dataset", "--config", str(config_path),
+                    "--project", "demo", "--execution", execution,
+                    "--output", str(output_dir),
+                ])
+            self.assertEqual(0, result)
+            receipt = json.loads(output.getvalue())
+            self.assertFalse(receipt["hosted"]["enabled"])
+            self.assertTrue(Path(receipt["dataset"]).is_file())
+            self.assertTrue(Path(receipt["manifest"]).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

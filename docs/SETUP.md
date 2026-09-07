@@ -64,6 +64,15 @@ every workflow status to one team status ID before activation. Polling is the
 recovery path; a signed webhook may only accelerate it. A timeout after a status
 write remains ambiguous until a read confirms the remote issue.
 
+For Logfire, set `project` to your Logfire project identity, choose its `us` or
+`eu` region, and inject the matching OTLP endpoint and write-token header through
+the named environment variables.
+The runtime sends JSON over HTTP to `/v1/traces`; projection failures are durable
+and fail-soft. Hosted datasets are separate and disabled by default. Enabling
+them requires `LOGFIRE_PROJECT_API_KEY` with only `project:read_datasets` and
+`project:write_datasets`; the telemetry write token is not accepted for dataset
+operations.
+
 The default worktree pool is `<project checkout>/.worktrees`. Add it to the
 project's `.gitignore` before activation:
 

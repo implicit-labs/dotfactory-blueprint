@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from .control import Principal
+from .datasets import (
+    HostedDatasetPublisher, HostedDatasetSettings, execution_dataset_case,
+    write_dataset_bundle,
+)
 from .instance import FactoryConfig
 from .lifecycle import FactoryRuntime, fixture_runner
 
@@ -167,6 +171,44 @@ def _demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dataset(args: argparse.Namespace) -> int:
+    config = FactoryConfig.load(args.config)
+    with FactoryRuntime(
+        config, project_keys=[args.project], control_only=True,
+    ) as runtime:
+        current = runtime.ledger.current(args.execution)
+        if current["project_key"] != args.project:
+            raise RuntimeError(
+                f"execution is not available in project {args.project}"
+            )
+        from .control import ObservationService
+        projection = ObservationService(
+            runtime.ledger, runtime.kernels[args.project]
+        ).execution_projection(args.execution)
+        case = execution_dataset_case(runtime.ledger, args.execution, projection)
+        receipt = write_dataset_bundle(args.output, [case])
+        receipt["case_id"] = case["case_id"]
+        receipt["hosted"] = {"enabled": False}
+        if args.publish_hosted:
+            settings = config.resolve_logfire_projection(
+                environment=runtime.environment
+            )
+            if not settings["dataset_enabled"]:
+                raise RuntimeError("hosted Logfire datasets are not enabled")
+            receipt["hosted"] = HostedDatasetPublisher(
+                HostedDatasetSettings(
+                    api_key=str(settings["dataset_api_key"]),
+                    project=str(settings["project"]),
+                    region=str(settings["region"]),
+                    dataset_name=str(settings["dataset_name"]),
+                ), ledger=runtime.ledger,
+            ).publish(
+                [case], command_id=f"dataset:{args.execution}:{case['case_id']}"
+            )
+        print(json.dumps(receipt, indent=2, sort_keys=True))
+    return 0
+
+
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dotfactory")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -198,8 +240,17 @@ def main(arguments: list[str] | None = None) -> int:
     demo = commands.add_parser("demo", help="run a disposable Git-backed toy lifecycle")
     demo.add_argument("--output")
     demo.set_defaults(callback=_demo)
+    dataset = commands.add_parser(
+        "dataset", help="export a deterministic local execution dataset"
+    )
+    dataset.add_argument("--config", default=os.environ.get("DOTFACTORY_CONFIG"))
+    dataset.add_argument("--project", required=True)
+    dataset.add_argument("--execution", required=True)
+    dataset.add_argument("--output", required=True)
+    dataset.add_argument("--publish-hosted", action="store_true")
+    dataset.set_defaults(callback=_dataset)
     args = parser.parse_args(arguments)
-    if args.command in ("run", "attention") and not args.config:
+    if args.command in ("run", "attention", "dataset") and not args.config:
         parser.error(f"{args.command} requires --config or DOTFACTORY_CONFIG")
     try:
         return int(args.callback(args))

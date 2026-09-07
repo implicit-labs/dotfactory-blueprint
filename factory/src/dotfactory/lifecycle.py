@@ -27,6 +27,7 @@ from .runner import RunnerResult
 from .scheduler import (
     ProjectPreparation, ScheduledProject, Scheduler, SchedulerPolicy, SchedulerTick,
 )
+from .telemetry import LogfireProjectionWorker, LogfireSettings
 from .workspace import GitWorkspaceProvider
 
 
@@ -131,6 +132,7 @@ class FactoryRuntime:
             self.projects: dict[str, ScheduledProject] = {}
             self.linear_workers: dict[str, LinearConvergenceWorker] = {}
             self.linear_evidence_workers: dict[str, LinearEvidenceWorker] = {}
+            self.logfire_worker: LogfireProjectionWorker | None = None
             self.preflights: list[dict[str, Any]] = []
             self._build_projects()
             routes = _runner_routes(config)
@@ -193,8 +195,13 @@ class FactoryRuntime:
                     "kind": "linear", "available": False,
                     "reason": "external projection preflight skipped",
                 })
+                self.preflights.append({
+                    "kind": "logfire", "available": False,
+                    "reason": "external projection preflight skipped",
+                })
             else:
                 self._build_linear()
+                self._build_logfire()
         except Exception:
             if hasattr(self, "ledger"):
                 self.ledger.close()
@@ -283,6 +290,32 @@ class FactoryRuntime:
                 "kind": "linear", "project_key": project_key,
                 "available": True, "binding_count": len(bindings),
             })
+
+    def _build_logfire(self) -> None:
+        projection = self.config.resolve_logfire_projection(
+            environment=self.environment
+        )
+        if not projection["enabled"]:
+            self.preflights.append({
+                "kind": "logfire", "available": False,
+                "reason": "projection disabled",
+                "project": projection.get("project"),
+            })
+            return
+        settings = LogfireSettings(
+            endpoint=str(projection["endpoint"]),
+            headers=str(projection["headers"]),
+            service_name=str(projection["service_name"]),
+            project=str(projection["project"]), region=str(projection["region"]),
+            timeout_seconds=int(projection["timeout_seconds"]),
+        )
+        self.logfire_worker = LogfireProjectionWorker(self.ledger, settings)
+        self.preflights.append({
+            "kind": "logfire", "available": True,
+            "project": settings.project, "region": settings.region,
+            "service_name": settings.service_name,
+            "credential_kind": "write_token",
+        })
 
     def request_stop(self, reason: str = "signal") -> None:
         self.stop_requested = True
@@ -428,6 +461,11 @@ class FactoryRuntime:
             if worker:
                 worker.drain_one(item)
 
+    def _drain_logfire(self) -> dict[str, Any] | None:
+        if not self.logfire_worker:
+            return None
+        return self.logfire_worker.drain()
+
     def _claim_pickups(self) -> list[str]:
         claimed = []
         for run in reversed(self.ledger.list_runs(status="running", limit=1000)):
@@ -493,13 +531,14 @@ class FactoryRuntime:
         self._drain_linear()
         cleanup = self._cleanup_terminal_workspaces()
         self._sync_linear_evidence()
+        logfire = self._drain_logfire()
         return {"claimed": claimed, "scheduler": {
             "disposition": tick.disposition,
             "dispatch_id": tick.dispatch_id,
             "execution_id": tick.execution_id,
             "attempt_id": tick.attempt_id,
             "detail": dict(tick.detail),
-        }, "cleanup": cleanup}
+        }, "cleanup": cleanup, "logfire": logfire}
 
     def _settled(self, step: Mapping[str, Any]) -> bool:
         if step["claimed"]:

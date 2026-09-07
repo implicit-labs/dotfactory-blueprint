@@ -12,7 +12,7 @@ from .observability import canonical_json, stable_span_id
 
 
 WATERFALL_FACT_VERSION = 1
-SUMMARY_FACT_VERSION = 1
+SUMMARY_FACT_VERSION = 2
 
 
 def _milliseconds(started_at: str | None, ended_at: str | None) -> int | None:
@@ -60,6 +60,8 @@ def readable_error_groups(
             "safe_remedy": error["safe_remedy"],
             "retryable": bool(error["retryable"]),
             "ambiguous_side_effect": bool(error["ambiguous_side_effect"]),
+            "capture_complete": bool(error.get("capture_complete", True)),
+            "completeness": dict(error.get("completeness") or {}),
             "trust_class": error.get("trust_class"),
             "first_occurred_at": error["occurred_at"],
             "last_occurred_at": error["occurred_at"],
@@ -73,6 +75,16 @@ def readable_error_groups(
         group["ambiguous_side_effect"] = bool(
             group["ambiguous_side_effect"] or error["ambiguous_side_effect"]
         )
+        group["capture_complete"] = bool(
+            group["capture_complete"] and error.get("capture_complete", True)
+        )
+        group["completeness"] = {
+            "complete": group["capture_complete"],
+            "reasons": sorted({
+                *group["completeness"].get("reasons", []),
+                *(error.get("completeness") or {}).get("reasons", []),
+            }),
+        }
         if severity_rank.get(str(error["severity"]), 3) > severity_rank.get(
             str(group["severity"]), 3
         ):
@@ -302,6 +314,10 @@ def summary_fact(
         "errors": [{
             "code": item["code"], "message": item["message"],
             "safe_remedy": item["safe_remedy"],
+            "category": item["category"],
+            "retryable": item["retryable"],
+            "ambiguous_side_effect": item["ambiguous_side_effect"],
+            "capture_complete": item["capture_complete"],
             "occurrence_count": item["occurrence_count"],
             "fingerprint": item["fingerprint"],
             "first_trace_seq": item["occurrences"][0]["trace_seq"],

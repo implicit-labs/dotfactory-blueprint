@@ -5564,20 +5564,23 @@ class SQLiteLedger:
                 raise LedgerError(f"projection {name} is required")
         if from_source_seq < 1:
             raise LedgerError("projection range must start at sequence 1 or later")
-        if through_source_seq is None:
-            if source_kind != "trace_record":
-                raise LedgerError("non-trace projections require a fixed through sequence")
-            through_source_seq = int(self.connection.execute(
-                "SELECT COALESCE(MAX(seq),0) FROM trace_records"
-            ).fetchone()[0])
-            through_source_seq = max(through_source_seq, from_source_seq - 1)
-        if through_source_seq < from_source_seq - 1:
-            raise LedgerError("projection range ends before it starts")
         prior = self.connection.execute(
             "SELECT * FROM projection_attempts WHERE destination=? "
             "AND (command_id=? OR idempotency_key=?)",
             (destination, command_id, idempotency_key),
         ).fetchone()
+        if through_source_seq is None:
+            if prior:
+                through_source_seq = int(prior["through_source_seq"])
+            elif source_kind != "trace_record":
+                raise LedgerError("non-trace projections require a fixed through sequence")
+            else:
+                through_source_seq = int(self.connection.execute(
+                    "SELECT COALESCE(MAX(seq),0) FROM trace_records"
+                ).fetchone()[0])
+                through_source_seq = max(through_source_seq, from_source_seq - 1)
+        if through_source_seq < from_source_seq - 1:
+            raise LedgerError("projection range ends before it starts")
         expected = (
             command_id, source_kind, from_source_seq, through_source_seq,
             idempotency_key,
@@ -5750,7 +5753,7 @@ class SQLiteLedger:
                     "UPDATE projection_attempts SET updated_at=? WHERE id=?",
                     (normalized.recorded_at, normalized.attempt_id),
                 )
-            if source_record:
+            if source_record and source_record["source_kind"] != "projection_receipt":
                 links = ({
                     "type": "asynchronous_projection",
                     "record_id": normalized.source_record_id,
