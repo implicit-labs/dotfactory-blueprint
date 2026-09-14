@@ -282,6 +282,13 @@ class Scheduler:
         result = self.runner.run(launch)
         if not isinstance(result, RunnerResult):
             raise PreparationError("runner did not return RunnerResult")
+        from .delivery import evaluate
+        progress = None
+        run = self.ledger.runner_run_for_attempt(launch.request.attempt_id)
+        callback = getattr(self.runner, "cancel_requested", None)
+        if run and callback:
+            progress = lambda: callback(str(run["id"]))
+        result = evaluate(self.ledger, launch, result, progress=progress)
         return result
 
     def _commit_result(

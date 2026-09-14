@@ -167,6 +167,28 @@ class WaterfallProjectionTests(unittest.TestCase):
         self.assertNotIn("<script>bad()</script>", html)
         self.assertIn("<table>", html)
         self.assertIn("aria-label=\"Run facts\"", html)
+        self.assertIn("<details class=error", html)
+        self.assertIn("Side effects ambiguous", html)
+        self.assertIn("Capture complete", html)
+        self.assertIn(summary["errors"][0]["fingerprint"], html)
+        self.assertIn("@media(max-width:640px)", html)
+        self.assertNotIn("min-width:760px", html)
+
+    def test_https_evidence_is_linked_and_private_uris_are_not(self):
+        execution = self.kernel.begin(
+            "dotfactory", "TASK-617", {"title": "evidence"},
+            command_id="begin-evidence",
+        )
+        self.kernel.transition(
+            execution, "Canceled", actor="human", signal="linear_status_change",
+            outcome="canceled", evidence=[
+                {"kind": "review", "uri": "https://example.test/evidence"},
+                {"kind": "local", "uri": "/private/example/receipt.json"},
+            ], command_id="cancel-evidence",
+        )
+        html = self.observation.waterfall_html(execution)
+        self.assertIn('href="https://example.test/evidence"', html)
+        self.assertNotIn("/private/example/receipt.json", html)
 
     def test_trace_and_error_pages_are_bounded(self):
         execution = self.failed_execution()

@@ -177,10 +177,10 @@ def render_linear_run_summary(
         recovered=completed and str(snapshot["current_state_id"]) == "Done",
         terminal=completed,
     )
-    if completed:
-        label = "Done"
-    elif attention:
+    if attention:
         label = "Needs attention"
+    elif completed:
+        label = str(snapshot["current_state_id"])
     elif incidents:
         label = "Investigating"
     else:
@@ -194,7 +194,8 @@ def render_linear_run_summary(
     if incidents:
         incident_phrase = (
             f" {len(incidents)} incident{'s were' if len(incidents) != 1 else ' was'} "
-            + ("recovered." if completed else "recorded.")
+            + ("recovered." if all(item["status"] == "recovered" for item in incidents)
+               else "recorded.")
         )
     result_line = (
         f"{'Completed' if completed else 'Currently'} in "

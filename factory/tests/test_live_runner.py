@@ -7,6 +7,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from dotfactory import (
@@ -299,6 +300,29 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertNotIn("tracker.example", prompt)
         self.assertNotIn("linear-issue-1", prompt)
         self.assertIn('"disabled_mcp_servers":["linear"]', prompt)
+
+    def test_codex_command_uses_route_defaults_without_ambient_config(self):
+        _kernel, _execution, launch = self.launch("codex")
+        launch.request.config.pop("model")
+        launch.request.config.pop("reasoning_effort")
+        route = replace(
+            self.routes()["codex"], default_model="gpt-5.6-sol",
+            default_reasoning_effort="medium",
+        )
+        command = CodexAdapter().command(route, launch)
+        self.assertEqual("gpt-5.6-sol", command[command.index("-m") + 1])
+        self.assertIn('model_reasoning_effort="medium"', command)
+
+    def test_workflow_values_override_codex_route_defaults(self):
+        _kernel, _execution, launch = self.launch("codex")
+        route = replace(
+            self.routes()["codex"], default_model="gpt-5.6-sol",
+            default_reasoning_effort="medium",
+        )
+        command = CodexAdapter().command(route, launch)
+        self.assertEqual("fixture-model", command[command.index("-m") + 1])
+        self.assertIn('model_reasoning_effort="high"', command)
+        self.assertNotIn('model_reasoning_effort="medium"', command)
 
     def test_prompt_requires_an_immutable_snapshot(self):
         _kernel, execution, launch = self.launch("codex")
@@ -1092,12 +1116,18 @@ class RunnerConfigurationTests(unittest.TestCase):
             ("ANTHROPIC_API_KEY",), runners["omp"]["environment_envs"]
         )
         self.assertEqual(("linear",), runners["codex"]["disabled_mcp_servers"])
+        self.assertEqual("gpt-5.6-sol", runners["codex"]["default_model"])
+        self.assertEqual(
+            "medium", runners["codex"]["default_reasoning_effort"]
+        )
+        self.assertIsNone(runners["claude"]["default_model"])
         self.assertEqual("codex", config.validate_runner_name("codex"))
 
     def test_invalid_runner_registry_blocks_activation(self):
         for key, value in (
             ("kind", "unknown"), ("command", ""),
             ("capabilities", ["Bad Name"]),
+            ("default_model", ""), ("default_reasoning_effort", ""),
         ):
             with self.subTest(key=key):
                 original = self.values["runners"]["codex"][key]

@@ -16,6 +16,11 @@ from .linear_api import (
 from .linear_evidence import (
     LinearEvidenceWorker, readable_incidents, render_linear_run_summary,
 )
+from .datasets import (
+    DatasetContractError, HostedDatasetPublisher, HostedDatasetSettings,
+    dataset_bundle, execution_dataset_case, incident_rows,
+    score_execution_case, write_dataset_bundle,
+)
 from .live_runner import (
     ClaudeCodeAdapter, CodexAdapter, LiveRunner, LiveRunnerRouter,
     OmpRpcAdapter, OmpRpcFrameDecoder, RunnerCapabilityReport, RunnerCanceled,
@@ -37,6 +42,10 @@ from .scheduler import (
 )
 from .projections import execution_waterfall, readable_error_groups, summary_fact
 from .waterfall import render_waterfall_html
+from .telemetry import (
+    LogfireProjectionWorker, LogfireSettings, TelemetryProjectionError,
+    otel_trace_document,
+)
 from .workflow import WorkflowDefinition, WorkflowError, load_workflow
 
 __all__ = [
@@ -48,6 +57,9 @@ __all__ = [
     "LinearAPIError", "LinearConvergenceWorker", "LinearGraphQLClient",
     "LinearWebhookVerifier",
     "LinearEvidenceWorker", "readable_incidents", "render_linear_run_summary",
+    "DatasetContractError", "HostedDatasetPublisher", "HostedDatasetSettings",
+    "dataset_bundle", "execution_dataset_case", "incident_rows",
+    "score_execution_case", "write_dataset_bundle",
     "FakePreparedRunner", "ObservationService", "PreparationEngine",
     "PreparationError", "PreparationResult", "PreparedLaunch", "Principal",
     "RunnerRequest", "RunnerResult",
@@ -62,5 +74,7 @@ __all__ = [
     "SQLiteLedger", "WorkflowDefinition", "WorkflowError", "load_workflow",
     "execution_waterfall", "readable_error_groups", "render_waterfall_html",
     "summary_fact",
+    "LogfireProjectionWorker", "LogfireSettings", "TelemetryProjectionError",
+    "otel_trace_document",
     "run_fake_attempt", "run_prepared_attempt", "runner_request",
 ]
