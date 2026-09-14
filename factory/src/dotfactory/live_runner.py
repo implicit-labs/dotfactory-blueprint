@@ -49,6 +49,8 @@ class RunnerRoute:
     permission_mode: str
     capabilities: tuple[str, ...] = ()
     profile: str | None = None
+    default_model: str | None = None
+    default_reasoning_effort: str | None = None
     environment_envs: tuple[str, ...] = ()
     disabled_mcp_servers: tuple[str, ...] = ()
     configured_mcp_servers: tuple[str, ...] | None = None
@@ -445,6 +447,13 @@ class RunnerAdapter:
             "Process exit alone is not success. "
             f"preferred_label must be exactly one of: {labels}."
         )
+        if launch.request.config.get("exit_contract"):
+            contract += (
+                " Every evidence URI must be an existing committed workspace file path, "
+                "such as .factory/delivery.json. Do not include git://, ledger://, local://, "
+                "HTTP URLs, commit IDs, or invented check references in evidence. "
+                "The factory adds its own verification receipt after your response."
+            )
         return prompt_text + contract
 
     def input_payload(
@@ -486,11 +495,15 @@ class CodexAdapter(RunnerAdapter):
                 "--output-schema", RESULT_SCHEMA_PATH,
             ]
         config = launch.request.config
-        if config.get("model"):
-            command.extend(["-m", str(config["model"])])
-        if config.get("reasoning_effort"):
+        model = config.get("model") or route.default_model
+        reasoning_effort = (
+            config.get("reasoning_effort") or route.default_reasoning_effort
+        )
+        if model:
+            command.extend(["-m", str(model)])
+        if reasoning_effort:
             command.extend([
-                "-c", f'model_reasoning_effort="{config["reasoning_effort"]}"',
+                "-c", f'model_reasoning_effort="{reasoning_effort}"',
             ])
         if (
             route.disabled_mcp_servers
@@ -563,10 +576,14 @@ class ClaudeCodeAdapter(RunnerAdapter):
         else:
             command.extend(["--session-id", launch.request.attempt_id])
         config = launch.request.config
-        if config.get("model"):
-            command.extend(["--model", str(config["model"])])
-        if config.get("reasoning_effort"):
-            command.extend(["--effort", str(config["reasoning_effort"])])
+        model = config.get("model") or route.default_model
+        reasoning_effort = (
+            config.get("reasoning_effort") or route.default_reasoning_effort
+        )
+        if model:
+            command.extend(["--model", str(model)])
+        if reasoning_effort:
+            command.extend(["--effort", str(reasoning_effort)])
         return tuple(command)
 
     def frame_event(self, frame):
@@ -614,10 +631,14 @@ class OmpRpcAdapter(RunnerAdapter):
             command.extend(["--profile", route.profile])
         command.extend(["--approval-mode", route.permission_mode])
         config = launch.request.config
-        if config.get("model"):
-            command.extend(["--model", str(config["model"])])
-        if config.get("reasoning_effort"):
-            command.extend(["--thinking", str(config["reasoning_effort"])])
+        model = config.get("model") or route.default_model
+        reasoning_effort = (
+            config.get("reasoning_effort") or route.default_reasoning_effort
+        )
+        if model:
+            command.extend(["--model", str(model)])
+        if reasoning_effort:
+            command.extend(["--thinking", str(reasoning_effort)])
         return tuple(command)
 
     def input_payload(self, launch, *, prompt_text, session_id):
@@ -1131,6 +1152,7 @@ class LiveRunner:
             "state_id": launch.request.state_id,
             "workflow_digest": launch.request.workflow_digest,
             "intent": intent,
+            "handoff": self.ledger.attempt_input_context(launch.request.attempt_id),
             "disabled_mcp_servers": disabled_mcp_servers,
             "skills": list(launch.request.config.get("skills", [])),
             "capabilities": list(launch.request.config.get("capabilities", [])),

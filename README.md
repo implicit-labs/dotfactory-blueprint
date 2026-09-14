@@ -1,5 +1,33 @@
 # dotfactory
 
+## Local doctor
+
+Check local prerequisites without starting the factory:
+
+```bash
+PYTHONPATH=factory/src python3 -m dotfactory doctor --config PATH
+PYTHONPATH=factory/src python3 -m dotfactory doctor --config PATH --json
+```
+
+Doctor validates the config, configured Git roots, local `origin/main` commits,
+runner executable presence, and required environment-variable presence for
+enabled integrations. Each failure includes a remedy. Exit status is `0` only
+when every required local check passes; otherwise it is `1`.
+
+JSON output has `schema_version: 1`, `command`, overall `status`, summary counts,
+and deterministically ordered `checks`. Each check contains `id`, `scope`,
+`status`, `required`, `message`, `remedy`, and `boundary`. Check status is
+`pass`, `fail`, `skipped`, or `not_checked` (`not checked` in text). Disabled
+integrations are skipped and do not fail readiness.
+Linear polling requires its token, not a webhook secret. Webhook readiness is
+reported as not checked; validate webhook credentials separately before ingress.
+
+Doctor is read-only and offline. It does not fetch, repair, create runtime or
+ledger state, launch runners, contact integrations, inspect credential stores,
+or report credential values and remote URLs. Executable and environment
+presence do not prove authentication; runner and integration authentication is
+explicitly not checked. Run each provider's authenticated preflight separately.
+
 Portable agent configuration and a crash-safe orchestration kernel.
 
 | Area | Purpose |
@@ -10,8 +38,8 @@ Portable agent configuration and a crash-safe orchestration kernel.
 | `docs/decisions/` | durable architecture decisions |
 | [`review_protocol.md`](review_protocol.md) | change, review, and merge checklist |
 
-The factory provides a one-process lifecycle command. It is not a hosted control
-service or PR listener.
+The factory provides a one-process lifecycle command and a separately served,
+authenticated loopback control API. It is not a remote PR listener.
 
 ## What the ledger does
 
@@ -81,7 +109,7 @@ recordings, and reports; it does not mutate the runtime summary comment.
 The versioned [control API](factory/CONTROL_API.md) exposes bounded, redacted
 run views and audited `cancel`, `retry`, `approve`, and `transition` commands.
 The host must authenticate requests and supply verified roles. The package
-provides a WSGI adapter, not a hosted server or authentication provider.
+provides a WSGI adapter and a token-authenticated local gateway through `serve`.
 
 ## Run one lifecycle
 
@@ -155,16 +183,28 @@ for full replay. See
    `factory/factory.json`, register the projects this factory may operate, then
    set `projections.logfire.enabled` to `true`.
 
-The current repository provides the durable outbox and fail-soft projection
-worker, but not the hosted runner or Logfire sink. Enabling the config alone
-does not transmit data yet. A runner supplies a sink using Logfire's
-[OpenTelemetry interface](https://pydantic.dev/docs/logfire/guides/alternative-clients/),
-then retries committed outbox items until delivery succeeds.
+The lifecycle maps its fixed canonical trace range to OTLP JSON and sends it to
+Logfire over HTTP. Each accepted or rejected source record gets a durable,
+redacted receipt. Missing or rejected credentials pause the projection without
+changing canonical run state. The runtime remains stdlib-only.
 Previously delivered events can be replayed through a durable session with a
 fixed event range, command ID, initiator, progress, and failure record. Retrying
 the same command resumes only unfinished items. Delivery is at least once, so
 every sink must deduplicate using the stable `event_id`. Run rebuilds with the
 ordinary worker stopped so live delivery and historical replay do not overlap.
+
+Export one deterministic local dataset without contacting Logfire:
+
+```bash
+PYTHONPATH=factory/src python3 -m dotfactory dataset \
+  --config factory/factory.json --project example-ios \
+  --execution EXECUTION_ID --output .dotfactory/datasets
+```
+
+The JSONL and content-addressed manifest exclude raw prompts, provider payloads,
+installed skill paths, and credentials. Set `dataset_enabled` and supply the
+separate project API key only when hosted Logfire dataset publication is wanted;
+then add `--publish-hosted`. Local export remains the canonical path.
 
 ## Quickstart
 

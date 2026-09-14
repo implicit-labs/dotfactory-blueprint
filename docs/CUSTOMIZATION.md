@@ -1,5 +1,12 @@
 # Customization
 
+## Verified delivery
+
+Use the [verified Python preset](VERIFIED-DELIVERY.md) for committed deliverables
+and a host-checked Review gate. Named `exit_contract` values must be supported;
+unknown names fail workflow loading. Autoplanning proceeds automatically;
+manual Planning requires exact-commit approval.
+
 Change the canonical source for the behavior you want; do not copy it into a
 second location.
 

@@ -6,8 +6,10 @@ import fcntl
 import hashlib
 import json
 import os
+import queue
 import socket
 import sqlite3
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -17,7 +19,7 @@ from .control import ControlService, ObservationService
 from .instance import FactoryConfig, FactoryConfigError
 from .kernel import DurableKernel
 from .ledger import SQLiteLedger
-from .linear_api import LinearConvergenceWorker, LinearGraphQLClient
+from .linear_api import LinearAPIError, LinearConvergenceWorker, LinearGraphQLClient
 from .linear_evidence import LinearEvidenceWorker, render_linear_run_summary
 from .live_runner import LiveRunner, LiveRunnerRouter, RunnerRoute
 from .observability import canonical_json
@@ -27,6 +29,7 @@ from .runner import RunnerResult
 from .scheduler import (
     ProjectPreparation, ScheduledProject, Scheduler, SchedulerPolicy, SchedulerTick,
 )
+from .telemetry import LogfireProjectionWorker, LogfireSettings
 from .workspace import GitWorkspaceProvider
 
 
@@ -50,6 +53,7 @@ class LifecycleReceipt:
     preflights: tuple[Mapping[str, Any], ...]
     shutdown_reason: str
     digest: str
+    target_state: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -117,7 +121,14 @@ class FactoryRuntime:
         self.control_only = control_only
         self.started_at = ""
         self.stop_requested = False
+        self.drain_requested = False
+        self.operator_server: Any | None = None
+        self._last_live_poll = 0.0
+        self._live_poll_inflight = False
+        self._live_poll_results: queue.Queue[Any] = queue.Queue(maxsize=1)
         self.shutdown_reason = "settled"
+        self.target_state: str | None = None
+        self.target_execution_id: str | None = None
         self.lock = InstanceLock(_ledger_path(config).with_suffix(".lock"))
         self.lock.acquire()
         try:
@@ -131,13 +142,14 @@ class FactoryRuntime:
             self.projects: dict[str, ScheduledProject] = {}
             self.linear_workers: dict[str, LinearConvergenceWorker] = {}
             self.linear_evidence_workers: dict[str, LinearEvidenceWorker] = {}
+            self.logfire_worker: LogfireProjectionWorker | None = None
             self.preflights: list[dict[str, Any]] = []
             self._build_projects()
             routes = _runner_routes(config)
             if control_only:
                 runner = LiveRunner(
                     self.ledger, routes=routes, environment=self.environment,
-                    cancel_requested=lambda _run_id: self.stop_requested,
+                    cancel_requested=self._runner_cancel_requested,
                 )
                 self.preflights.append({
                     "kind": "runner", "name": "control-only",
@@ -175,7 +187,7 @@ class FactoryRuntime:
                     )
                 runner = LiveRunner(
                     self.ledger, routes=routes, environment=self.environment,
-                    cancel_requested=lambda _run_id: self.stop_requested,
+                    cancel_requested=self._runner_cancel_requested,
                 )
             else:
                 self.preflights.append({
@@ -193,8 +205,13 @@ class FactoryRuntime:
                     "kind": "linear", "available": False,
                     "reason": "external projection preflight skipped",
                 })
+                self.preflights.append({
+                    "kind": "logfire", "available": False,
+                    "reason": "external projection preflight skipped",
+                })
             else:
                 self._build_linear()
+                self._build_logfire()
         except Exception:
             if hasattr(self, "ledger"):
                 self.ledger.close()
@@ -284,9 +301,98 @@ class FactoryRuntime:
                 "available": True, "binding_count": len(bindings),
             })
 
+    def _build_logfire(self) -> None:
+        projection = self.config.resolve_logfire_projection(
+            environment=self.environment
+        )
+        if not projection["enabled"]:
+            self.preflights.append({
+                "kind": "logfire", "available": False,
+                "reason": "projection disabled",
+                "project": projection.get("project"),
+            })
+            return
+        settings = LogfireSettings(
+            endpoint=str(projection["endpoint"]),
+            headers=str(projection["headers"]),
+            service_name=str(projection["service_name"]),
+            project=str(projection["project"]), region=str(projection["region"]),
+            timeout_seconds=int(projection["timeout_seconds"]),
+        )
+        self.logfire_worker = LogfireProjectionWorker(self.ledger, settings)
+        self.preflights.append({
+            "kind": "logfire", "available": True,
+            "project": settings.project, "region": settings.region,
+            "service_name": settings.service_name,
+            "credential_kind": "write_token",
+        })
+
     def request_stop(self, reason: str = "signal") -> None:
         self.stop_requested = True
         self.shutdown_reason = reason
+
+    def enable_operator(self) -> None:
+        from .operator import OperatorServer
+        if self.operator_server is None:
+            self.operator_server = OperatorServer(self)
+
+    def _runner_cancel_requested(self, runner_run_id: str) -> bool:
+        if self.operator_server:
+            self.operator_server.pump()
+        run = self.ledger.runner_run(runner_run_id)
+        if self.stop_requested or run["status"] in ("canceled", "superseded"):
+            return True
+        self._poll_linear_during_run(run)
+        run = self.ledger.runner_run(runner_run_id)
+        return self.stop_requested or run["status"] in ("canceled", "superseded")
+
+    def _poll_linear_during_run(self, run: Mapping[str, Any]) -> None:
+        # Only the network read crosses threads. Observe/reconcile/command work
+        # always runs here on the existing ledger writer.
+        try:
+            execution_id, project_key, issue, error = self._live_poll_results.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self._live_poll_inflight = False
+            self.preflights[:] = [item for item in self.preflights
+                                 if item.get("kind") != "linear-live-poll"]
+            if error:
+                self.preflights.append({"kind": "linear-live-poll", "available": False,
+                                        "reason": error})
+            elif self.ledger.current(execution_id)["status"] == "running":
+                self.linear_workers[project_key].observe_issue(execution_id, issue)
+        now = time.monotonic()
+        if self._live_poll_inflight or now - self._last_live_poll < 5:
+            return
+        execution_id = str(run["execution_id"])
+        current = self.ledger.current(execution_id)
+        project_key = str(current["project_key"])
+        worker = self.linear_workers.get(project_key)
+        if not worker:
+            return
+        identifier = str(current["work_item_identifier"])
+        client = worker.client
+        results = self._live_poll_results
+        self._last_live_poll = now
+        self._live_poll_inflight = True
+
+        def read() -> None:
+            try:
+                issue = client.issue(identifier)
+                results.put((execution_id, project_key, issue, None))
+            except Exception as error:
+                reason = error.code if isinstance(error, LinearAPIError) else type(error).__name__
+                results.put((execution_id, project_key, None, reason))
+
+        threading.Thread(target=read, name="dotfactory-tracker-read", daemon=True).start()
+
+    def _wait(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while not self.stop_requested and not self.drain_requested and time.monotonic() < deadline:
+            if self.operator_server:
+                self.operator_server.pump()
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
     def control_service(self, project_key: str) -> ControlService:
         if project_key not in self.kernels:
@@ -322,29 +428,53 @@ class FactoryRuntime:
 
     def start_issue(
         self, project_key: str, identifier: str, *, title: str | None = None,
+        description: str = "",
     ) -> str:
         if project_key not in self.kernels:
             raise LifecycleError(f"project is not enabled: {project_key}")
         existing = self._existing_execution(project_key, identifier)
         if existing:
             return existing
-        intent = {"title": title or identifier, "source": "explicit_issue"}
+        intent = {"title": title or identifier, "description": description,
+                  "source": "explicit_issue"}
+        adopted_state = None
         worker = self.linear_workers.get(project_key)
         if worker:
             issue = worker.client.issue(identifier)
             if str(issue["identifier"]) != identifier:
                 raise LifecycleError("Linear returned a different issue identifier")
+            project = self.config.resolve_project(project_key, environment=self.environment)
+            if (issue.get("project") or {}).get("id") != project["tracker_project_id"]:
+                raise LifecycleError("Linear issue belongs to a different project")
+            if project.get("tracker_team_id") and (
+                issue.get("team") or {}
+            ).get("id") != project["tracker_team_id"]:
+                raise LifecycleError("Linear issue belongs to a different team")
+            candidates = [
+                state["id"] for state in self.kernels[project_key].states.values()
+                if state.get("checkpoint_role") == "pickup"
+                and state.get("linear_status") == (issue.get("state") or {}).get("name")
+            ]
+            if len(candidates) != 1:
+                raise LifecycleError("Linear issue must be in one eligible pickup checkpoint")
+            adopted_state = str(candidates[0])
             intent.update({
                 "title": str(issue.get("title") or title or identifier),
                 "url": issue.get("url"), "linear_issue_id": issue["id"],
+                "description": issue.get("description") or "",
+                "source_revision": issue.get("updatedAt"),
             })
+        if not isinstance(intent["description"], str) or len(intent["description"]) > 65536:
+            raise LifecycleError("issue description must be text of at most 65536 characters")
         execution_id = self.kernels[project_key].begin(
             project_key, identifier, intent,
             command_id=f"runtime-begin:{project_key}:{identifier}",
+            adopted_state=adopted_state,
         )
         if worker:
-            self._drain_linear()
-            worker.poll(execution_id, identifier)
+            # The adoption snapshot is the first observation. A second read here
+            # could turn a concurrent human edit into an unsolicited status write.
+            worker.observe_issue(execution_id, issue)
             self._sync_linear_evidence()
         return execution_id
 
@@ -428,6 +558,11 @@ class FactoryRuntime:
             if worker:
                 worker.drain_one(item)
 
+    def _drain_logfire(self) -> dict[str, Any] | None:
+        if not self.logfire_worker:
+            return None
+        return self.logfire_worker.drain()
+
     def _claim_pickups(self) -> list[str]:
         claimed = []
         for run in reversed(self.ledger.list_runs(status="running", limit=1000)):
@@ -437,6 +572,16 @@ class FactoryRuntime:
                 continue
             current = self.ledger.current(str(run["id"]))
             if current.get("attempt"):
+                continue
+            if self.ledger.run_snapshot(str(run["id"]))["attention_requests"]:
+                continue
+            pending = self.ledger.pending_transition(str(run["id"]))
+            if pending:
+                kernel.claim_pending_transition(
+                    str(run["id"]), owner=f"{self.owner}:human-handoff",
+                    command_id=f"runtime-handoff:{pending['id']}",
+                )
+                claimed.append(str(run["id"]))
                 continue
             _workflow, states, edges = kernel.graph_for_execution(str(run["id"]))
             state_id = str(current["current_state_id"])
@@ -453,10 +598,17 @@ class FactoryRuntime:
                 raise LifecycleError(
                     f"pickup state {state_id} requires exactly one agent claim edge"
                 )
+            if states[str(candidates[0]["to"])].get("execution", {}).get("exit_contract") == "implementation-result-v2":
+                from .delivery import DeliveryError, guard_planned_transition
+                try:
+                    guard_planned_transition(self.ledger, str(run["id"]), states, state_id, str(candidates[0]["to"]))
+                except DeliveryError:
+                    # Keep the owner/operator available for planning or approval repair.
+                    continue
             kernel.transition(
                 str(run["id"]), str(candidates[0]["to"]), actor="agent",
                 signal="listener_claim", owner=f"{self.owner}:{state_id}",
-                command_id=f"runtime-claim:{run['id']}:{state_id}",
+                command_id=f"runtime-claim:{run['id']}:{current['current_state_run_id']}",
             )
             claimed.append(str(run["id"]))
         return claimed
@@ -467,13 +619,17 @@ class FactoryRuntime:
             if run["status"] != "completed":
                 continue
             project_key = str(run["project_key"])
+            if project_key not in self.engines:
+                continue
             preparation = self.config.resolve_preparation(
                 project_key, environment=self.environment
             )
             if preparation["workspace"]["retention"] != "until_terminal":
                 continue
             workspace = self.ledger.workspace_for_execution(str(run["id"]))
-            if not workspace or workspace["status"] == "cleaned":
+            if not workspace or workspace["status"] == "cleaned" or (
+                workspace["metadata"].get("cleanup_policy") in ("retain", "quarantine")
+            ):
                 continue
             result = self.engines[project_key].cleanup_workspace(str(run["id"]))
             results.append({
@@ -485,21 +641,30 @@ class FactoryRuntime:
         return results
 
     def step(self) -> dict[str, Any]:
+        if self.operator_server:
+            self.operator_server.pump()
+        if self.drain_requested:
+            return {"claimed": [], "scheduler": {"disposition": "idle"}, "cleanup": []}
         self._poll_linear()
         self._drain_linear()
+        if self._at_target():
+            return {"claimed": [], "scheduler": {"disposition": "idle"}, "cleanup": []}
         claimed = self._claim_pickups()
         self._drain_linear()
+        if self._at_target():
+            return {"claimed": claimed, "scheduler": {"disposition": "idle"}, "cleanup": []}
         tick = self.scheduler.tick()
         self._drain_linear()
         cleanup = self._cleanup_terminal_workspaces()
         self._sync_linear_evidence()
+        logfire = self._drain_logfire()
         return {"claimed": claimed, "scheduler": {
             "disposition": tick.disposition,
             "dispatch_id": tick.dispatch_id,
             "execution_id": tick.execution_id,
             "attempt_id": tick.attempt_id,
             "detail": dict(tick.detail),
-        }, "cleanup": cleanup}
+        }, "cleanup": cleanup, "logfire": logfire}
 
     def _settled(self, step: Mapping[str, Any]) -> bool:
         if step["claimed"]:
@@ -507,23 +672,72 @@ class FactoryRuntime:
         disposition = str(step["scheduler"]["disposition"])
         return disposition in ("idle", "capacity", "needs_attention")
 
+    def _at_target(self) -> bool:
+        return bool(self.target_execution_id and self.target_state and self.ledger.current(
+            self.target_execution_id)["current_state_id"] == self.target_state)
+
     def run(
         self, execution_ids: list[str], *, watch: bool = False,
-        max_ticks: int = 100,
+        max_ticks: int | None = 100, until_state: str | None = None,
     ) -> LifecycleReceipt:
+        if max_ticks is not None and max_ticks < 1:
+            raise LifecycleError("max_ticks must be positive")
+        self.shutdown_reason = "settled"
+        self.target_state = until_state
+        self.target_execution_id = execution_ids[0] if until_state and len(execution_ids) == 1 else None
+        if until_state:
+            if len(execution_ids) != 1:
+                raise LifecycleError("until_state requires one execution")
+            execution = execution_ids[0]
+            current = self.ledger.current(execution)
+            _, states, edges = self.kernels[current["project_key"]].graph_for_execution(execution)
+            if until_state not in states:
+                raise LifecycleError("unknown target state")
+            history = self.ledger.run_history(execution)["state_runs"]
+            if current["current_state_id"] != until_state and any(
+                item["state_id"] == until_state for item in history
+            ):
+                raise LifecycleError("target state was already passed")
+            reachable = {current["current_state_id"]}
+            for _ in states:
+                reachable.update(edge["to"] for edge in edges if edge["from"] in reachable
+                                 or edge["from"] == "@any_nonterminal" and any(
+                                     states[item]["kind"] != "terminal" for item in reachable
+                                     if item in states))
+            if until_state not in reachable:
+                raise LifecycleError("target state is unreachable")
         self.started_at = self.ledger.clock()
         ticks = []
-        for _index in range(max_ticks):
+        while True:
             if self.stop_requested:
+                break
+            if until_state and self.ledger.current(execution_ids[0])["current_state_id"] == until_state:
+                self._drain_linear()
+                self._sync_linear_evidence()
+                current = self.ledger.current(execution_ids[0])
+                projected = current["project_key"] not in self.linear_workers or (
+                    current["desired_linear_status"] == current["observed_linear_status"]
+                )
+                self.shutdown_reason = "target_state" if projected else "target_projection_pending"
+                if not ticks:
+                    ticks.append({"claimed": [], "scheduler": {"disposition": "idle"}, "cleanup": []})
+                break
+            if max_ticks is not None and len(ticks) >= max_ticks:
+                self.shutdown_reason = "max_ticks"
                 break
             step = self.step()
             ticks.append(step)
+            if until_state and self.ledger.current(execution_ids[0])["current_state_id"] == until_state:
+                continue
+            if self.drain_requested:
+                self.shutdown_reason = "drained"
+                break
             if not watch and self._settled(step):
+                if until_state:
+                    self.shutdown_reason = "target_not_reached"
                 break
             if watch and self._settled(step):
-                time.sleep(self.scheduler.policy.poll_interval_ms / 1000)
-        else:
-            self.shutdown_reason = "max_ticks"
+                self._wait(self.scheduler.policy.poll_interval_ms / 1000)
         return self.receipt(execution_ids, ticks)
 
     def receipt(
@@ -553,6 +767,7 @@ class FactoryRuntime:
             "executions": executions,
             "preflights": self.preflights,
             "shutdown_reason": self.shutdown_reason,
+            "target_state": getattr(self, "target_state", None),
         }
         digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
         return LifecycleReceipt(
@@ -564,9 +779,13 @@ class FactoryRuntime:
             ticks=tuple(ticks), executions=tuple(executions),
             preflights=tuple(self.preflights),
             shutdown_reason=payload["shutdown_reason"], digest=digest,
+            target_state=payload["target_state"],
         )
 
     def close(self) -> None:
+        if self.operator_server:
+            self.operator_server.close()
+            self.operator_server = None
         self.ledger.close()
         self.lock.close()
 
