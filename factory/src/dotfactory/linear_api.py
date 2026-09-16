@@ -167,7 +167,7 @@ class LinearGraphQLClient:
     def issue(self, issue_id: str) -> dict[str, Any]:
         data = self.execute(
             "FactoryIssue",
-            "query FactoryIssue($id:String!){issue(id:$id){id identifier title url updatedAt "
+            "query FactoryIssue($id:String!){issue(id:$id){id identifier title description url updatedAt "
             "state{id name} team{id} project{id}}}",
             {"id": issue_id},
         )

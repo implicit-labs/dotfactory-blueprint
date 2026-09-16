@@ -330,6 +330,27 @@ class LinearEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(first, second)
 
+    def test_canceled_summary_does_not_claim_done_or_recovered(self):
+        service = ObservationService(self.ledger, self.kernel)
+        snapshot = self.ledger.run_snapshot(self.execution)
+        snapshot.update({"status": "completed", "current_state_id": "Canceled"})
+        projection = service.execution_projection(self.execution)
+        projection["error_groups"] = [{
+            "fingerprint": "failed", "category": "runner", "severity": "error",
+            "occurrence_count": 1,
+            "code": "DOTFACTORY_RUNNER_FAILED", "message": "runner failed",
+            "occurrences": [{"trace_seq": 1}],
+        }]
+        body, _ = render_linear_run_summary(snapshot, projection,
+                                            self.ledger.run_history(self.execution))
+        self.assertIn("Dotfactory run — Canceled", body)
+        self.assertNotIn("recovered.", body)
+        snapshot["attention_requests"] = [{"id": "cleanup", "category": "unsafe-cleanup",
+                                           "detail": {"allowed_actions": ["retain"]}}]
+        body, _ = render_linear_run_summary(snapshot, projection,
+                                            self.ledger.run_history(self.execution))
+        self.assertIn("Dotfactory run — Needs attention", body)
+
     def test_renderer_shows_durable_time_and_token_coverage_per_node(self):
         self.kernel.transition(
             self.execution, "Autoplanning", actor="agent", signal="listener_claim",

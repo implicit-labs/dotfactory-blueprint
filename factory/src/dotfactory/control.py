@@ -280,6 +280,34 @@ class ObservationService:
             cursor=cursor, kind=kind, time_field="created_at",
         )
 
+    def delivery(self, execution_id: str) -> dict[str, Any]:
+        from .delivery import latest_check
+        receipt = latest_check(self.ledger, execution_id)
+        if receipt:
+            source = receipt.get("source", {})
+            verification = receipt.get("verification", {})
+            receipt = {key: receipt[key] for key in
+                       ("attempt_id", "contract", "passed") if key in receipt} | {
+                "error": str(receipt.get("error", ""))[:2000],
+                "source": {key: source[key] for key in
+                           ("base_sha", "head_sha", "patch_sha256") if key in source},
+                "verification": {key: verification[key] for key in
+                                 ("exit_code", "script_sha256", "output_sha256") if key in verification},
+                "details": "Export the full review packet with the delivery CLI at Review.",
+            }
+        current = self.ledger.current(execution_id)
+        snapshot = self.ledger.workflow_snapshot(execution_id)
+        gate = None
+        if snapshot and current["current_state_id"] == "Ready":
+            from .delivery import DeliveryError, guard_planned_transition
+            states = {node["id"]: node for node in snapshot["normalized"]["states"]}
+            if "Implementing" in states:
+                try:
+                    guard_planned_transition(self.ledger, execution_id, states, "Ready", "Implementing")
+                except DeliveryError as error:
+                    gate = str(error)[:2000]
+        return {"api_version": API_VERSION, "data": receipt, "planning_gate": gate}
+
     def feedback(
         self, execution_id: str, *, limit: int = 25, cursor: str | None = None
     ) -> dict[str, Any]:
@@ -331,12 +359,10 @@ class ObservationService:
         return {"api_version": API_VERSION, "data": data, "next_cursor": next_cursor}
 
     def available_actions(self, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-        if snapshot["status"] != "running":
-            return []
         state = str(snapshot["current_state_id"])
         edges = _control_edges(
             self.ledger, self.kernel, str(snapshot["id"]), state
-        )
+        ) if snapshot["status"] == "running" else []
         actions: list[dict[str, Any]] = []
         for action in ("cancel", "approve", "retry"):
             candidates = [
@@ -607,6 +633,16 @@ class ControlService:
         if action == "approve":
             edge = action_edge("approve")
             note = parameters.get("note")
+            _workflow, delivery_states, _edges = self.kernel.graph_for_execution(execution_id)
+            if state == "PlanReview" and any(
+                node.get("execution", {}).get("exit_contract") == "plan-result-v2"
+                for node in delivery_states.values()
+            ):
+                from .delivery import planned_receipt
+                head = planned_receipt(self.ledger, execution_id)["receipt"]["source"]["head_sha"]
+                if parameters.get("plan_sha") != head:
+                    raise ControlError("plan_sha_required", "approve requires the exact reviewed plan_sha")
+                note = f"Approved verification plan at {head}. " + str(note or "")
             if edge.get("requires_feedback") and (
                 not isinstance(note, str) or not note.strip()
             ):
