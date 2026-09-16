@@ -1503,6 +1503,7 @@ class SQLiteLedger:
         resolved_node: dict[str, Any] | None = None,
         owner: str | None = None,
         actor: str = "agent",
+        observed_linear_status: str | None = None,
     ) -> str:
         existing = self.connection.execute(
             "SELECT execution_id FROM events WHERE idempotency_key=?", (idempotency_key,)
@@ -1553,7 +1554,8 @@ class SQLiteLedger:
                 "desired_linear_status,observed_linear_status,current_state_run_id,created_at,"
                 "completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (execution_id, work_item_id, workflow_name, workflow_version, number,
-                 execution_key, intent_json, "running", state_id, linear_status, None,
+                 execution_key, intent_json, "running", state_id, linear_status,
+                 observed_linear_status,
                  state_run_id, now, None),
             )
             db.execute(
@@ -1589,13 +1591,15 @@ class SQLiteLedger:
                     "execution_key": execution_key,
                     "workflow_digest": (workflow_snapshot or {}).get("digest"),
                     "resolved_node": resolved_node or {},
+                    "adopted_status": observed_linear_status,
                 },
                 idempotency_key=idempotency_key,
             )
-            self._queue_linear_status_mutation(
-                db, execution_id=execution_id, event_seq=seq,
-                desired_status=linear_status, expected_observed_status=None,
-            )
+            if observed_linear_status is None:
+                self._queue_linear_status_mutation(
+                    db, execution_id=execution_id, event_seq=seq,
+                    desired_status=linear_status, expected_observed_status=None,
+                )
         return execution_id
 
     def accept_transition(
@@ -3264,7 +3268,8 @@ class SQLiteLedger:
             db.execute(
                 "UPDATE execution_workspaces SET status=?,metadata_json=?,updated_at=?,"
                 "cleaned_at=? WHERE execution_id=?",
-                (status, json.dumps(redact_payload(detail or {}), sort_keys=True), now,
+                (status, json.dumps({**json.loads(workspace["metadata_json"]),
+                                    **redact_payload(detail or {})}, sort_keys=True), now,
                  now if status == "cleaned" else workspace["cleaned_at"], execution_id),
             )
             execution = db.execute(
@@ -4877,6 +4882,76 @@ class SQLiteLedger:
             item["body"] = json.loads(item.pop("body_json"))
             result.append(item)
         return result
+
+    def attempt_input_context(self, attempt_id: str) -> dict[str, Any]:
+        """Freeze bounded handoff facts once, before presenting provider input."""
+        from .handoff import build_handoff
+
+        key = f"attempt:{attempt_id}:input-context:v1"
+        existing = self.event_for_command(key)
+        if existing:
+            return existing["payload"]
+        with self.transaction() as db:
+            existing = self.event_for_command(key)
+            if existing:
+                return existing["payload"]
+            attempt = db.execute(
+                "SELECT a.*,s.execution_id FROM attempts a JOIN state_runs s "
+                "ON s.id=a.state_run_id WHERE a.id=?", (attempt_id,),
+            ).fetchone()
+            if not attempt:
+                raise LedgerError("attempt not found")
+            context = build_handoff(db, str(attempt["execution_id"]), attempt_id)
+            self._event(
+                db, execution_id=str(attempt["execution_id"]),
+                state_run_id=str(attempt["state_run_id"]), attempt_id=attempt_id,
+                event_type="attempt_input_snapshotted", payload=context,
+                idempotency_key=key, destinations=(),
+            )
+        return self.event_for_command(key)["payload"]
+
+    def record_delivery_check(self, attempt_id: str, fence_token: str,
+                              receipt: dict[str, Any]) -> dict[str, Any]:
+        key = f"attempt:{attempt_id}:delivery-check:v1"
+        with self.transaction() as db:
+            attempt = self._active_attempt(db, attempt_id, fence_token)
+            existing = self.event_for_command(key)
+            if existing:
+                if existing["payload"] != redact_payload(receipt):
+                    raise LedgerError("delivery check is immutable; start a new attempt")
+                return existing
+            state = db.execute("SELECT * FROM state_runs WHERE id=?",
+                               (attempt["state_run_id"],)).fetchone()
+            self._event(db, execution_id=state["execution_id"], state_run_id=state["id"],
+                        attempt_id=attempt_id, event_type="delivery_checked", payload=receipt,
+                        idempotency_key=key, destinations=())
+        return self.event_for_command(key)
+
+    def set_workspace_cleanup_policy(
+        self, execution_id: str, *, owner_token: str, policy: str, command_id: str,
+    ) -> None:
+        if policy not in ("automatic", "retain", "quarantine"):
+            raise LedgerError("invalid workspace cleanup policy")
+        key = f"workspace-policy:{execution_id}:{command_id}"
+        if self.event_for_command(key):
+            return
+        with self.transaction() as db:
+            workspace = self.workspace_for_execution(execution_id)
+            if not workspace or workspace["owner_token"] != owner_token:
+                raise LedgerError("workspace is missing or differently owned")
+            metadata = {**workspace["metadata"], "cleanup_policy": policy}
+            db.execute(
+                "UPDATE execution_workspaces SET metadata_json=?,updated_at=? WHERE id=?",
+                (canonical_json(metadata), self.clock(), workspace["id"]),
+            )
+            current = self.current(execution_id)
+            self._event(
+                db, execution_id=execution_id,
+                state_run_id=current["current_state_run_id"], attempt_id=None,
+                event_type="workspace_retention_changed",
+                payload={"workspace_id": workspace["id"], "policy": policy},
+                idempotency_key=key,
+            )
 
     def workflow_snapshot(self, execution_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(

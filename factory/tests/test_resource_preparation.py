@@ -559,6 +559,7 @@ class PreparationTests(unittest.TestCase):
             preparation_config=self.configuration(),
         )
         self.assertEqual("ready", prepared.disposition)
+        self.assertEqual("ready", self.engine.cleanup_attempt(prepared.launch).disposition)
 
         def dirty(_handle):
             raise WorkspaceUnsafeCleanup("dirty workspace")
@@ -574,6 +575,18 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(1, self.ledger.connection.execute(
             "SELECT COUNT(*) FROM attention_requests WHERE status='open'"
         ).fetchone()[0])
+
+    def test_workspace_release_refuses_unresolved_resource_allocations(self):
+        prepared = self.engine.prepare(
+            self.request, project=self.project(), preparation_config=self.configuration(),
+        )
+        self.assertEqual("ready", prepared.disposition)
+        def forbidden(_handle):
+            self.fail("workspace cleanup must not run before provider cleanup")
+        self.workspace.cleanup = forbidden
+        result = self.engine.cleanup_workspace(self.execution, explicit_release=True)
+        self.assertEqual("needs_attention", result.disposition)
+        self.assertTrue(result.attention["detail"]["allocation_ids"])
 
     def test_checkpoint_release_then_rework_reuses_execution_workspace(self):
         first = self.engine.prepare(

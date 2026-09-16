@@ -567,6 +567,10 @@ def compile_dot(
         if profile_name:
             execution["profile"] = profile_name
         if execution:
+            if execution.get("exit_contract"):
+                from .delivery import CONTRACTS
+                if execution["exit_contract"] not in CONTRACTS:
+                    raise WorkflowError(f"unsupported exit contract: {execution['exit_contract']}")
             prompt = execution.get("prompt")
             if prompt and graph.source_name != "<dot>":
                 prompt_path = Path(graph.source_name).parent / str(prompt)
@@ -733,6 +737,11 @@ def compile_dot(
 
 def _legacy_json(path: Path) -> WorkflowDefinition:
     values = json.loads(path.read_text(encoding="utf-8"))
+    from .delivery import CONTRACTS
+    for state in values["states"]:
+        contract = state.get("execution", {}).get("exit_contract")
+        if contract and contract not in CONTRACTS:
+            raise WorkflowError(f"unsupported exit contract: {contract}")
     transitions = [dict(item) for item in values["transitions"]]
     global_transitions = [dict(item) for item in values["global_transitions"]]
     feedback = values.get("semantics", {}).get("review_feedback", {})

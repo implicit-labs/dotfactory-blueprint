@@ -71,6 +71,7 @@ class DurableKernel:
     def begin(
         self, project_key: str, identifier: str, intent: dict[str, Any], *,
         command_id: str, owner: str | None = None, actor: str = "agent",
+        adopted_state: str | None = None,
     ) -> str:
         idempotency_key = (
             f"project:{project_key}:work:{identifier}:begin:{command_id}"
@@ -78,7 +79,12 @@ class DurableKernel:
         prior = self.ledger.event_for_command(idempotency_key)
         if prior:
             return str(prior["execution_id"])
-        state_id = self.workflow["scope"]["entry_state"]
+        state_id = adopted_state or self.workflow["scope"]["entry_state"]
+        if adopted_state and (
+            adopted_state not in self.states
+            or self.states[adopted_state].get("checkpoint_role") != "pickup"
+        ):
+            raise KernelError("only an eligible pickup checkpoint can be adopted")
         state = self.states[state_id]
         return self.ledger.begin_execution(
             project_key=project_key, identifier=identifier, intent=intent,
@@ -89,6 +95,7 @@ class DurableKernel:
             resolved_node=state.get("execution", {}),
             owner=owner, actor=actor,
             idempotency_key=idempotency_key,
+            observed_linear_status=state["linear_status"] if adopted_state else None,
         )
 
     def _matches(
@@ -194,6 +201,24 @@ class DurableKernel:
             return None
         return self._recorded_resume_state(execution_id, from_state, edges)
 
+    def _guard_plan(self, execution_id: str, states: dict[str, Any], from_state: str, to_state: str, feedback: list[dict[str, Any]] | None = None) -> None:
+        from .delivery import DeliveryError, guard_planned_transition
+        try:
+            guard_planned_transition(self.ledger, execution_id, states, from_state, to_state, feedback)
+        except DeliveryError as error:
+            raise KernelError(str(error)) from error
+
+    def _require_delivery(self, state: dict[str, Any], edge: dict[str, Any],
+                          attempt_id: str | None) -> None:
+        contract = state.get("execution", {}).get("exit_contract")
+        if contract:
+            from .delivery import DeliveryError, FAILURE_LABELS, require_receipt
+            if edge.get("on", edge.get("label")) not in FAILURE_LABELS and edge.get("action") not in ("cancel", "duplicate"):
+                try:
+                    require_receipt(self.ledger, str(attempt_id or ""), str(contract))
+                except DeliveryError as error:
+                    raise KernelError(str(error)) from error
+
     def transition(
         self, execution_id: str, to_state: str, *, actor: str, signal: str,
         command_id: str, owner: str | None = None, attempt_id: str | None = None,
@@ -218,6 +243,8 @@ class DurableKernel:
         target = states[to_state]
         terminal = set(workflow["scope"]["terminal_states"])
         edge = matches[0]
+        self._require_delivery(states[from_state], edge, attempt_id)
+        self._guard_plan(execution_id, states, from_state, to_state, feedback)
         policy = self._edge_policy(edge)
         stored_feedback_ids = self._stored_feedback_ids(execution_id, edge)
         resume_state_id = self._next_resume_state(
@@ -315,6 +342,16 @@ class DurableKernel:
             execution_id, from_state=from_state, to_state=target_state,
             edge=edge, edges=edges, terminal=target_state in terminal,
         )
+        try:
+            self._require_delivery(states[from_state], edge, attempt_id)
+            self._guard_plan(execution_id, states, from_state, target_state, observation_feedback)
+        except KernelError as error:
+            return self.ledger.record_linear_observation(
+                execution_id, observed_status=observed_status, actor="human",
+                disposition="rejected", reason=str(error),
+                idempotency_key=idempotency_key, source_event_id=source_event_id,
+                feedback=[], feedback_allowed=False, observation_id=observation_id,
+            )
         if target["kind"] == "work" and target_state not in terminal and not owner:
             try:
                 return self.ledger.defer_transition(
@@ -458,6 +495,8 @@ class DurableKernel:
         edge = next(
             item for item in edges if item["id"] == request["edge_id"]
         )
+        self._require_delivery(states[request["from_state"]], edge, None)
+        self._guard_plan(execution_id, states, request["from_state"], request["to_state"])
         if not self.condition_matches(execution_id, edge):
             raise KernelError("pending human transition condition no longer matches")
         policy = self._edge_policy(edge)
