@@ -28,6 +28,8 @@ configured by dotfactory belong to their owning repository.
 | [0026](0026-accept-nested-verification-tests.md) | Accept nested verification tests | Proposed | — |
 | [0027](0027-continue-validated-autoplanning.md) | Continue validated Autoplanning | Accepted | 0024 (planning approval policy) |
 | [0028](0028-check-local-readiness-without-starting-work.md) | Check local readiness without starting work | Proposed | — |
+| [0029](0029-freeze-hierarchical-telemetry-delivery.md) | Freeze hierarchical telemetry delivery | Accepted | — |
+| [0030](0030-receive-agent-events-without-dispatch-authority.md) | Receive agent events without dispatch authority | Accepted | — |
 
 ## Lifecycle
 

@@ -184,9 +184,10 @@ for full replay. See
    set `projections.logfire.enabled` to `true`.
 
 The lifecycle maps its fixed canonical trace range to OTLP JSON and sends it to
-Logfire over HTTP. Each accepted or rejected source record gets a durable,
-redacted receipt. Missing or rejected credentials pause the projection without
-changing canonical run state. The runtime remains stdlib-only.
+Logfire over HTTP. A source receipt is committed only after its observation and all required
+structural ancestors are accepted. Partial acceptance and permanent rejection
+block automatic delivery; unknown outcomes may replay the identical saved bytes.
+Delivery outcomes stay in projection-owned tables without changing canonical run state. The runtime remains stdlib-only.
 Previously delivered events can be replayed through a durable session with a
 fixed event range, command ID, initiator, progress, and failure record. Retrying
 the same command resumes only unfinished items. Delivery is at least once, so

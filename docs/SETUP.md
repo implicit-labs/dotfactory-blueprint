@@ -76,6 +76,24 @@ them requires `LOGFIRE_PROJECT_API_KEY` with only `project:read_datasets` and
 `project:write_datasets`; the telemetry write token is not accepted for dataset
 operations.
 
+Telemetry mapping v2 freezes a durable upload plan before network access. Its
+hierarchy anchors are zero-duration ownership markers, not completed operations;
+observation leaves carry the actual failure and timing facts. Inspect the
+returned `logfire.delivery` status when a lifecycle tick reports a paused
+projection. Partial acceptance and permanent errors block automatic delivery;
+the ledger remains intact and the factory can continue work. Do not delete a
+plan or invent a new command to force a partial batch to resend.
+
+For an integration that publishes native Linear Agent Sessions, deploy the dedicated
+[receipt-only webhook receiver](../factory/deploy/linear-webhook/README.md)
+before enabling `AgentSessionEvent` on the OAuth app. Keep the service's signing
+secret and inbox volume separate from the factory's OAuth token and ledger.
+This enables receipt auditing, not prompt-driven execution: mentions and replies
+are **not dispatched** by this service. Keep the app private and do not advertise
+it as an interactive agent until a reviewed inbox consumer exists. An authorized
+outbound native-session publisher is a separate prerequisite; this receiver does
+not provide one.
+
 The default worktree pool is `<project checkout>/.worktrees`. Add it to the
 project's `.gitignore` before activation:
 
