@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import urllib.error
 import urllib.request
-from calendar import timegm
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 from urllib.parse import unquote
 
 from .ledger import SQLiteLedger
-from .observability import ProjectionReceiptV1, canonical_json, stable_span_id
+from .telemetry_delivery import TelemetryOutbox
+from .telemetry_mapping import (
+    OTEL_MAPPING_VERSION, _unix_nano, otel_trace_document,
+)
 
 
-OTEL_MAPPING_VERSION = 1
 Transport = Callable[[str, Mapping[str, str], bytes, float], Mapping[str, Any]]
 
 
@@ -85,7 +84,7 @@ class LogfireSettings:
 
     @property
     def destination(self) -> str:
-        return f"logfire:{self.project}:{self.region}"
+        return f"logfire:{self.project}:{self.region}:otel-v2"
 
     @property
     def traces_endpoint(self) -> str:
@@ -101,78 +100,6 @@ class LogfireSettings:
         return result
 
 
-def _unix_nano(value: str | None) -> str:
-    if not value:
-        return "0"
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    seconds = timegm(parsed.utctimetuple())
-    return str(seconds * 1_000_000_000 + parsed.microsecond * 1_000)
-
-
-def _attribute(key: str, value: Any) -> dict[str, Any]:
-    if isinstance(value, bool):
-        encoded = {"boolValue": value}
-    elif isinstance(value, int):
-        encoded = {"intValue": str(value)}
-    else:
-        encoded = {"stringValue": str(value)}
-    return {"key": key, "value": encoded}
-
-
-def otel_trace_document(
-    records: list[dict[str, Any]], *, service_name: str,
-    destination: str = "logfire",
-) -> dict[str, Any]:
-    """Map canonical records to stable OTLP JSON without raw payloads."""
-    spans = []
-    for record in sorted(records, key=lambda item: int(item["seq"])):
-        started_at = record.get("started_at") or record["observed_at"]
-        ended_at = record.get("ended_at") or started_at
-        attributes = [
-            _attribute("dotfactory.mapping.version", OTEL_MAPPING_VERSION),
-            _attribute("dotfactory.record.id", record["record_id"]),
-            _attribute("dotfactory.record.seq", int(record["seq"])),
-            _attribute("dotfactory.execution.id", record["execution_id"]),
-            _attribute("dotfactory.domain", record["domain"]),
-            _attribute("dotfactory.phase", record["phase"]),
-            _attribute("dotfactory.status", record["status"]),
-            _attribute("dotfactory.trust_class", record["trust_class"]),
-            _attribute("dotfactory.ordering_quality", record["ordering_quality"]),
-            _attribute(
-                "dotfactory.capture.complete",
-                bool((record.get("completeness") or {}).get("complete", True)),
-            ),
-        ]
-        span = {
-            "traceId": str(record["trace_id"]),
-            "spanId": str(record.get("span_id") or stable_span_id(
-                "trace_record", str(record["record_id"])
-            )),
-            "name": f"{record['domain']}.{record['phase']}.{record['name']}",
-            "kind": 1,
-            "startTimeUnixNano": _unix_nano(str(started_at)),
-            "endTimeUnixNano": _unix_nano(str(ended_at)),
-            "attributes": attributes,
-            "status": {"code": 2 if record["status"] == "failed" else 1},
-        }
-        if record.get("parent_span_id"):
-            span["parentSpanId"] = str(record["parent_span_id"])
-        spans.append(span)
-    return {
-        "resourceSpans": [{
-            "resource": {"attributes": [
-                _attribute("service.name", service_name),
-                _attribute("dotfactory.projection.destination", destination),
-            ]},
-            "scopeSpans": [{
-                "scope": {"name": "dotfactory", "version": str(OTEL_MAPPING_VERSION)},
-                "spans": spans,
-            }],
-        }],
-    }
-
 
 def _http_transport(
     endpoint: str, headers: Mapping[str, str], body: bytes, timeout: float,
@@ -186,7 +113,7 @@ def _http_transport(
     except urllib.error.HTTPError as error:
         raise TelemetryProjectionError(
             f"LOGFIRE_HTTP_{error.code}", "Logfire rejected the OTLP trace",
-            retryable=error.code == 429 or error.code >= 500,
+            retryable=error.code in (429, 502, 503, 504),
         ) from error
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         raise TelemetryProjectionError(
@@ -200,18 +127,51 @@ def _http_transport(
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise TelemetryProjectionError(
             "LOGFIRE_RESPONSE_INVALID", "Logfire returned invalid JSON",
-            retryable=False,
+            retryable=False, ambiguous=True,
         ) from error
     if not isinstance(result, dict):
         raise TelemetryProjectionError(
             "LOGFIRE_RESPONSE_INVALID", "Logfire returned a non-object response",
-            retryable=False,
+            retryable=False, ambiguous=True,
         )
     return result
 
 
+def _response_outcome(response: Mapping[str, Any], span_count: int) -> dict[str, Any]:
+    if not isinstance(response, Mapping):
+        raise TelemetryProjectionError(
+            "LOGFIRE_RESPONSE_INVALID", "Invalid OTLP response",
+            retryable=False, ambiguous=True,
+        )
+    partial = response.get("partialSuccess")
+    if partial is None:
+        return {"accepted_spans": span_count, "rejected_spans": 0, "ambiguous": False}
+    try:
+        if not isinstance(partial, dict):
+            raise ValueError("invalid partialSuccess")
+        value = partial.get("rejectedSpans", 0)
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError("invalid rejectedSpans")
+        rejected = int(value)
+        if rejected < 0 or rejected > span_count:
+            raise ValueError("invalid rejection count")
+    except (ValueError, TypeError) as error:
+        raise TelemetryProjectionError(
+            "LOGFIRE_RESPONSE_INVALID", "Invalid OTLP partial success",
+            retryable=False, ambiguous=True,
+        ) from error
+    result = {
+        "accepted_spans": span_count - rejected, "rejected_spans": rejected,
+        "ambiguous": bool(rejected), "warning": bool(partial.get("errorMessage")),
+    }
+    if rejected:
+        # Aggregate counts do not identify accepted spans. OTLP forbids retry.
+        result.update(code="LOGFIRE_PARTIAL_REJECTION", retryable=False)
+    return result
+
+
 class LogfireProjectionWorker:
-    """Publish a fixed ledger range and persist one receipt per source record."""
+    """Freeze a fixed source range; retry saved batches, not rebuilt records."""
 
     def __init__(
         self, ledger: SQLiteLedger, settings: LogfireSettings, *,
@@ -223,22 +183,27 @@ class LogfireProjectionWorker:
         self.settings = settings
         self.transport = transport or _http_transport
         self.batch_size = batch_size
-
-    @staticmethod
-    def _identity(attempt_id: str, record_id: str, delivery: int) -> tuple[str, str]:
-        source = f"{attempt_id}:{record_id}:{delivery}"
-        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
-        return f"otlp-{digest[:32]}", f"otlp:{digest}"
-
-    def _delivery_number(self, attempt_id: str, record_id: str) -> int:
-        return int(self.ledger.connection.execute(
-            "SELECT COUNT(*) FROM projection_receipts WHERE attempt_id=? "
-            "AND source_record_id=?", (attempt_id, record_id),
-        ).fetchone()[0]) + 1
+        self.outbox = TelemetryOutbox(ledger, destination=settings.destination)
 
     def publish(
         self, *, command_id: str, from_trace_seq: int = 1,
         through_trace_seq: int | None = None,
+    ) -> dict[str, Any]:
+        with self.outbox.delivery_lock() as acquired:
+            if not acquired:
+                return {"status": "paused", "delivery": {
+                    "status": "busy", "outcome": {
+                        "code": "LOGFIRE_DESTINATION_BUSY", "retryable": True,
+                    },
+                }}
+            return self._publish(
+                command_id=command_id, from_trace_seq=from_trace_seq,
+                through_trace_seq=through_trace_seq,
+            )
+
+    def _publish(
+        self, *, command_id: str, from_trace_seq: int,
+        through_trace_seq: int | None,
     ) -> dict[str, Any]:
         attempt = self.ledger.start_projection_attempt(
             self.settings.destination, command_id=command_id,
@@ -246,86 +211,63 @@ class LogfireProjectionWorker:
             from_source_seq=from_trace_seq, through_source_seq=through_trace_seq,
         )
         attempt_id = str(attempt["id"])
-        self.ledger.resume_projection_attempt(attempt_id)
+        if attempt["status"] == "completed" or self.outbox.plan_failure(attempt_id):
+            return self.outbox.result(attempt_id)
+        try:
+            frozen = self.outbox.freeze(
+                attempt, service_name=self.settings.service_name, batch_size=self.batch_size,
+            )
+        except (ValueError, TypeError, KeyError):
+            self.outbox.block_invalid_plan(attempt_id)
+            return self.outbox.result(attempt_id)
+        if not frozen:
+            result = self.outbox.result(attempt_id)
+            result["delivery"]["outcome"] = {
+                "code": "LOGFIRE_DESTINATION_BUSY", "retryable": True,
+            }
+            return result
         headers = {
-            **self.settings.header_map,
-            "content-type": "application/json",
-            "user-agent": "dotfactory-otlp/1",
+            **self.settings.header_map, "content-type": "application/json",
+            "user-agent": "dotfactory-otlp/2",
         }
         while True:
-            records = self.ledger.pending_projection_records(
-                attempt_id, limit=self.batch_size
-            )
-            if not records:
-                self.ledger.advance_projection_watermark(
-                    attempt_id,
-                    through_source_seq=int(attempt["through_source_seq"]),
-                )
-                return self.ledger.projection_attempt(attempt_id)
-            document = otel_trace_document(
-                records, service_name=self.settings.service_name,
-                destination=self.settings.destination,
-            )
-            body = canonical_json(document).encode("utf-8")
+            batch = self.outbox.next_batch(attempt_id)
+            if batch is None:
+                self.outbox.finish(attempt_id)
+                return self.outbox.result(attempt_id)
+            if batch["status"] == "blocked":
+                return self.outbox.result(attempt_id)
+            self.outbox.begin_delivery(batch)
+            total = len(json.loads(batch["span_ids_json"]))
             try:
                 response = self.transport(
-                    self.settings.traces_endpoint, headers, body,
+                    self.settings.traces_endpoint, headers,
+                    batch["body_json"].encode("utf-8"),
                     float(self.settings.timeout_seconds),
                 )
-                rejected = int((response.get("partialSuccess") or {}).get(
-                    "rejectedSpans", 0
-                ))
-                if rejected:
-                    raise TelemetryProjectionError(
-                        "LOGFIRE_PARTIAL_REJECTION",
-                        "Logfire rejected part of the OTLP trace batch",
-                        retryable=True,
-                    )
+                outcome = _response_outcome(response, total)
             except TelemetryProjectionError as error:
-                for record in records:
-                    delivery = self._delivery_number(
-                        attempt_id, str(record["record_id"])
-                    )
-                    receipt_id, key = self._identity(
-                        attempt_id, str(record["record_id"]), delivery
-                    )
-                    self.ledger.record_projection_receipt(
-                        ProjectionReceiptV1(
-                            receipt_id=receipt_id, attempt_id=attempt_id,
-                            destination=self.settings.destination,
-                            source_record_id=str(record["record_id"]),
-                            status="rejected", idempotency_key=key,
-                            recorded_at=self.ledger.clock(), error_code=error.code,
-                            detail={
-                                "credential_kind": "write_token",
-                                "required_purpose": "otlp_trace_write",
-                                "ambiguous": error.ambiguous,
-                            },
-                        ), rejection=error.safe_fact(),
-                    )
-                return self.ledger.projection_attempt(attempt_id)
-            for record in records:
-                delivery = self._delivery_number(attempt_id, str(record["record_id"]))
-                receipt_id, key = self._identity(
-                    attempt_id, str(record["record_id"]), delivery
-                )
-                self.ledger.record_projection_receipt(
-                    ProjectionReceiptV1(
-                        receipt_id=receipt_id, attempt_id=attempt_id,
-                        destination=self.settings.destination,
-                        source_record_id=str(record["record_id"]), status="accepted",
-                        idempotency_key=key, recorded_at=self.ledger.clock(),
-                        external_id=str(record["trace_id"]),
-                        detail={"mapping_version": OTEL_MAPPING_VERSION},
-                    )
-                )
+                outcome = {
+                    "code": error.code, "retryable": error.retryable,
+                    "ambiguous": error.ambiguous, "span_count": total,
+                    "credential_kind": "write_token",
+                    "required_purpose": "otlp_trace_write",
+                }
+                self.outbox.reject(batch, outcome)
+                return self.outbox.result(attempt_id)
+            if outcome.get("rejected_spans"):
+                self.outbox.reject(batch, outcome)
+                return self.outbox.result(attempt_id)
+            self.outbox.acknowledge(batch, outcome)
 
     def drain(self) -> dict[str, Any] | None:
-        """Resume an unfinished range, otherwise publish the next fixed range."""
+        """Blocked plans stay visible; later data cannot bypass their delivery."""
         prior = self.ledger.connection.execute(
-            "SELECT * FROM projection_attempts WHERE destination=? "
-            "AND status<>'completed' ORDER BY created_at,id LIMIT 1",
-            (self.settings.destination,),
+            "SELECT a.* FROM projection_attempts a "
+            "LEFT JOIN otlp_plans p ON p.attempt_id=a.id "
+            "WHERE a.destination=? AND a.status<>'completed' "
+            "ORDER BY CASE WHEN p.attempt_id IS NULL THEN 1 ELSE 0 END,"
+            "a.created_at,a.id LIMIT 1", (self.settings.destination,),
         ).fetchone()
         if prior:
             return self.publish(

@@ -22,6 +22,8 @@ configured by dotfactory belong to their owning repository.
 | [0018](0018-reconcile-linear-through-the-durable-kernel.md) | Reconcile Linear through the durable kernel | Accepted | 0008 and 0011 (partial) |
 | [0019](0019-compose-one-recoverable-lifecycle.md) | Compose one recoverable lifecycle | Accepted | — |
 | [0020](0020-project-readable-run-evidence-into-linear.md) | Project readable run evidence into Linear | Accepted | — |
+| [0029](0029-freeze-hierarchical-telemetry-delivery.md) | Freeze hierarchical telemetry delivery | Accepted | — |
+| [0030](0030-receive-agent-events-without-dispatch-authority.md) | Receive agent events without dispatch authority | Accepted | — |
 
 ## Lifecycle
 

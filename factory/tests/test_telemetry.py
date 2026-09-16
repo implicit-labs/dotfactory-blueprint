@@ -97,7 +97,8 @@ class TelemetryProjectionTests(unittest.TestCase):
             self.ledger, self.settings(), transport=transport, batch_size=1,
         ).publish(command_id="publish-batched")
         self.assertEqual("completed", result["status"])
-        self.assertEqual([1] * source_count, calls)
+        self.assertTrue(all(count == 1 for count in calls))
+        self.assertGreater(len(calls), source_count)
         self.assertEqual(source_count, result["accepted_count"])
 
     def test_nanosecond_mapping_does_not_use_float_timestamps(self):
@@ -122,12 +123,8 @@ class TelemetryProjectionTests(unittest.TestCase):
         )
         failed = worker.publish(command_id="publish-resume")
         self.assertEqual("paused", failed["status"])
-        self.assertGreater(failed["rejected_count"], 0)
-        detail = json.loads(self.ledger.connection.execute(
-            "SELECT detail_json FROM projection_receipts "
-            "WHERE destination=? ORDER BY seq LIMIT 1",
-            (self.settings().destination,),
-        ).fetchone()[0])
+        self.assertEqual(0, failed["rejected_count"])
+        detail = failed["delivery"]["outcome"]
         self.assertEqual("write_token", detail["credential_kind"])
         self.assertEqual("otlp_trace_write", detail["required_purpose"])
         resumed = worker.publish(command_id="publish-resume")
