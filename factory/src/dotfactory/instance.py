@@ -283,55 +283,96 @@ def _validate_projections(values: dict[str, Any]) -> None:
     if not isinstance(projections, dict):
         raise FactoryConfigError("config.projections must be an object")
     linear = projections.get("linear")
-    if linear is None:
-        return
-    if not isinstance(linear, dict):
+    if linear is not None and not isinstance(linear, dict):
         raise FactoryConfigError("config.projections.linear must be an object")
+    if linear is not None:
+        allowed = {
+            "enabled", "token_env", "endpoint", "timeout_seconds",
+            "poll_interval_seconds", "webhook_secret_env",
+        }
+        if set(linear) - allowed:
+            raise FactoryConfigError("config.projections.linear contains unknown fields")
+        if not isinstance(linear.get("enabled"), bool):
+            raise FactoryConfigError("config.projections.linear.enabled must be true or false")
+        token_env = linear.get("token_env")
+        if not isinstance(token_env, str) or not ENV_NAME.fullmatch(token_env):
+            raise FactoryConfigError(
+                "config.projections.linear.token_env must name an environment variable"
+            )
+        if "webhook_secret_env" in linear and (
+            not isinstance(linear["webhook_secret_env"], str)
+            or not ENV_NAME.fullmatch(linear["webhook_secret_env"])
+        ):
+            raise FactoryConfigError(
+                "config.projections.linear.webhook_secret_env must name an environment variable"
+            )
+        endpoint = linear.get("endpoint", "https://api.linear.app/graphql")
+        if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
+            raise FactoryConfigError("config.projections.linear.endpoint must use HTTPS")
+        for key, default, maximum in (
+            ("timeout_seconds", 15, 60), ("poll_interval_seconds", 30, 3600),
+        ):
+            value = linear.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+                raise FactoryConfigError(
+                    f"config.projections.linear.{key} must be between 1 and {maximum}"
+                )
+        if linear["enabled"]:
+            missing_teams = sorted(
+                project_key for project_key, project in values["projects"].items()
+                if project.get("tracker", {}).get("kind") == "linear"
+                and not (
+                    project["tracker"].get("team_id")
+                    or project["tracker"].get("team_id_env")
+                )
+            )
+            if missing_teams:
+                raise FactoryConfigError(
+                    "enabled Linear projection requires tracker team IDs for: "
+                    + ", ".join(missing_teams)
+                )
+    logfire = projections.get("logfire")
+    if logfire is None:
+        return
+    if not isinstance(logfire, dict):
+        raise FactoryConfigError("config.projections.logfire must be an object")
     allowed = {
-        "enabled", "token_env", "endpoint", "timeout_seconds",
-        "poll_interval_seconds", "webhook_secret_env",
+        "enabled", "endpoint_env", "headers_env", "service_name_env",
+        "project", "region", "timeout_seconds", "dataset_enabled",
+        "dataset_api_key_env", "dataset_name",
     }
-    if set(linear) - allowed:
-        raise FactoryConfigError("config.projections.linear contains unknown fields")
-    if not isinstance(linear.get("enabled"), bool):
-        raise FactoryConfigError("config.projections.linear.enabled must be true or false")
-    token_env = linear.get("token_env")
-    if not isinstance(token_env, str) or not ENV_NAME.fullmatch(token_env):
-        raise FactoryConfigError(
-            "config.projections.linear.token_env must name an environment variable"
-        )
-    if "webhook_secret_env" in linear and (
-        not isinstance(linear["webhook_secret_env"], str)
-        or not ENV_NAME.fullmatch(linear["webhook_secret_env"])
+    if set(logfire) - allowed:
+        raise FactoryConfigError("config.projections.logfire contains unknown fields")
+    for key in ("enabled", "dataset_enabled"):
+        if key in logfire and not isinstance(logfire[key], bool):
+            raise FactoryConfigError(f"config.projections.logfire.{key} must be true or false")
+    for key in (
+        "endpoint_env", "headers_env", "service_name_env", "dataset_api_key_env",
     ):
+        if key in logfire and (
+            not isinstance(logfire[key], str) or not ENV_NAME.fullmatch(logfire[key])
+        ):
+            raise FactoryConfigError(
+                f"config.projections.logfire.{key} must name an environment variable"
+            )
+    project = logfire.get("project")
+    if not isinstance(project, str) or not project.strip():
         raise FactoryConfigError(
-            "config.projections.linear.webhook_secret_env must name an environment variable"
+            "config.projections.logfire.project must be a non-empty string"
         )
-    endpoint = linear.get("endpoint", "https://api.linear.app/graphql")
-    if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
-        raise FactoryConfigError("config.projections.linear.endpoint must use HTTPS")
-    for key, default, maximum in (
-        ("timeout_seconds", 15, 60), ("poll_interval_seconds", 30, 3600),
-    ):
-        value = linear.get(key, default)
-        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
-            raise FactoryConfigError(
-                f"config.projections.linear.{key} must be between 1 and {maximum}"
-            )
-    if linear["enabled"]:
-        missing_teams = sorted(
-            project_key for project_key, project in values["projects"].items()
-            if project.get("tracker", {}).get("kind") == "linear"
-            and not (
-                project["tracker"].get("team_id")
-                or project["tracker"].get("team_id_env")
-            )
+    if logfire.get("region", "us") not in ("us", "eu"):
+        raise FactoryConfigError(
+            "config.projections.logfire.region must be us or eu"
         )
-        if missing_teams:
-            raise FactoryConfigError(
-                "enabled Linear projection requires tracker team IDs for: "
-                + ", ".join(missing_teams)
-            )
+    timeout = logfire.get("timeout_seconds", 15)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 60:
+        raise FactoryConfigError(
+            "config.projections.logfire.timeout_seconds must be between 1 and 60"
+        )
+    if logfire.get("dataset_enabled") and not logfire.get("dataset_api_key_env"):
+        raise FactoryConfigError(
+            "enabled hosted datasets require projections.logfire.dataset_api_key_env"
+        )
 
 
 def _positive_integer(value: Any, path: str) -> int:
@@ -481,6 +522,8 @@ class FactoryConfig:
     def load(cls, path: str | Path) -> "FactoryConfig":
         resolved = Path(path).expanduser().resolve()
         values = json.loads(resolved.read_text(encoding="utf-8"))
+        if not isinstance(values, dict):
+            raise FactoryConfigError("config must be a JSON object")
         _reject_embedded_secrets(values)
         if values.get("schema_version") not in (2, 3, 4, 5, 6):
             raise FactoryConfigError(
@@ -607,6 +650,49 @@ class FactoryConfig:
         if not projection.get("enabled"):
             raise FactoryConfigError("Linear projection is disabled")
         return str(environment[projection["token_env"]])
+
+    def resolve_logfire_projection(
+        self, *, environment: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        environment = os.environ if environment is None else environment
+        values = self.values.get("projections", {}).get("logfire")
+        if not values:
+            return {"enabled": False, "dataset_enabled": False}
+        result = {
+            "enabled": bool(values.get("enabled", False)),
+            "dataset_enabled": bool(values.get("dataset_enabled", False)),
+            "project": str(values["project"]),
+            "region": str(values.get("region", "us")),
+            "timeout_seconds": int(values.get("timeout_seconds", 15)),
+            "dataset_name": str(values.get("dataset_name", "dotfactory-executions")),
+        }
+        env_fields = {
+            "endpoint": values.get("endpoint_env", "OTEL_EXPORTER_OTLP_ENDPOINT"),
+            "headers": values.get("headers_env", "OTEL_EXPORTER_OTLP_HEADERS"),
+            "service_name": values.get("service_name_env", "OTEL_SERVICE_NAME"),
+            "dataset_api_key": values.get("dataset_api_key_env"),
+        }
+        result["environment_names"] = {
+            key: name for key, name in env_fields.items() if name
+        }
+        if result["enabled"]:
+            for key in ("endpoint", "headers"):
+                name = str(env_fields[key])
+                if not environment.get(name):
+                    raise FactoryConfigError(
+                        f"Logfire projection requires environment variable {name}"
+                    )
+                result[key] = str(environment[name])
+            service_env = str(env_fields["service_name"])
+            result["service_name"] = str(environment.get(service_env, "dotfactory"))
+        if result["dataset_enabled"]:
+            name = str(env_fields["dataset_api_key"])
+            if not environment.get(name):
+                raise FactoryConfigError(
+                    f"hosted datasets require environment variable {name}"
+                )
+            result["dataset_api_key"] = str(environment[name])
+        return result
 
     def resolve_workflow(self, project_key: str) -> dict[str, Any]:
         if project_key not in self.values["projects"]:

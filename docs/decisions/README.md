@@ -22,6 +22,14 @@ configured by dotfactory belong to their owning repository.
 | [0018](0018-reconcile-linear-through-the-durable-kernel.md) | Reconcile Linear through the durable kernel | Accepted | 0008 and 0011 (partial) |
 | [0019](0019-compose-one-recoverable-lifecycle.md) | Compose one recoverable lifecycle | Accepted | — |
 | [0020](0020-project-readable-run-evidence-into-linear.md) | Project readable run evidence into Linear | Accepted | — |
+| [0023](0023-preserve-supervised-handoffs.md) | Preserve supervised handoffs through one writer | Accepted | — |
+| [0024](0024-check-delivery-before-review.md) | Check delivery before Review | Proposed; planning approval superseded by 0027 | — |
+| [0025](0025-serve-control-through-the-runtime-owner.md) | Serve control through the runtime owner | Proposed | — |
+| [0026](0026-accept-nested-verification-tests.md) | Accept nested verification tests | Proposed | — |
+| [0027](0027-continue-validated-autoplanning.md) | Continue validated Autoplanning | Accepted | 0024 (planning approval policy) |
+| [0028](0028-check-local-readiness-without-starting-work.md) | Check local readiness without starting work | Proposed | — |
+| [0029](0029-freeze-hierarchical-telemetry-delivery.md) | Freeze hierarchical telemetry delivery | Accepted | — |
+| [0030](0030-receive-agent-events-without-dispatch-authority.md) | Receive agent events without dispatch authority | Accepted | — |
 
 ## Lifecycle
 

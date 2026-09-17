@@ -647,7 +647,7 @@ class PreparationEngine:
         self._fault("after_cleanup_finished")
         return PreparationResult("ready", launch=launch)
 
-    def cleanup_workspace(self, execution_id: str) -> PreparationResult:
+    def cleanup_workspace(self, execution_id: str, *, explicit_release: bool = False) -> PreparationResult:
         record = self.ledger.workspace_for_execution(execution_id)
         if not record:
             return PreparationResult("ready")
@@ -657,6 +657,28 @@ class PreparationEngine:
             )
         if record["status"] == "cleaned":
             return PreparationResult("ready")
+        if not explicit_release and record["metadata"].get("cleanup_policy") in (
+            "retain", "quarantine",
+        ):
+            return PreparationResult("retained")
+        outstanding = self.ledger.connection.execute(
+            "SELECT id FROM resource_allocations WHERE execution_id=? "
+            "AND status IN ('active','release_pending')", (execution_id,),
+        ).fetchall()
+        if outstanding:
+            self.ledger.set_workspace_status(
+                execution_id, owner_token=self.owner_token, status="quarantined",
+                detail={"message": "Resource cleanup is unresolved"},
+            )
+            attention = self.ledger.open_attention(
+                execution_id=execution_id, attempt_id=None, preparation_id=None,
+                dedupe_key=f"workspace:{record['id']}:outstanding-resources",
+                category="unsafe-cleanup", provider="git-worktree",
+                detail={"message": "Resource cleanup must be reconciled before workspace removal",
+                        "allocation_ids": [row["id"] for row in outstanding],
+                        "allowed_actions": ["retain", "quarantine"]},
+            )
+            return PreparationResult("needs_attention", attention=attention)
         cleanup_plan = self.ledger.begin_cleanup_plan(
             execution_id=execution_id, attempt_id=None,
             plan={"scope": "execution", "workspace_id": record["id"],
@@ -742,7 +764,7 @@ class PreparationEngine:
                     command_id=command_id,
                 )
         elif remedy == "release" and not preparation:
-            cleanup = self.cleanup_workspace(execution_id)
+            cleanup = self.cleanup_workspace(execution_id, explicit_release=True)
             if cleanup.disposition != "ready":
                 raise LedgerError("workspace is not safe to release")
         elif remedy in ("release", "cancel") and preparation:
@@ -771,8 +793,14 @@ class PreparationEngine:
                     str(allocation["id"]), fence_token=str(fence_token),
                     result={**dict(result), "attention_command_id": command_id},
                 )
-        elif remedy == "quarantine":
-            if preparation:
+        elif remedy in ("retain", "quarantine"):
+            workspace = self.ledger.workspace_for_execution(execution_id)
+            if workspace:
+                self.ledger.set_workspace_cleanup_policy(
+                    execution_id, owner_token=self.owner_token, policy=remedy,
+                    command_id=command_id,
+                )
+            if remedy == "quarantine" and preparation:
                 targets = [
                     allocation for allocation in preparation["allocations"]
                     if allocation["status"] == "active"
@@ -805,6 +833,14 @@ class PreparationEngine:
             resolution="canceled" if remedy == "cancel" else "resolved",
             detail={"remedy": remedy, "command_id": command_id},
         )
+        if remedy in ("retain", "quarantine") and not preparation:
+            self.ledger.open_attention(
+                execution_id=execution_id, attempt_id=None, preparation_id=None,
+                dedupe_key=f"workspace:{execution_id}:held:{command_id}",
+                category="retained-workspace", provider="git-worktree",
+                detail={"message": "Workspace held by operator; release requires approval.",
+                        "allowed_actions": ["release"]},
+            )
         return {
             "attention": resolved,
             "remedy": remedy,
@@ -825,6 +861,8 @@ def run_prepared_attempt(
         launch.request.attempt_id, launch.request.fence_token
     )
     result = runner.run(launch)
+    from .delivery import evaluate
+    result = evaluate(kernel.ledger, launch, result)
     cleanup = engine.cleanup_attempt(launch)
     if cleanup.disposition != "ready":
         raise PreparationError("attempt cleanup requires attention before transition")

@@ -9,6 +9,11 @@
       "profile_paths": [],
       "defaults": {"runner": "codex", "resources": []}
     },
+    "verified-python": {
+      "path": "./workflows/verified-python.dot",
+      "profile_paths": [],
+      "defaults": {"runner": "codex", "resources": []}
+    },
     "three-step": {
       "path": "./workflows/three-step.dot",
       "profile_paths": [],
@@ -123,7 +128,13 @@
       "enabled": false,
       "endpoint_env": "OTEL_EXPORTER_OTLP_ENDPOINT",
       "headers_env": "OTEL_EXPORTER_OTLP_HEADERS",
-      "service_name_env": "OTEL_SERVICE_NAME"
+      "service_name_env": "OTEL_SERVICE_NAME",
+      "project": "your-account/your-project",
+      "region": "us",
+      "timeout_seconds": 15,
+      "dataset_enabled": false,
+      "dataset_api_key_env": "LOGFIRE_PROJECT_API_KEY",
+      "dataset_name": "dotfactory-executions"
     }
   }
 }

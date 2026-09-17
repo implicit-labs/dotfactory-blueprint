@@ -447,6 +447,13 @@ class RunnerAdapter:
             "Process exit alone is not success. "
             f"preferred_label must be exactly one of: {labels}."
         )
+        if launch.request.config.get("exit_contract"):
+            contract += (
+                " Every evidence URI must be an existing committed workspace file path, "
+                "such as .factory/delivery.json. Do not include git://, ledger://, local://, "
+                "HTTP URLs, commit IDs, or invented check references in evidence. "
+                "The factory adds its own verification receipt after your response."
+            )
         return prompt_text + contract
 
     def input_payload(
@@ -1145,6 +1152,7 @@ class LiveRunner:
             "state_id": launch.request.state_id,
             "workflow_digest": launch.request.workflow_digest,
             "intent": intent,
+            "handoff": self.ledger.attempt_input_context(launch.request.attempt_id),
             "disabled_mcp_servers": disabled_mcp_servers,
             "skills": list(launch.request.config.get("skills", [])),
             "capabilities": list(launch.request.config.get("capabilities", [])),

@@ -4,6 +4,106 @@ The host authenticates every request and supplies a `viewer`, `operator`, or
 `approver` principal. The core does not parse credentials. Responses are JSON
 with `Cache-Control: no-store`.
 
+## Run the local HTTP gateway
+
+After `init` and a first local `run` have created the ledger, run this from the
+repository checkout containing the `serve` command:
+
+```bash
+export DOTFACTORY_API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export DOTFACTORY_CONFIG=/absolute/path/to/instance/factory.json
+PYTHONPATH=factory/src python3 -m dotfactory serve --port 8765
+```
+
+Keep that terminal running. From a second terminal with the same token:
+
+```bash
+curl --fail-with-body -H "Authorization: Bearer $DOTFACTORY_API_TOKEN" \
+  http://127.0.0.1:8765/v1/overview
+curl --fail-with-body -H "Authorization: Bearer $DOTFACTORY_API_TOKEN" \
+  'http://127.0.0.1:8765/v1/runs?limit=10'
+```
+
+- This is a new local API secret, **not** a Linear or Logfire key. Store/share it
+  through your local secret manager; do not paste it into tickets or URLs.
+  `--token-env NAME` selects another environment variable. Restart to rotate it.
+- The default role is `viewer`. Start a separate explicitly authorized instance
+  with `--role operator --subject your-client` for commands; use `approver` only
+  for clients allowed to approve workflow edges. All roles can read the entire
+  factory ledger; project query filters are **not** access controls.
+- A running factory receives requests on its mode-0600 owner socket. A stopped
+  factory is opened under an exclusive control-only lock for each request.
+  Neither path launches agents, admits tickets, or starts a second scheduler.
+- Stop with Ctrl-C or SIGTERM. The gateway closes its listener; it does not stop
+  a separate factory run. There is no installed background service.
+- Missing ledgers fail startup. An older running factory without HTTP forwarding
+  must be restarted from this version. Lock contention, owner timeouts, transport
+  errors, and oversized owner responses return 503 without replaying commands.
+- Requests are bounded to 32 KiB bodies and 64 KiB serialized socket envelopes;
+  active-owner responses are also bounded to 64 KiB. Use smaller page limits for
+  large collections. An oversized unpaginated response may remain unavailable
+  while the owner is running. Connections are serial and body reads time out
+  after five seconds; this is a local operator gateway, not a public web server.
+- Command timeouts can mean **outcome unknown**, not failure. Read the receipt at
+  `/v1/commands/{command_id}`, then retry only with the identical
+  `Idempotency-Key`, principal, and body. Never generate a new key for a retry.
+
+Example command after restarting the gateway with `--role operator`:
+
+```bash
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer $DOTFACTORY_API_TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: cancel-example-1' \
+  --data '{"action":"cancel","expected_state":"Todo","confirmed":true,"parameters":{"reason":"No longer needed"}}' \
+  http://127.0.0.1:8765/v1/runs/EXECUTION_ID/commands
+```
+
+Use the execution's observed state, not the example's `Todo`. Role and subject
+come from gateway startup, never request headers or body fields. The owner
+trusts this principal only across its existing same-UID socket: processes under
+that operating-system account already have local operator authority.
+
+## Setup versus serving versus Linear
+
+### Approve planned verification
+
+The initialized `verified-python` Autoplanning lane continues automatically to
+implementation after host validation. Only manual Planning stops at `PlanReview`.
+For that manual path, export its plan
+packet with `dotfactory delivery` and review `verification-plan.json`, `checks/`,
+and `change.patch` before approving. From a gateway started with `--role approver`:
+
+```bash
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer $DOTFACTORY_API_TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: approve-plan-1' \
+  --data '{"action":"approve","expected_state":"PlanReview","parameters":{"plan_sha":"EXACT_REVIEWED_HEAD_FROM_PACKET","note":"Reviewed proposed acceptance checks"}}' \
+  http://127.0.0.1:8765/v1/runs/EXECUTION_ID/commands
+```
+
+The exact reviewed commit is mandatory. Viewer/operator tokens cannot approve.
+Approval moves the execution to Ready; it does **not** start a worker. If the
+worker is stopped, resume the same issue with `dotfactory run --until-state Review`
+and the same config/project/issue arguments. A running worker can pick up Ready.
+Pinned checks remain bound across restarts. Automatic authorization is a recorded
+Autoplanning handoff, not a synthetic human approval or an HTTP approve call.
+
+### Command ownership
+
+| Operation | Interface | Requires a running factory worker? |
+|---|---|---|
+| Create configuration | `dotfactory init` (CLI only; no init endpoint) | No |
+| Inspect status | `dotfactory status` or gateway `GET /v1/runs` | No; ledger must exist |
+| Start agent work | `dotfactory run` | Starts the worker |
+| Host existing observation/control routes | `dotfactory serve` | No; forwards when a worker is running |
+
+The listener binds **127.0.0.1 only**, without TLS. There is no LAN/public host
+flag, CORS support, tunnel, or Linear webhook registration. Browser-origin
+requests are rejected. Do not reverse-proxy it onto the internet as-is.
+Linear cloud cannot call your laptop's loopback address. Remote integration
+still needs an explicitly approved authenticated ingress/relay and webhook
+identity/replay handling; serving these routes does not implement that listener.
+
 ## Reads
 
 | Endpoint | Query | Returns |
