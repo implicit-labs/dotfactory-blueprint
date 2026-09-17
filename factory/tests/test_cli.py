@@ -188,6 +188,7 @@ class FactoryCLITests(unittest.TestCase):
         runtime.start_issue.assert_called_once_with(
             "demo", "DEMO-1", title=None, description="already read",
         )
+
     def test_run_exit_code_is_zero_only_for_an_idle_settled_boundary(self):
         runtime = MagicMock()
         runtime.ledger.run_snapshot.return_value = {"attention_requests": []}

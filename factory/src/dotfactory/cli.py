@@ -134,6 +134,8 @@ def _load_description(path_value: str | None) -> str:
     if len(description) > 65_536:
         raise ValueError("description file exceeds 65,536 characters")
     return description
+
+
 def _run(args: argparse.Namespace) -> int:
     config = FactoryConfig.load(args.config)
     description = _load_description(args.description_file)
