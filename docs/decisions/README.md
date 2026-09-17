@@ -30,6 +30,7 @@ configured by dotfactory belong to their owning repository.
 | [0028](0028-check-local-readiness-without-starting-work.md) | Check local readiness without starting work | Proposed | — |
 | [0029](0029-freeze-hierarchical-telemetry-delivery.md) | Freeze hierarchical telemetry delivery | Accepted | — |
 | [0030](0030-receive-agent-events-without-dispatch-authority.md) | Receive agent events without dispatch authority | Accepted | — |
+| [0031](0031-freeze-bounded-verification-host-policy.md) | Freeze a bounded verification host policy | Proposed | — |
 
 ## Lifecycle
 

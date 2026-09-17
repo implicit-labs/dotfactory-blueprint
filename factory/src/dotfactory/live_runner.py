@@ -454,7 +454,11 @@ class RunnerAdapter:
                 "HTTP URLs, commit IDs, or invented check references in evidence. "
                 "The factory adds its own verification receipt after your response."
             )
-        return prompt_text + contract
+        policy_guidance = ""
+        if launch.request.config.get("exit_contract") == "plan-result-v2":
+            from .delivery import verification_policy_guidance
+            policy_guidance = "\n\n" + verification_policy_guidance()
+        return prompt_text + policy_guidance + contract
 
     def input_payload(
         self, launch: PreparedLaunch, *, prompt_text: str,

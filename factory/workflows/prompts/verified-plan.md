@@ -1,4 +1,7 @@
 Plan the issue and its verification before implementation.
+Use the authoritative host verification contract injected below. Select any
+non-legacy verification deadline explicitly in .factory/verification.json; do
+not duplicate or infer host policy from this checked-in prompt.
 Commit .factory/plan.md with requirements, design, risks, and acceptance coverage.
 Create .factory/verification.json with schema_version 1 and criteria: each has a
 unique id, requirement, and kind. Automated criteria list files (Python checks

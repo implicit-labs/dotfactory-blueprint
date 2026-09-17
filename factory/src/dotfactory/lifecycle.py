@@ -426,6 +426,16 @@ class FactoryRuntime:
             (project_key, identifier),
         ).fetchone() is not None
 
+    def _next_execution_number(self, project_key: str, identifier: str) -> int:
+        row = self.ledger.connection.execute(
+            "SELECT COALESCE(MAX(we.execution_number),0)+1 AS next_number "
+            "FROM work_items wi LEFT JOIN workflow_executions we "
+            "ON we.work_item_id=wi.id "
+            "WHERE wi.project_key=? AND wi.identifier=?",
+            (project_key, identifier),
+        ).fetchone()
+        return int(row["next_number"] if row else 1)
+
     def start_issue(
         self, project_key: str, identifier: str, *, title: str | None = None,
         description: str = "",
@@ -466,9 +476,12 @@ class FactoryRuntime:
             })
         if not isinstance(intent["description"], str) or len(intent["description"]) > 65536:
             raise LifecycleError("issue description must be text of at most 65536 characters")
+        execution_number = self._next_execution_number(project_key, identifier)
         execution_id = self.kernels[project_key].begin(
             project_key, identifier, intent,
-            command_id=f"runtime-begin:{project_key}:{identifier}",
+            command_id=(
+                f"runtime-begin:{project_key}:{identifier}:{execution_number}"
+            ),
             adopted_state=adopted_state,
         )
         if worker:
