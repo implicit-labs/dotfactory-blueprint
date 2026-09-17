@@ -118,8 +118,27 @@ def _run_exit_code(runtime: FactoryRuntime, receipt: Any) -> int:
     return 0 if final_disposition == "idle" else 1
 
 
+def _load_description(path_value: str | None) -> str:
+    if path_value is None:
+        return ""
+    path = Path(path_value)
+    if not path.is_file():
+        raise ValueError("description file is not a regular file")
+    try:
+        with path.open("r", encoding="utf-8") as description_file:
+            description = description_file.read(65_537)
+    except UnicodeDecodeError as error:
+        raise ValueError("description file is not valid UTF-8") from error
+    except OSError as error:
+        raise ValueError("description file could not be read") from error
+    if len(description) > 65_536:
+        raise ValueError("description file exceeds 65,536 characters")
+    return description
+
+
 def _run(args: argparse.Namespace) -> int:
     config = FactoryConfig.load(args.config)
+    description = _load_description(args.description_file)
     with FactoryRuntime(config, project_keys=[args.project]) as runtime:
         _install_signals(runtime)
         runtime.enable_operator()
@@ -131,7 +150,7 @@ def _run(args: argparse.Namespace) -> int:
             title = str(discovered.get("title") or issue)
         execution = runtime.start_issue(
             args.project, issue, title=title,
-            description=Path(args.description_file).read_text() if args.description_file else "",
+            description=description,
         )
         receipt = runtime.run(
             [execution], watch=args.watch,
