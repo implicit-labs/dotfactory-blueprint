@@ -86,6 +86,9 @@ explicit human procedures:
 ```json
 {
   "schema_version": 1,
+  "verification_policy": {
+    "timeout_seconds": 120
+  },
   "criteria": [
     {
       "id": "blank-name",
@@ -102,6 +105,13 @@ explicit human procedures:
   ]
 }
 ```
+
+`verification_policy` must be nested exactly as shown. Its `timeout_seconds` may
+be 60 or 120. A top-level `timeout_seconds`, unknown top-level fields, unknown
+policy keys, other types, and other values fail closed. Omitting the entire
+`verification_policy` object keeps the historical 60-second deadline. Planning
+receives this exact schema shape from the canonical resolver used for structural
+validation and execution.
 
 The verifier receives the exported source directory as `argv[1]`. It should run
 these acceptance tests and relevant regression tests, print readable output, and
@@ -172,6 +182,24 @@ execution against the intended base; this preset does not silently reopen or
 rewrite an approval. Code-only rework uses the existing Review → Reworking path
 and the same approved checks. Use a bounded two-step rework/verification pass.
 
+## Recover an incompatible frozen plan
+
+Never rewrite or resume an accepted plan with replacement checks. Preserve its
+workspace, ledger events, failed receipts, and execution snapshots.
+
+1. If the execution is nonterminal, cancel it through the existing audited
+   operator/control transition. Do not add a bypass edge.
+2. Start the same work item again. `start_issue` returns an existing active
+   execution, or derives its begin-command identity from the next execution
+   number after terminal completion. The ledger atomically assigns that number
+   and key; validate and approve the new plan independently.
+3. Record both execution IDs in operator evidence so the new attempt is linked
+   without changing the old one.
+
+Stop for human intervention if the existing execution cannot be terminalized or
+a fresh execution cannot be created. This route does not migrate accepted checks
+or authorize implementation in place.
+
 ## Export the delivered change
 
 At Review, use `delivery` again with a fresh output directory. It writes
@@ -199,9 +227,18 @@ at Blocked. Cancellation remains available.
 - Criteria: 1–32, at least one automated; definition at most 64 KiB.
 - Frozen files: at most 64; evidence 1–32 committed local files, no symlinks/escape.
 - Verification source: at most 2000 regular committed files/4 MiB.
-- Run: 60 seconds, 4 MiB output; final 16 KiB retained with full output hash.
+- Run: the frozen 60- or 120-second policy, 4 MiB output; final 16 KiB retained
+  with full output hash. Policy-free schema-version-1 plans retain 60 seconds.
+- Receipt: actual `sys.executable` and Python version, isolated mode, restricted
+  `PATH`, temporary `HOME`, raw committed-source export, secret exclusion, and
+  requested/effective timeout.
 - Raw Git export excludes ignored/untracked files and archive substitutions.
 - Trusted project code has host OS permissions; this is not a security sandbox.
 - Passing checks prove their assertions, not complete coverage, UI quality,
   deployment, live Linear delivery, or manual criteria. Human review remains.
 - The host owns export; agents do not upload directly to Linear or merge.
+
+The complete regression suite is separate evidence when it exceeds the host
+budget. Set `DOTFACTORY_TEST_PYTHON` to an audited absolute Python 3.13 path and
+run `/bin/bash factory/test.sh`; do not attribute that result to an older host's
+60-second verifier.

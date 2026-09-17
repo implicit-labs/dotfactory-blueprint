@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -19,10 +20,70 @@ PLANNED_CONTRACTS = {"plan-result-v2", "implementation-result-v2", "python-verif
 CONTRACTS = {"plan-result-v1", "implementation-result-v1", "python-verification-v1"} | PLANNED_CONTRACTS
 FAILURE_LABELS = {"failed", "retry", "exhausted", "blocked", "cancel", "duplicate"}
 MAX_BYTES = 4 * 1024 * 1024
+VERIFICATION_POLICY_SCHEMA_VERSION = 1
+VERIFICATION_TIMEOUT_SECONDS = (60, 120)
+LEGACY_VERIFICATION_TIMEOUT_SECONDS = 60
+VERIFICATION_DEFINITION_KEYS = {"schema_version", "verification_policy", "criteria"}
 
 
 class DeliveryError(ValueError):
     pass
+
+
+def resolve_verification_policy(definition: dict[str, Any]) -> dict[str, int]:
+    """Resolve the bounded host policy selected by a schema-version-1 plan."""
+    if not isinstance(definition, dict) or definition.get("schema_version") != 1:
+        raise DeliveryError("verification policy requires schema_version 1")
+    unknown = set(definition) - VERIFICATION_DEFINITION_KEYS
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        raise DeliveryError(f"verification definition has unknown top-level fields: {names}")
+    if "verification_policy" not in definition:
+        timeout = LEGACY_VERIFICATION_TIMEOUT_SECONDS
+    else:
+        policy = definition["verification_policy"]
+        if not isinstance(policy, dict) or set(policy) != {"timeout_seconds"}:
+            raise DeliveryError("verification_policy accepts only timeout_seconds")
+        timeout = policy["timeout_seconds"]
+        if isinstance(timeout, bool) or not isinstance(timeout, int):
+            raise DeliveryError("verification timeout_seconds must be an integer")
+        if timeout not in VERIFICATION_TIMEOUT_SECONDS:
+            raise DeliveryError("verification timeout_seconds must be 60 or 120")
+    return {
+        "schema_version": VERIFICATION_POLICY_SCHEMA_VERSION,
+        "timeout_seconds": timeout,
+    }
+
+
+def verification_policy_guidance() -> str:
+    """Render planning guidance from the constants enforced by the host."""
+    allowed = " or ".join(str(value) for value in VERIFICATION_TIMEOUT_SECONDS)
+    example = json.dumps({
+        "schema_version": VERIFICATION_POLICY_SCHEMA_VERSION,
+        "verification_policy": {"timeout_seconds": VERIFICATION_TIMEOUT_SECONDS[-1]},
+        "criteria": [{
+            "id": "required-check",
+            "requirement": "Describe required behavior",
+            "kind": "automated",
+            "files": [".factory/verify.py", "tests/test_required.py"],
+        }],
+    }, separators=(",", ":"))
+    return (
+        "Authoritative host verification contract:\n"
+        f"- Python runs as sys.executable ({sys.executable}, Python {platform.python_version()}) "
+        "with isolated mode (-I); Python children must use sys.executable, not PATH discovery.\n"
+        f"- The executable environment uses PATH={os.defpath}, an isolated temporary HOME, "
+        "no ambient secret or credential variables, and no stdin.\n"
+        "- Verification receives an isolated raw-Git export of committed source; ignored and "
+        "untracked files are excluded, and committed-source mutation is rejected.\n"
+        f"- Exact schema shape for an explicit deadline: {example}\n"
+        f"- verification_policy.timeout_seconds may be {allowed}; omitting verification_policy "
+        f"retains the legacy {LEGACY_VERIFICATION_TIMEOUT_SECONDS}-second deadline. "
+        "timeout_seconds at the top level, unknown top-level fields, unknown policy keys, and "
+        "other values are rejected.\n"
+        "- Output and committed source are each bounded to 4 MiB. Operator cancel and deadline "
+        "expiry terminate the verifier's owned process group."
+    )
 
 
 def digest(data: bytes) -> str:
@@ -151,7 +212,8 @@ def verification_definition(root: Path) -> dict[str, Any]:
             except SyntaxError as error:
                 raise DeliveryError(f"invalid planned Python check: {name}") from error
         hashes[name] = digest(file.read_bytes())
-    return {"definition": definition, "files": hashes}
+    return {"definition": definition, "policy": resolve_verification_policy(definition),
+            "files": hashes}
 
 
 def planned_receipt(ledger: Any, execution_id: str) -> dict[str, Any]:
@@ -213,7 +275,23 @@ def guard_planned_transition(ledger: Any, execution_id: str, states: dict[str, A
                 raise DeliveryError("source changed between plan approval and implementation")
 
 
-def _verify(root: Path, base: str, progress: Callable[[], bool] | None) -> dict[str, Any]:
+def _verify(
+    root: Path,
+    base: str,
+    progress: Callable[[], bool] | None,
+    *,
+    policy: dict[str, int] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    selected = resolve_verification_policy({
+        "schema_version": 1,
+        **({"verification_policy": {"timeout_seconds": policy["timeout_seconds"]}}
+           if policy is not None else {}),
+    })
+    if policy is not None and policy != selected:
+        raise DeliveryError("verification policy is not canonical")
+    timeout_seconds = selected["timeout_seconds"]
     script = git(root, "show", f"{base}:.factory/verify.py")
     if not script.strip():
         raise DeliveryError("verification revision requires .factory/verify.py")
@@ -249,23 +327,30 @@ def _verify(root: Path, base: str, progress: Callable[[], bool] | None) -> dict[
         pinned = temp / "verify.py"
         pinned.write_bytes(script)
         output = temp / "check.log"
+        environment = {
+            "PATH": os.defpath,
+            "HOME": str(temp),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
         with output.open("wb") as stream:
             process = subprocess.Popen(
                 [sys.executable, "-I", str(pinned), str(checkout)], cwd=temp,
                 stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
-                env={"PATH": os.defpath, "HOME": str(temp), "PYTHONDONTWRITEBYTECODE": "1"},
+                env=environment,
                 start_new_session=True,
             )
-            deadline = time.monotonic() + 60
+            deadline = monotonic() + timeout_seconds
             try:
                 while process.poll() is None:
                     if progress and progress():
                         raise DeliveryError("verification canceled by operator")
-                    if time.monotonic() >= deadline:
-                        raise DeliveryError("verification exceeded 60 seconds")
+                    if monotonic() >= deadline:
+                        raise DeliveryError(
+                            f"verification exceeded {timeout_seconds} seconds"
+                        )
                     if output.stat().st_size > MAX_BYTES:
                         raise DeliveryError("verification output exceeded 4 MiB")
-                    time.sleep(0.05)
+                    sleep(0.05)
             finally:
                 # This process group was created by this invocation only.
                 try:
@@ -283,7 +368,20 @@ def _verify(root: Path, base: str, progress: Callable[[], bool] | None) -> dict[
         return {"script_sha256": digest(script), "exit_code": process.returncode,
                 "output_sha256": digest(data), "output": data[-16384:].decode("utf-8", errors="replace"),
                 "output_truncated": len(data) > 16384,
-                "input": "isolated export of committed HEAD; ignored files excluded"}
+                "input": "isolated export of committed HEAD; ignored files excluded",
+                "policy": {
+                    "schema_version": selected["schema_version"],
+                    "requested_timeout_seconds": timeout_seconds,
+                    "effective_timeout_seconds": timeout_seconds,
+                    "interpreter": sys.executable,
+                    "python_version": platform.python_version(),
+                    "isolated": True,
+                    "path": environment["PATH"],
+                    "home": environment["HOME"],
+                    "home_isolated": True,
+                    "source_export": "raw committed Git objects",
+                    "ambient_secrets_excluded": True,
+                }}
 
 
 def _failed_result(receipt: dict[str, Any], uri: str) -> RunnerResult:
@@ -361,7 +459,15 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
                 raise DeliveryError("delivery.json requires a limitations string list")
             receipt["delivery"] = details
             if contract in ("python-verification-v1", "python-verification-v2"):
-                receipt["verification"] = _verify(root, approved["head_sha"] if approved else source["base_sha"], progress)
+                # Pre-policy plan-result-v2 receipts are immutable and omit this key.
+                # Passing None preserves their historical 60-second verifier budget.
+                policy = approved.get("policy") if approved else None
+                receipt["verification"] = _verify(
+                    root,
+                    approved["head_sha"] if approved else source["base_sha"],
+                    progress,
+                    policy=policy,
+                )
                 if receipt["verification"]["exit_code"] != 0:
                     raise DeliveryError("pinned verification failed")
         if source_snapshot(workspace) != source:
