@@ -1211,7 +1211,7 @@ class LiveRunnerTests(unittest.TestCase):
         database.commit()
         database.close()
         migrated = SQLiteLedger(path)
-        self.assertEqual(12, migrated.connection.execute(
+        self.assertEqual(13, migrated.connection.execute(
             "PRAGMA user_version"
         ).fetchone()[0])
         tables = {

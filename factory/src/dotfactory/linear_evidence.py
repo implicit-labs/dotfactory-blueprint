@@ -206,6 +206,63 @@ def render_linear_run_summary(
     workspace = snapshot.get("workspace")
     workspace_status = str(workspace.get("status")) if workspace else "not allocated"
     trace = summary["trace"]
+    runner_runs = list(history.get("runner_runs") or [])
+    runner_identities = sorted({
+        (
+            _scrub(item.get("runner_key"), 80),
+            _scrub(item.get("adapter_kind"), 80),
+            _scrub(item.get("adapter_version"), 80),
+            int(item.get("protocol_version") or 0),
+        )
+        for item in runner_runs
+    })
+    runner_phrase = "not launched" if not runner_identities else "; ".join(
+        f"`{runner}` · {adapter} {version} · protocol v{protocol}"
+        for runner, adapter, version, protocol in runner_identities
+    )
+    artifacts = list(history.get("artifacts") or [])
+    artifact_kinds = sorted({_scrub(item.get("kind"), 80) for item in artifacts})
+    artifact_phrase = (
+        "none recorded" if not artifacts else
+        f"{len(artifacts)} recorded · " + ", ".join(
+            f"`{kind}`" for kind in artifact_kinds[:8]
+        )
+    )
+    verification_runs = [
+        item for item in state_runs
+        if "verif" in str(item.get("state_id") or "").casefold()
+    ]
+    if not verification_runs:
+        verification_phrase = "not reached"
+    elif all(str(item.get("status")) == "completed" for item in verification_runs):
+        verification_phrase = f"{len(verification_runs)} node run(s) completed"
+    else:
+        verification_phrase = "in progress or incomplete"
+    links = [
+        item for item in summary.get("links") or []
+        if isinstance(item, dict) and str(item.get("url", "")).startswith("https://")
+    ]
+    evidence_phrase = (
+        f"trace {'complete' if trace['complete'] else 'incomplete'} · "
+        f"{len(artifacts)} ledger artifact(s) · {len(links)} external link(s)"
+    )
+    if attention:
+        latest_attention = attention[-1]
+        next_action = _scrub(
+            latest_attention.get("safe_remedy") or latest_attention.get("reason")
+            or "Respond to the open attention request."
+        )
+    elif incidents and not completed:
+        next_action = _scrub(
+            incidents[-1]["primary"].get("safe_remedy")
+            or "Inspect the active incident."
+        )
+    elif completed and str(snapshot["current_state_id"]) == "Done":
+        next_action = "Review linked evidence and merge only after required gates pass."
+    elif completed:
+        next_action = "Review the terminal outcome and choose recovery or cancellation."
+    else:
+        next_action = f"Continue from `{_scrub(snapshot['current_state_id'], 120)}`."
     latest_fact_at = None
     for item in waterfall.get("items") or []:
         latest_fact_at = item.get("ended_at") or item.get("started_at") or latest_fact_at
@@ -221,6 +278,12 @@ def render_linear_run_summary(
         f"`{_scrub(trace['trace_id'], 160)}`",
         f"- **Workspace:** `{_scrub(workspace_status, 120)}`",
         f"- **Attention:** {len(attention)} open",
+        "", "### Delivery facts", "",
+        f"- **Runner / version:** {runner_phrase}",
+        f"- **Changed artifacts:** {artifact_phrase}",
+        f"- **Verification:** {verification_phrase}",
+        f"- **Evidence coverage:** {evidence_phrase}",
+        f"- **Next action:** {next_action}",
         "", "### Nodes traversed", "",
         f"**Path:** {_node_path(state_runs)}", "",
         *_node_details(state_runs, state_token_usage, as_of=latest_fact_at),
@@ -247,10 +310,6 @@ def render_linear_run_summary(
             if not completed and remedy:
                 lines.append(f"Next: {remedy}")
 
-    links = [
-        item for item in summary.get("links") or []
-        if isinstance(item, dict) and str(item.get("url", "")).startswith("https://")
-    ]
     lines.extend(["", "+++ Technical details", ""])
     for incident in incidents[-3:]:
         primary = incident["primary"]

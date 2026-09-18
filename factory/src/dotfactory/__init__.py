@@ -16,6 +16,7 @@ from .linear_api import (
 from .linear_evidence import (
     LinearEvidenceWorker, readable_incidents, render_linear_run_summary,
 )
+from .linear_agent import LinearAgentSessionWorker, build_agent_projection
 from .datasets import (
     DatasetContractError, HostedDatasetPublisher, HostedDatasetSettings,
     dataset_bundle, execution_dataset_case, incident_rows,
@@ -58,6 +59,7 @@ __all__ = [
     "LinearAPIError", "LinearConvergenceWorker", "LinearGraphQLClient",
     "LinearWebhookVerifier",
     "LinearEvidenceWorker", "readable_incidents", "render_linear_run_summary",
+    "LinearAgentSessionWorker", "build_agent_projection",
     "DatasetContractError", "HostedDatasetPublisher", "HostedDatasetSettings",
     "dataset_bundle", "execution_dataset_case", "incident_rows",
     "score_execution_case", "write_dataset_bundle",

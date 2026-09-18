@@ -336,6 +336,19 @@ def _doctor(args: argparse.Namespace) -> int:
     return run(args.config, json_output=args.json)
 
 
+def _listener(args: argparse.Namespace) -> int:
+    from .listener_control import manage_listener
+
+    result = manage_listener(
+        args.listener_action,
+        service_id=args.service_id,
+        token_env=args.token_env,
+        timeout=args.timeout,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dotfactory")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -411,6 +424,18 @@ def main(arguments: list[str] | None = None) -> int:
     status.add_argument("--project", required=True)
     status.add_argument("--execution")
     status.set_defaults(callback=_status)
+    listener = commands.add_parser(
+        "listener", help="inspect, suspend, or resume the hosted receipt listener"
+    )
+    listener.add_argument(
+        "listener_action", choices=("status", "suspend", "resume")
+    )
+    listener.add_argument(
+        "--service-id", default=os.environ.get("DOTFACTORY_LISTENER_SERVICE_ID")
+    )
+    listener.add_argument("--token-env", default="RENDER_API_KEY")
+    listener.add_argument("--timeout", type=float, default=10.0)
+    listener.set_defaults(callback=_listener)
     from .control_server import serve
     server = commands.add_parser("serve", help="serve the authenticated loopback control API")
     server.add_argument("--config", default=os.environ.get("DOTFACTORY_CONFIG"))

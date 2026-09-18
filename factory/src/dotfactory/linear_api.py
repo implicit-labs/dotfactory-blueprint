@@ -221,6 +221,158 @@ class LinearGraphQLClient:
             variables={"id": comment_id, "input": {"body": body}},
         )
 
+    @staticmethod
+    def _agent_session_value(data: dict[str, Any], field: str) -> dict[str, Any]:
+        result = data.get(field)
+        session = result.get("agentSession") if isinstance(result, dict) else None
+        if (
+            not isinstance(result, dict) or result.get("success") is not True
+            or not isinstance(session, dict) or not str(session.get("id", "")).strip()
+        ):
+            raise LinearAPIError(
+                "invalid_agent_session", "Linear returned no agent session",
+                retryable=False,
+            )
+        return dict(session)
+
+    def agent_session(self, session_id: str) -> dict[str, Any] | None:
+        try:
+            data = self.execute(
+                "FactoryAgentSession",
+                "query FactoryAgentSession($id:String!){agentSession(id:$id){"
+                "id url status issue{id} externalLinks{label url}}}",
+                {"id": session_id},
+            )
+        except LinearAPIError as error:
+            if error.code.upper() in NOT_FOUND_CODES:
+                return None
+            raise
+        session = data.get("agentSession")
+        return dict(session) if isinstance(session, dict) else None
+
+    def issue_agent_sessions(self, issue_id: str) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        cursor = None
+        seen = set()
+        for _page in range(20):
+            data = self.execute(
+                "FactoryIssueAgentSessions",
+                "query FactoryIssueAgentSessions($id:String!,$after:String){issue(id:$id){"
+                "agentSessions(first:50,after:$after){nodes{id url status issue{id} "
+                "externalLinks{label url}} pageInfo{hasNextPage endCursor}}}}",
+                {"id": issue_id, "after": cursor},
+            )
+            issue = data.get("issue")
+            sessions = issue.get("agentSessions") if isinstance(issue, dict) else None
+            nodes = sessions.get("nodes") if isinstance(sessions, dict) else None
+            page = sessions.get("pageInfo") if isinstance(sessions, dict) else None
+            if (not isinstance(nodes, list) or any(not isinstance(item, dict) for item in nodes)
+                    or not isinstance(page, dict) or not isinstance(page.get("hasNextPage"), bool)):
+                raise LinearAPIError("invalid_agent_sessions", "Linear returned invalid agent sessions", retryable=False)
+            result.extend(dict(item) for item in nodes)
+            if not page["hasNextPage"]:
+                return result
+            cursor = page.get("endCursor")
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                break
+            seen.add(cursor)
+        raise LinearAPIError("agent_sessions_incomplete", "Linear session listing could not be completed", retryable=False)
+
+    def create_agent_session(
+        self, *, issue_id: str, external_urls: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        try:
+            data = self.execute(
+                "FactoryAgentSessionCreate",
+                "mutation FactoryAgentSessionCreate($input:AgentSessionCreateOnIssue!){"
+                "agentSessionCreateOnIssue(input:$input){success agentSession{"
+                "id url status issue{id} externalLinks{label url}}}}",
+                {"input": {"issueId": issue_id, "externalUrls": external_urls}},
+            )
+        except LinearAPIError as error:
+            if error.retryable and error.code.upper() not in {
+                "RATELIMITED", "RATE_LIMITED", "HTTP_429",
+            }:
+                raise LinearAPIError(
+                    error.code, "Linear agent session result is unknown",
+                    retryable=True, ambiguous=True,
+                ) from error
+            raise
+        return self._agent_session_value(data, "agentSessionCreateOnIssue")
+
+    def update_agent_session(
+        self, *, session_id: str, external_urls: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        try:
+            data = self.execute(
+                "FactoryAgentSessionUpdate",
+                "mutation FactoryAgentSessionUpdate($id:String!,$input:AgentSessionUpdateInput!){"
+                "agentSessionUpdate(id:$id,input:$input){success agentSession{"
+                "id url status issue{id} externalLinks{label url}}}}",
+                {"id": session_id, "input": {"externalUrls": external_urls}},
+            )
+        except LinearAPIError as error:
+            if error.retryable and error.code.upper() not in {
+                "RATELIMITED", "RATE_LIMITED", "HTTP_429",
+            }:
+                raise LinearAPIError(
+                    error.code, "Linear agent session update result is unknown",
+                    retryable=True, ambiguous=True,
+                ) from error
+            raise
+        return self._agent_session_value(data, "agentSessionUpdate")
+
+    def agent_activity(self, activity_id: str) -> dict[str, Any] | None:
+        try:
+            data = self.execute(
+                "FactoryAgentActivity",
+                "query FactoryAgentActivity($id:String!){agentActivity(id:$id){"
+                "id agentSession{id}}}",
+                {"id": activity_id},
+            )
+        except LinearAPIError as error:
+            if error.code.upper() in NOT_FOUND_CODES:
+                return None
+            raise
+        activity = data.get("agentActivity")
+        return dict(activity) if isinstance(activity, dict) else None
+
+    def create_agent_activity(
+        self, *, session_id: str, activity_id: str, content: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            data = self.execute(
+                "FactoryAgentActivityCreate",
+                "mutation FactoryAgentActivityCreate($input:AgentActivityCreateInput!){"
+                "agentActivityCreate(input:$input){success agentActivity{"
+                "id agentSession{id}}}}",
+                {"input": {
+                    "id": activity_id, "agentSessionId": session_id,
+                    "content": content,
+                }},
+            )
+        except LinearAPIError as error:
+            if error.retryable and error.code.upper() not in {
+                "RATELIMITED", "RATE_LIMITED", "HTTP_429",
+            }:
+                raise LinearAPIError(
+                    error.code, "Linear agent activity result is unknown",
+                    retryable=True, ambiguous=True,
+                ) from error
+            raise
+        result = data.get("agentActivityCreate")
+        activity = result.get("agentActivity") if isinstance(result, dict) else None
+        if (
+            not isinstance(result, dict) or result.get("success") is not True
+            or not isinstance(activity, dict)
+            or str(activity.get("id", "")) != activity_id
+        ):
+            raise LinearAPIError(
+                "invalid_agent_activity", "Linear returned no matching agent activity",
+                retryable=False,
+            )
+        return dict(activity)
+
     def _mutate_comment(
         self, *, operation: str, field: str, query: str,
         variables: dict[str, Any],

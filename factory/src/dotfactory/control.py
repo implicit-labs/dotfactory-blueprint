@@ -146,6 +146,12 @@ class ObservationService:
             )
         except LedgerError:
             snapshot["linear_evidence"] = None
+        try:
+            snapshot["linear_agent_session"] = self.ledger.linear_agent_session(
+                execution_id
+            )
+        except LedgerError:
+            snapshot["linear_agent_session"] = None
         snapshot["available_actions"] = self.available_actions(snapshot)
         return {"api_version": API_VERSION, "data": _without_fences(snapshot)}
 
@@ -250,9 +256,14 @@ class ObservationService:
             )
         except LedgerError:
             evidence = None
+        try:
+            agent_session = self.ledger.linear_agent_session(execution_id)
+        except LedgerError:
+            agent_session = None
         return {
             "waterfall": waterfall, "summary": summary,
             "error_groups": groups, "linear_evidence": evidence,
+            "linear_agent_session": agent_session,
         }
 
     def summary(self, execution_id: str) -> dict[str, Any]:

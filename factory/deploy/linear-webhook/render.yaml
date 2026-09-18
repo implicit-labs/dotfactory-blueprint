@@ -1,0 +1,23 @@
+# Apply this Blueprint from the reviewed source repository after reviewing cost.
+services:
+  - type: web
+    name: dotfactory-linear-listener
+    runtime: docker
+    plan: 0.5c-512mb
+    region: virginia
+    dockerfilePath: ./factory/deploy/linear-webhook/Dockerfile
+    dockerContext: .
+    autoDeployTrigger: "off"
+    numInstances: 1
+    healthCheckPath: /readyz
+    disk:
+      name: linear-receipts
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: LINEAR_WEBHOOK_SECRET
+        sync: false
+      - key: LINEAR_WEBHOOK_ORGANIZATION_ID
+        sync: false
+      - key: LINEAR_WEBHOOK_OAUTH_CLIENT_ID
+        sync: false

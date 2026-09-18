@@ -19,6 +19,7 @@ from .control import ControlService, ObservationService
 from .instance import FactoryConfig, FactoryConfigError
 from .kernel import DurableKernel
 from .ledger import SQLiteLedger
+from .linear_agent import LinearAgentSessionWorker, build_agent_projection
 from .linear_api import LinearAPIError, LinearConvergenceWorker, LinearGraphQLClient
 from .linear_evidence import LinearEvidenceWorker, render_linear_run_summary
 from .live_runner import LiveRunner, LiveRunnerRouter, RunnerRoute
@@ -145,6 +146,7 @@ class FactoryRuntime:
             self.projects: dict[str, ScheduledProject] = {}
             self.linear_workers: dict[str, LinearConvergenceWorker] = {}
             self.linear_evidence_workers: dict[str, LinearEvidenceWorker] = {}
+            self.linear_agent_workers: dict[str, LinearAgentSessionWorker] = {}
             self.logfire_worker: LogfireProjectionWorker | None = None
             self.preflights: list[dict[str, Any]] = []
             self._build_projects()
@@ -306,9 +308,27 @@ class FactoryRuntime:
             self.linear_evidence_workers[project_key] = LinearEvidenceWorker(
                 self.ledger, client
             )
+            if projection["agent_sessions_enabled"]:
+                agent_token = str(self.environment.get(projection["agent_token_env"], "")).strip()
+                if agent_token:
+                    authorization = agent_token if agent_token.startswith("Bearer ") else "Bearer " + agent_token
+                    agent_client = LinearGraphQLClient(
+                        authorization, endpoint=projection["endpoint"],
+                        timeout_seconds=projection["timeout_seconds"],
+                    )
+                    self.linear_agent_workers[project_key] = LinearAgentSessionWorker(
+                        self.ledger, agent_client
+                    )
+                self.preflights.append({
+                    "kind": "linear_agent", "project_key": project_key,
+                    "available": bool(agent_token),
+                    "reason": "configured" if agent_token else "agent token unavailable; using comment fallback",
+                    "token_env": projection["agent_token_env"],
+                })
             self.preflights.append({
                 "kind": "linear", "project_key": project_key,
                 "available": True, "binding_count": len(bindings),
+                "agent_sessions_enabled": projection["agent_sessions_enabled"],
             })
 
     def _build_logfire(self) -> None:
@@ -556,6 +576,10 @@ class FactoryRuntime:
     def _sync_linear_evidence(self) -> None:
         if not self.linear_evidence_workers:
             return
+        agent_workers = getattr(self, "linear_agent_workers", {})
+        linear_projection = self.config.resolve_linear_projection(
+            environment=self.environment
+        ) if hasattr(self, "config") else {"agent_session_url_template": None}
         for run in reversed(self.ledger.list_runs(limit=1000)):
             execution_id = str(run["id"])
             project_key = str(run["project_key"])
@@ -570,6 +594,20 @@ class FactoryRuntime:
             body, digest = render_linear_run_summary(
                 snapshot, projection, self.ledger.run_history(execution_id)
             )
+            agent_worker = agent_workers.get(project_key)
+            if agent_worker:
+                template = str(linear_projection["agent_session_url_template"])
+                marker_url = template.replace("{execution_id}", execution_id)
+                external_urls, activities = build_agent_projection(
+                    snapshot, projection, self.ledger.run_history(execution_id),
+                    marker_url=marker_url,
+                )
+                agent_status = agent_worker.sync(
+                    execution_id, issue_id=issue_id, marker_url=marker_url,
+                    external_urls=external_urls, activities=activities,
+                )
+                if agent_status != "fallback":
+                    continue
             self.ledger.stage_linear_evidence(
                 execution_id, issue_id=issue_id, body=body, digest=digest,
             )
@@ -775,6 +813,7 @@ class FactoryRuntime:
             projection = service.execution_projection(execution_id)
             item = dict(projection["summary"])
             item["linear_evidence"] = projection["linear_evidence"]
+            item["linear_agent_session"] = projection["linear_agent_session"]
             executions.append(item)
         payload: dict[str, Any] = {
             "schema_version": 1,

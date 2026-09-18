@@ -31,6 +31,57 @@ safety gate. Verify the image's linked SQLite version before deploying.
 
 ## Enable and prove
 
+### Render setup
+
+Use `factory/deploy/linear-webhook/render.yaml` as the Blueprint path in the
+reviewed repository. It defines one paid web service, a 1 GB persistent disk at
+`/data`, `/readyz` health checks, and manual deployments. It does not provision
+an agent worker or enable Linear webhooks. Select the reviewed branch/commit
+for a canary; switch to main only after the source PR is merged.
+
+Supply the three requested environment values through Render's secret settings.
+The signing secret must match the Linear app's webhook configuration. Do not put
+the app access token or personal Linear API key on this receipt-only service.
+
+The proposed compute plan is `0.5c-512mb`. Confirm current pricing, persistent
+disk availability and spending approval before creating the service.
+
+Keep the image entrypoint enabled. Verify the mounted `/data` is writable by
+UID/GID 10001; image-layer ownership alone does not prove mounted-disk access.
+The optional root bootstrap prepares only the mount directory and drops all
+privileges before serving. Do not solve a permission failure by running the
+receiver itself as root. Verify a committed receipt survives a restart.
+
+Disk-backed Render services use a single instance and stop the old instance
+before replacement; expect a short deployment outage. Keep receipts separate
+from the coordinator ledger and worker filesystem.
+
+### Suspend and resume
+
+Suspend compute when no Agent Session events are expected. Render leaves the
+persistent receipt disk unchanged, but deliveries sent while suspended are not
+accepted. Resume and check `/readyz` before using Agent Sessions again.
+
+```bash
+export DOTFACTORY_LISTENER_SERVICE_ID=srv-...
+export RENDER_API_KEY=... # shell or secret manager only; never repository config
+PYTHONPATH=factory/src python3 -m dotfactory listener status
+PYTHONPATH=factory/src python3 -m dotfactory listener suspend
+PYTHONPATH=factory/src python3 -m dotfactory listener resume
+```
+
+Each mutation prints an accepted control receipt. Run `status` afterward to
+observe Render's current state; the command never reads or mutates the receipt
+database. Render credentials are sent only to `https://api.render.com` and are
+never included in output or errors.
+
+References: [Blueprints](https://render.com/docs/blueprint-spec),
+[persistent disks](https://render.com/docs/disks),
+[pricing](https://render.com/pricing), and
+[service controls](https://api-docs.render.com/reference/suspend-service-1).
+
+### Live verification
+
 1. Deploy with the correct volume and secret environment; verify `/readyz` is 200.
 2. Set the private OAuth app webhook URL to `https://<host>/webhooks/linear` and
    enable only the Agent session events category. Use the matching signing secret.
