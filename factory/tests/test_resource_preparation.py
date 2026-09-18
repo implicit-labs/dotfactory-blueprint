@@ -165,6 +165,83 @@ class PreparationTests(unittest.TestCase):
     def project(self):
         return {"repository_path": str(self.root / "repository")}
 
+    def install_skill(self, name="proof-skill"):
+        root = self.root / "skills" / name
+        root.mkdir(parents=True)
+        (root / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Preparation proof.\n---\n\nRun it.\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def skill_engine(self):
+        return PreparationEngine(
+            self.ledger, workspace_provider=self.workspace,
+            providers={"fixture": self.provider}, owner_token="factory-owner",
+            skill_directories={"codex": str(self.root / "skills")},
+        )
+
+    def test_missing_skill_fails_before_workspace_creation_and_emits_receipt(self):
+        request = replace(self.request, config={
+            "runner": "codex", "resources": ["alpha"],
+            "skills": ["missing-skill"],
+        })
+        result = self.skill_engine().prepare(
+            request, project=self.project(),
+            preparation_config=self.configuration(),
+        )
+        self.assertEqual("fatal", result.disposition)
+        self.assertIn("missing-skill", result.error["message"])
+        self.assertEqual(0, self.workspace.created)
+        receipt = self.ledger.skill_receipt_for_attempt(request.attempt_id)
+        self.assertEqual("failed", receipt["status"])
+        self.assertEqual(["missing-skill"], receipt["requested"])
+        self.assertEqual(["missing-skill"], receipt["missing"])
+        event = self.ledger.event_for_command(
+            f"skill-receipt:{request.attempt_id}"
+        )
+        self.assertEqual("skill_receipt_failed", event["event_type"])
+        trace = self.ledger.trace_page(request.execution_id, limit=1000)
+        skill_trace = next(item for item in trace if item["domain"] == "skill")
+        self.assertEqual("failed", skill_trace["status"])
+        skill_error = next(
+            item for item in self.ledger.error_page(request.execution_id)
+            if item["domain"] == "skill"
+        )
+        self.assertIn("missing-skill", skill_error["message"])
+
+        self.install_skill("missing-skill")
+        replay = self.skill_engine().prepare(
+            request, project=self.project(),
+            preparation_config=self.configuration(),
+        )
+        self.assertEqual("fatal", replay.disposition)
+        self.assertEqual(0, self.workspace.created)
+        self.assertEqual(receipt, self.ledger.skill_receipt_for_attempt(
+            request.attempt_id
+        ))
+
+    def test_prepared_launch_carries_resolved_skill_and_content_hash(self):
+        self.install_skill()
+        request = replace(self.request, config={
+            "runner": "codex", "resources": ["alpha"],
+            "skills": ["proof-skill"],
+        })
+        result = self.skill_engine().prepare(
+            request, project=self.project(),
+            preparation_config=self.configuration(),
+        )
+        self.assertEqual("ready", result.disposition)
+        self.assertEqual(("proof-skill",), tuple(
+            skill.name for skill in result.launch.skills
+        ))
+        self.assertEqual(64, len(result.launch.skills[0].content_hash))
+        prepared = self.ledger.preparation(result.launch.preparation_id)["prepared"]
+        self.assertEqual(
+            result.launch.skills[0].content_hash,
+            prepared["skills"][0]["content_hash"],
+        )
+
     def test_ready_launch_is_immutable_and_redacts_persistence(self):
         result = self.engine.prepare(
             self.request, project=self.project(),

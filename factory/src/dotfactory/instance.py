@@ -435,7 +435,7 @@ def _validate_runners(values: dict[str, Any]) -> None:
         "kind", "command", "minimum_version", "permission_mode", "profile",
         "default_model", "default_reasoning_effort",
         "capabilities", "environment_envs", "silence_timeout_seconds",
-        "disabled_mcp_servers",
+        "disabled_mcp_servers", "skill_directory",
         "termination_grace_seconds", "maximum_frame_bytes",
         "maximum_reassembled_frame_bytes", "maximum_events",
         "maximum_payload_bytes",
@@ -462,6 +462,13 @@ def _validate_runners(values: dict[str, Any]) -> None:
                 not isinstance(runner[key], str) or not runner[key].strip()
             ):
                 raise FactoryConfigError(f"{path}.{key} must be a non-empty string")
+        if "skill_directory" in runner and (
+            not isinstance(runner["skill_directory"], str)
+            or not runner["skill_directory"].strip()
+        ):
+            raise FactoryConfigError(
+                f"{path}.skill_directory must be a non-empty path"
+            )
         capabilities = runner.get("capabilities", [])
         if not isinstance(capabilities, list) or any(
             not isinstance(item, str) or not PROJECT_KEY.fullmatch(item)
@@ -821,9 +828,18 @@ class FactoryConfig:
             },
         }
 
-    def resolve_runners(self) -> dict[str, dict[str, Any]]:
+    def resolve_runners(
+        self, *, environment: dict[str, str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
         if self.values["schema_version"] < 6:
             return {}
+        environment = os.environ if environment is None else environment
+        home = Path(environment.get("HOME", str(Path.home()))).expanduser()
+        defaults = {
+            "codex": home / ".agents" / "skills",
+            "claude-code": home / ".claude" / "skills",
+            "omp-rpc": home / ".omp" / "agent" / "skills",
+        }
         result = {}
         for name, value in self.values["runners"].items():
             kind = str(value["kind"])
@@ -834,8 +850,21 @@ class FactoryConfig:
                 }
                 if kind == "codex" else {}
             )
+            configured = value.get("skill_directory")
+            if configured:
+                raw_directory = str(configured)
+                candidate = (
+                    home / raw_directory[2:]
+                    if raw_directory.startswith("~/") else Path(raw_directory)
+                )
+                directory = (
+                    candidate if candidate.is_absolute()
+                    else self.path.parent / candidate
+                ).resolve()
+            else:
+                directory = defaults[str(value["kind"])].resolve()
             result[str(name)] = {
-                "name": str(name), "kind": kind,
+                "name": str(name), "kind": str(value["kind"]),
                 "command": str(value["command"]),
                 "minimum_version": str(value["minimum_version"]),
                 "permission_mode": str(value["permission_mode"]),
@@ -868,6 +897,7 @@ class FactoryConfig:
                 "maximum_payload_bytes": int(
                     value.get("maximum_payload_bytes", 256 * 1024)
                 ),
+                "skill_directory": str(directory),
             }
         return result
 

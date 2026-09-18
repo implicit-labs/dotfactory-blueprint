@@ -53,6 +53,11 @@ build -> build [on=retry]
 build -> canceled [on=exhausted]
 ```
 
+Each declared skill must exist as `<skill_directory>/<name>/SKILL.md` for the
+selected runner. Configure `skill_directory` in that runner's
+`factory/factory.json` entry when its installed catalog is not at the harness
+default. Missing names fail before runner launch.
+
 The exhaustion edge selects the destination. Put repeated settings in a named
 JSON profile and reference it with `profile=builder`; a node value wins over its
 profile. Workflow-wide `node [...]` defaults win over factory defaults and lose
@@ -164,3 +169,12 @@ hooks, session history, and per-project trust outside the repository.
 Each capability owns its instructions, deterministic implementation,
 integration guidance, and offline tests under `skills/<goal>/`. A capability is
 portable only when another repository can install it using that folder alone.
+
+## Declared skill presentation
+
+The installed catalog defaults to `~/.agents/skills` for Codex,
+`~/.claude/skills` for Claude Code, and `~/.omp/agent/skills` for OMP.
+Preparation resolves and hashes each declared package before workspace or resource
+mutation. Missing names fail through the workflow's `failed` edge. The runner
+records an attempt-scoped receipt after writing its protocol input; this proves
+presentation, not behavioral compliance.

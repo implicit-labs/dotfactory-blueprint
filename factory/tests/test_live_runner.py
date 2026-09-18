@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -15,6 +16,7 @@ from dotfactory import (
     LiveRunner, LiveRunnerRouter, OmpRpcAdapter, OmpRpcFrameDecoder,
     PreparedLaunch, Principal, RunnerExecutionError, RunnerNeedsAttention,
     RunnerProtocolError, RunnerProviderError, RunnerRoute, SQLiteLedger,
+    SkillResolver,
 )
 from dotfactory.ledger import StaleAttempt
 from dotfactory.observability import stable_trace_id
@@ -87,6 +89,142 @@ class LiveRunnerTests(unittest.TestCase):
         )
         path.chmod(0o700)
         return path
+
+    def launch_with_skill(self, runner):
+        _kernel, execution, launch = self.launch(runner)
+        installed = self.root / f"{runner}-skills" / "proof-skill"
+        installed.mkdir(parents=True)
+        (installed / "SKILL.md").write_text(
+            "---\nname: proof-skill\ndescription: Protocol proof.\n---\n\n"
+            "Emit the proof.\n",
+            encoding="utf-8",
+        )
+        launch.request.config["skills"] = ["proof-skill"]
+        skills = SkillResolver(installed.parent).resolve(["proof-skill"])
+        return execution, replace(launch, skills=skills)
+
+    def capture_skill_protocol(self, runner, fixture):
+        _execution, launch = self.launch_with_skill(runner)
+        capture = self.root / f"{runner}-skill-protocol.json"
+        lines = self.lines(fixture)
+        if runner == "omp":
+            body = f"""
+                import json
+                import pathlib
+                import sys
+
+                frames = [json.loads(sys.stdin.readline()), json.loads(sys.stdin.readline())]
+                pathlib.Path({str(capture)!r}).write_text(json.dumps({{
+                    "argv": sys.argv[1:], "frames": frames,
+                }}))
+                for line in {lines!r}:
+                    sys.stdout.write(line + "\\n")
+                    sys.stdout.flush()
+            """
+        else:
+            body = f"""
+                import json
+                import pathlib
+                import sys
+
+                payload = sys.stdin.read()
+                pathlib.Path({str(capture)!r}).write_text(json.dumps({{
+                    "argv": sys.argv[1:], "stdin": payload,
+                }}))
+                for line in {lines!r}:
+                    sys.stdout.write(line + "\\n")
+                    sys.stdout.flush()
+            """
+        executable = self.executable(body, name=f"{runner}-skill-runner")
+        base = self.routes()[runner]
+        route = replace(base, command=str(executable), disabled_mcp_servers=())
+        result = LiveRunner(
+            self.ledger, routes={runner: route},
+            observed_versions={runner: route.minimum_version},
+            environment={"HOME": str(self.root), "PATH": os.environ["PATH"]},
+        ).run(launch)
+        self.assertEqual("succeeded", result.outcome)
+        captured = json.loads(capture.read_text(encoding="utf-8"))
+        receipt = self.ledger.skill_receipt_for_attempt(launch.request.attempt_id)
+        self.assertEqual("presented", receipt["status"])
+        self.assertEqual("proof-skill", receipt["resolved"][0]["name"])
+        self.assertEqual(64, len(receipt["resolved"][0]["content_hash"]))
+        if runner == "omp":
+            payload = (
+                "\n".join(
+                    json.dumps(frame, sort_keys=True)
+                    for frame in captured["frames"]
+                ) + "\n"
+            )
+        else:
+            payload = captured["stdin"]
+        self.assertEqual(
+            hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            receipt["presented"]["input_sha256"],
+        )
+        event = self.ledger.event_for_command(
+            f"skill-receipt:{launch.request.attempt_id}"
+        )
+        self.assertEqual("skill_receipt_presented", event["event_type"])
+        durable = self.ledger.runner_run_for_attempt(launch.request.attempt_id)
+        self.assertEqual(receipt, durable["receipt"]["skill_receipt"])
+        return captured, receipt
+
+    def test_codex_protocol_capture_presents_declared_skill(self):
+        captured, receipt = self.capture_skill_protocol(
+            "codex", "codex-0.147.0-success.jsonl",
+        )
+        self.assertIn("$proof-skill", captured["stdin"])
+        self.assertIn(receipt["resolved"][0]["entrypoint"], captured["stdin"])
+        self.assertEqual(
+            "codex-explicit-skill-reference",
+            receipt["presented"]["mechanism"],
+        )
+
+    def test_claude_protocol_capture_presents_declared_skill(self):
+        captured, receipt = self.capture_skill_protocol(
+            "claude", "claude-2.1.251-success.jsonl",
+        )
+        flag = captured["argv"].index("--allowedTools")
+        self.assertEqual("Skill(proof-skill)", captured["argv"][flag + 1])
+        self.assertIn("proof-skill", captured["stdin"])
+        self.assertEqual(
+            "claude-skill-tool-allowlist",
+            receipt["presented"]["mechanism"],
+        )
+
+    def test_omp_protocol_capture_presents_declared_skill(self):
+        captured, receipt = self.capture_skill_protocol(
+            "omp", "omp-18.0.4-success.jsonl",
+        )
+        self.assertIn("--skills=proof-skill", captured["argv"])
+        self.assertEqual("negotiate_protocol", captured["frames"][0]["type"])
+        prompt = captured["frames"][1]["message"]
+        self.assertIn('<factory_skill name="proof-skill"', prompt)
+        self.assertIn("Emit the proof.", prompt)
+        self.assertIn(receipt["resolved"][0]["content_hash"], prompt)
+        self.assertEqual(
+            "omp-inline-skill-content", receipt["presented"]["mechanism"],
+        )
+
+    def test_declared_skill_records_failed_receipt_when_payload_is_not_presented(self):
+        _execution, launch = self.launch_with_skill("codex")
+        route = replace(
+            self.routes()["codex"], command=str(self.root / "missing-codex"),
+            disabled_mcp_servers=(),
+        )
+        runner = LiveRunner(
+            self.ledger, routes={"codex": route},
+            observed_versions={"codex": route.minimum_version},
+            environment={"HOME": str(self.root), "PATH": os.environ["PATH"]},
+        )
+        with self.assertRaises(RunnerExecutionError):
+            runner.run(launch)
+        receipt = self.ledger.skill_receipt_for_attempt(launch.request.attempt_id)
+        self.assertEqual("failed", receipt["status"])
+        self.assertEqual([], receipt["missing"])
+        self.assertEqual("skill-presentation", receipt["error"]["category"])
+        self.assertNotIn("presented", receipt)
 
     def routes(self):
         return {
@@ -1109,7 +1247,8 @@ class RunnerConfigurationTests(unittest.TestCase):
 
     def test_schema_six_resolves_runner_registry(self):
         config = FactoryConfig.load(self.write())
-        runners = config.resolve_runners()
+        home = self.root / "home"
+        runners = config.resolve_runners(environment={"HOME": str(home)})
         self.assertEqual("omp-rpc", runners["omp"]["kind"])
         self.assertEqual("dotfactory-claude-api", runners["omp"]["profile"])
         self.assertEqual(
@@ -1121,6 +1260,18 @@ class RunnerConfigurationTests(unittest.TestCase):
             "medium", runners["codex"]["default_reasoning_effort"]
         )
         self.assertIsNone(runners["claude"]["default_model"])
+        self.assertEqual(
+            str((home / ".agents" / "skills").resolve()),
+            runners["codex"]["skill_directory"],
+        )
+        self.assertEqual(
+            str((home / ".claude" / "skills").resolve()),
+            runners["claude"]["skill_directory"],
+        )
+        self.assertEqual(
+            str((home / ".omp" / "agent" / "skills").resolve()),
+            runners["omp"]["skill_directory"],
+        )
         self.assertEqual("codex", config.validate_runner_name("codex"))
 
     def test_invalid_runner_registry_blocks_activation(self):
@@ -1128,6 +1279,7 @@ class RunnerConfigurationTests(unittest.TestCase):
             ("kind", "unknown"), ("command", ""),
             ("capabilities", ["Bad Name"]),
             ("default_model", ""), ("default_reasoning_effort", ""),
+            ("skill_directory", ""),
         ):
             with self.subTest(key=key):
                 original = self.values["runners"]["codex"][key]

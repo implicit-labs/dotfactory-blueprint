@@ -70,6 +70,32 @@ class FakePreparation:
                 status="failed", error={"message": "fixture fatal"},
             )
             return PreparationResult("fatal", error={"message": "fixture fatal"})
+        if disposition == "skill-fatal":
+            self.ledger.record_skill_receipt(
+                request.attempt_id, fence_token=request.fence_token,
+                receipt={
+                    "schema_version": 1, "status": "failed",
+                    "attempt_id": request.attempt_id,
+                    "preparation_id": preparation["id"], "runner": "codex",
+                    "requested": ["missing-skill"], "resolved": [],
+                    "missing": ["missing-skill"],
+                    "error": {
+                        "message": "declared skills are not installed: missing-skill",
+                        "category": "skill-resolution",
+                    },
+                },
+            )
+            self.ledger.fail_preparation(
+                preparation["id"], fence_token=request.fence_token,
+                status="failed", error={
+                    "message": "declared skills are not installed: missing-skill",
+                    "category": "skill-resolution",
+                },
+            )
+            return PreparationResult("fatal", error={
+                "message": "declared skills are not installed: missing-skill",
+                "category": "skill-resolution", "missing": ["missing-skill"],
+            })
         if preparation["status"] in ("failed", "busy"):
             preparation = self.ledger.resume_preparation(
                 preparation["id"], fence_token=request.fence_token,
@@ -244,6 +270,25 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual("Autoplanning", self.ledger.current(execution)["current_state_id"])
             attention = self.ledger.attention(tick.detail["attention_id"])
             self.assertEqual("open", attention["status"])
+
+    def test_missing_skill_fails_attempt_with_receipt_and_never_launches(self):
+        kernel, execution, claim = self.work("TEST-SKILL")
+        preparation = FakePreparation(self.ledger, ["skill-fatal"])
+        runner = FakePreparedRunner([])
+        tick = self.scheduler(kernel, preparation, runner).tick()
+        self.assertEqual("failed", tick.disposition)
+        self.assertEqual("skill-resolution", tick.detail["category"])
+        self.assertEqual("Investigating", self.ledger.current(
+            execution
+        )["current_state_id"])
+        attempt = dict(self.ledger.connection.execute(
+            "SELECT * FROM attempts WHERE id=?", (claim["attempt_id"],)
+        ).fetchone())
+        self.assertEqual("completed", attempt["status"])
+        self.assertEqual("failed to resolve declared skills", attempt["outcome"])
+        self.assertEqual([], runner.launches)
+        receipt = self.ledger.skill_receipt_for_attempt(claim["attempt_id"])
+        self.assertEqual(["missing-skill"], receipt["missing"])
 
     def test_durable_terminal_runner_failure_follows_failed_graph_edge(self):
         kernel, execution, _claim = self.work("TASK-RUNNER-FAIL")

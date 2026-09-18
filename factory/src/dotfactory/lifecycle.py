@@ -95,9 +95,12 @@ def _ledger_path(config: FactoryConfig) -> Path:
     return candidate.resolve()
 
 
-def _runner_routes(config: FactoryConfig) -> dict[str, RunnerRoute]:
+def _runner_routes(
+    config: FactoryConfig, *, environment: dict[str, str] | None = None,
+) -> dict[str, RunnerRoute]:
     return {
-        name: RunnerRoute(**values) for name, values in config.resolve_runners().items()
+        name: RunnerRoute(**values)
+        for name, values in config.resolve_runners(environment=environment).items()
     }
 
 
@@ -145,7 +148,7 @@ class FactoryRuntime:
             self.logfire_worker: LogfireProjectionWorker | None = None
             self.preflights: list[dict[str, Any]] = []
             self._build_projects()
-            routes = _runner_routes(config)
+            routes = _runner_routes(config, environment=self.environment)
             if control_only:
                 runner = LiveRunner(
                     self.ledger, routes=routes, environment=self.environment,
@@ -219,6 +222,12 @@ class FactoryRuntime:
             raise
 
     def _build_projects(self) -> None:
+        skill_directories = {
+            name: str(values["skill_directory"])
+            for name, values in self.config.resolve_runners(
+                environment=self.environment
+            ).items()
+        }
         for project_key in self.project_keys:
             project = self.config.resolve_project(
                 project_key, environment=self.environment
@@ -256,6 +265,7 @@ class FactoryRuntime:
             engine = PreparationEngine(
                 self.ledger, workspace_provider=GitWorkspaceProvider(),
                 providers=providers, owner_token=self.owner,
+                skill_directories=skill_directories,
             )
             self.kernels[project_key] = kernel
             self.engines[project_key] = engine

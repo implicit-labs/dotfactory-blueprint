@@ -85,7 +85,10 @@ Repository-backed attempts use `PreparationEngine` before live dispatch. It
 creates or reconciles one issue-named worktree per execution, expands logical
 resource names, journals external mutations, compensates partial setup, and
 returns immutable `PreparedLaunch`. Live runner adapters never receive a raw
-`RunnerRequest`.
+`RunnerRequest`. Declared skills resolve from the selected runner's installed
+catalog before other preparation. `PreparedLaunch` binds their paths and
+content hashes; the adapter emits a durable `skill_receipt` when its protocol
+payload is presented. Missing names fail the attempt without launching a runner.
 
 Every observed Linear status change is compared with the run's snapshotted
 workflow. An allowed human move is committed; a premature, unknown, or ambiguous

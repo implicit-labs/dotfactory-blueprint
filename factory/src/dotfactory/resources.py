@@ -12,6 +12,7 @@ from typing import Any, Mapping, Protocol
 from .kernel import DurableKernel
 from .ledger import LedgerError, ResourceBusy, SQLiteLedger, parse_timestamp
 from .runner import RunnerRequest, RunnerResult
+from .skills import ResolvedSkill, SkillResolutionError, SkillResolver
 from .workspace import (
     GitWorkspaceProvider, WorkspaceConflict, WorkspaceHandle, WorkspaceUnsafeCleanup,
 )
@@ -91,6 +92,7 @@ class PreparedLaunch:
     commands: tuple[tuple[str, ...], ...]
     urls: tuple[str, ...]
     allocation_ids: tuple[str, ...]
+    skills: tuple[ResolvedSkill, ...] = ()
 
     def environment_dict(self) -> dict[str, str]:
         return dict(self.environment)
@@ -141,12 +143,14 @@ class PreparationEngine:
     def __init__(
         self, ledger: SQLiteLedger, *, workspace_provider: GitWorkspaceProvider,
         providers: Mapping[str, ResourceProvider], owner_token: str,
+        skill_directories: Mapping[str, str] | None = None,
         fault_hook: Any | None = None,
     ) -> None:
         self.ledger = ledger
         self.workspace_provider = workspace_provider
         self.providers = dict(providers)
         self.owner_token = owner_token
+        self.skill_directories = dict(skill_directories or {})
         self.fault_hook = fault_hook
         self._activations: dict[str, ProviderActivation] = {}
 
@@ -348,6 +352,40 @@ class PreparationEngine:
         self._activations[allocation_id] = activation
         return activation
 
+    def _resolve_skills(self, request: RunnerRequest) -> tuple[ResolvedSkill, ...]:
+        requested = request.config.get("skills", [])
+        if not isinstance(requested, list) or any(
+            not isinstance(item, str) or not item for item in requested
+        ):
+            raise SkillResolutionError(
+                "declared skills must be an array of names", requested=(),
+            )
+        if not requested:
+            return ()
+        runner = request.config.get("runner")
+        directory = self.skill_directories.get(str(runner))
+        if not directory:
+            names = tuple(dict.fromkeys(requested))
+            raise SkillResolutionError(
+                "declared skills have no installed directory for runner "
+                f"{runner}: " + ", ".join(names),
+                requested=names, missing=names,
+            )
+        return SkillResolver(directory).resolve(requested)
+
+    @staticmethod
+    def _prepared_skills(preparation: Mapping[str, Any]) -> tuple[ResolvedSkill, ...]:
+        prepared = preparation.get("prepared")
+        if not isinstance(prepared, Mapping):
+            return ()
+        entries = prepared.get("skills", [])
+        if not isinstance(entries, list):
+            raise PreparationError("prepared skill resolution is invalid")
+        try:
+            return tuple(ResolvedSkill(**dict(item)) for item in entries)
+        except (TypeError, ValueError) as error:
+            raise PreparationError("prepared skill resolution is invalid") from error
+
     def _launch(
         self, request: RunnerRequest, preparation: Mapping[str, Any],
         workspace: WorkspaceHandle,
@@ -372,6 +410,7 @@ class PreparationEngine:
             branch_name=workspace.branch_name,
             environment=tuple(sorted(environment)), commands=tuple(commands),
             urls=tuple(sorted(urls)), allocation_ids=tuple(allocation_ids),
+            skills=self._prepared_skills(preparation),
         )
 
     def prepare(
@@ -388,6 +427,42 @@ class PreparationEngine:
             attempt_id=request.attempt_id, fence_token=request.fence_token,
             request_digest=request_digest,
         )
+        prior_error = preparation.get("error")
+        if (
+            preparation["status"] == "failed"
+            and isinstance(prior_error, Mapping)
+            and prior_error.get("category") == "skill-resolution"
+        ):
+            return PreparationResult("fatal", error=dict(prior_error))
+        try:
+            resolved_skills = self._resolve_skills(request)
+        except SkillResolutionError as error:
+            receipt = {
+                "schema_version": 1, "status": "failed",
+                "attempt_id": request.attempt_id,
+                "preparation_id": str(preparation["id"]),
+                "runner": str(request.config.get("runner") or ""),
+                "requested": list(error.requested),
+                "resolved": [item.as_dict() for item in error.resolved],
+                "missing": list(error.missing),
+                "error": {"message": str(error), "category": "skill-resolution"},
+            }
+            self.ledger.record_skill_receipt(
+                request.attempt_id, fence_token=request.fence_token,
+                receipt=receipt,
+            )
+            if preparation["status"] != "failed":
+                self.ledger.fail_preparation(
+                    str(preparation["id"]), fence_token=request.fence_token,
+                    status="failed", error={
+                        "message": str(error), "category": "skill-resolution",
+                        "missing": list(error.missing),
+                    },
+                )
+            return PreparationResult("fatal", error={
+                "message": str(error), "category": "skill-resolution",
+                "missing": list(error.missing),
+            })
         if preparation["status"] == "ready":
             try:
                 workspace = self._workspace(
@@ -518,6 +593,7 @@ class PreparationEngine:
                 ),
                 "urls": sorted(url for _, activation in activated for url in activation.urls),
                 "allocation_ids": [str(item[0]["id"]) for item in activated],
+                "skills": [item.as_dict() for item in resolved_skills],
             }
             result_digest = _digest(prepared_view)
             preparation = self.ledger.mark_preparation_ready(
