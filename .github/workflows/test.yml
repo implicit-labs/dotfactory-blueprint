@@ -28,3 +28,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: /bin/bash skills/stable-local-services/test.sh
+
+  worker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned native worker image and verify disk restart
+        run: /bin/bash factory/deploy/owned-worker/test-image.sh

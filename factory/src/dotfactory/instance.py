@@ -566,6 +566,12 @@ class FactoryConfig:
         _validate_projects(values.get("projects"), workflow_names)
         _validate_scheduler(values)
         _validate_runners(values)
+        if "execution" in values:
+            from .execution import validate_policy
+            try:
+                validate_policy(values["execution"])
+            except (ValueError, TypeError) as error:
+                raise FactoryConfigError(str(error)) from error
         _validate_projections(values)
         return cls(resolved, values)
 

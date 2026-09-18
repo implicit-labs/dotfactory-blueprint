@@ -1,0 +1,16 @@
+# One on-demand worker. Explicitly suspend in Render after work; idle is billed.
+# Applying starts the service. It can host one coordinator plus local coding stages.
+services:
+  - type: worker
+    name: dotfactory-coding-worker
+    runtime: docker
+    plan: 1c-2g
+    region: virginia
+    dockerfilePath: ./factory/deploy/owned-worker/Dockerfile
+    dockerContext: .
+    autoDeployTrigger: "off"
+    numInstances: 1
+    disk:
+      name: worker-state
+      mountPath: /data
+      sizeGB: 10

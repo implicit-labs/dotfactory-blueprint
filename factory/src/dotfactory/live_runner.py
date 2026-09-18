@@ -1016,8 +1016,10 @@ class LiveRunner:
         run_command: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         kill_process_group: Callable[[int, int], None] = os.killpg,
         host_id: str | None = None, boot_id: str | None = None,
+        execution: Any = None,
     ) -> None:
         self.ledger = ledger
+        self.execution = execution
         self.router = LiveRunnerRouter(ledger, routes)
         self.observed_versions = dict(observed_versions or {})
         self.environment = dict(os.environ if environment is None else environment)
@@ -1070,6 +1072,15 @@ class LiveRunner:
             for key in self.BASE_ENVIRONMENT if self.environment.get(key)
         }
         sensitive = []
+        if self.execution is not None:
+            record = self.execution.record(launch.request)
+            if record["worker_config"]["transport"] == "local":
+                from .worker import environment
+                child = environment(record["worker_config"]["billing"], route.kind, route.environment_envs)
+                sensitive = [value for key, value in child.items() if key in route.environment_envs
+                             or any(word in key for word in ("TOKEN", "KEY", "SECRET", "PASSWORD"))]
+                return child, tuple(sensitive)
+            return child, ()
         for key in route.environment_envs:
             value = self.environment.get(key)
             if not value:
@@ -1090,12 +1101,16 @@ class LiveRunner:
             return route
         child_environment, sensitive = self._child_environment(route, launch)
         try:
-            result = self.run_command(
-                [route.command, "mcp", "list", "--json"],
-                cwd=launch.workspace_path, env=child_environment,
-                check=False, text=True, timeout=MCP_DISCOVERY_TIMEOUT_SECONDS,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
+            if self.execution is not None:
+                output = self.execution.run_command(launch, [route.command, "mcp", "list", "--json"])
+                result = subprocess.CompletedProcess([], 0, output, "")
+            else:
+                result = self.run_command(
+                    [route.command, "mcp", "list", "--json"],
+                    cwd=launch.workspace_path, env=child_environment,
+                    check=False, text=True, timeout=MCP_DISCOVERY_TIMEOUT_SECONDS,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
         except subprocess.TimeoutExpired as error:
             raise RunnerProtocolError(
                 "Codex MCP configuration discovery timed out after "
@@ -1342,7 +1357,12 @@ class LiveRunner:
     def run(self, launch: PreparedLaunch) -> RunnerResult:
         if not isinstance(launch, PreparedLaunch):
             raise PreparationError("live runner requires PreparedLaunch")
-        route, adapter = self.router.route(launch)
+        if self.execution is not None:
+            self.ledger.assert_attempt_active(launch.request.attempt_id, launch.request.fence_token)
+            route = RunnerRoute(**self.execution.record(launch.request)["route"])
+            adapter = ADAPTERS[route.kind]
+        else:
+            route, adapter = self.router.route(launch)
         existing = self.ledger.runner_run_for_attempt(launch.request.attempt_id)
         if existing and existing["status"] == "result_ready":
             self.ledger.assert_attempt_active(
@@ -1438,7 +1458,8 @@ class LiveRunner:
         skill_presentation: AdapterSkillPresentation | None,
         skill_receipt: dict[str, Any] | None,
     ) -> RunnerResult:
-        version = self._version(route)
+        version = (self.execution.record(launch.request)["report"]["version"]
+                   if self.execution is not None else self._version(route))
         route = self._resolve_workspace_integrations(route, launch)
         prompt = self._prompt(launch, route)
         session_id = (
@@ -1522,6 +1543,12 @@ class LiveRunner:
                 launch.request.attempt_id, launch.request.fence_token
             )
             child_environment, sensitive = self._child_environment(route, launch)
+            payload = adapter.input_payload(
+                launch, prompt_text=prompt, session_id=session_id,
+                skill_presentation=skill_presentation,
+            )
+            if self.execution is not None:
+                command, payload = self.execution.invocation(launch, command, payload)
             process = self.popen(
                 command, cwd=launch.workspace_path, env=child_environment,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1533,10 +1560,6 @@ class LiveRunner:
                 pid=process.pid, process_group_id=process.pid,
             )
             phase = "running"
-            payload = adapter.input_payload(
-                launch, prompt_text=prompt, session_id=session_id,
-                skill_presentation=skill_presentation,
-            )
             if len(payload) > route.maximum_reassembled_frame_bytes:
                 raise RunnerProtocolError("runner input exceeds the byte limit")
             if not process.stdin:
@@ -1698,6 +1721,8 @@ class LiveRunner:
 
             while True:
                 now = self.monotonic()
+                if self.execution is not None:
+                    self.execution.renew(launch)
                 if self.cancel_requested(str(run["id"])):
                     raise RunnerCanceled("runner cancellation was requested")
                 wall_seconds = _duration_seconds(
@@ -1767,6 +1792,10 @@ class LiveRunner:
                 )
             if not terminal_seen:
                 raise RunnerProtocolError("runner stream has no terminal event")
+            if self.execution is not None:
+                # Transport provenance is journaled by accept() and projected from
+                # worker_handoffs. Delivery contracts validate only agent file evidence.
+                self.execution.accept(launch)
             self.ledger.assert_attempt_active(
                 launch.request.attempt_id, launch.request.fence_token
             )
@@ -1808,12 +1837,16 @@ class LiveRunner:
             self._fault("after_runner_result_commit")
             return receipt.result
         except RunnerNeedsAttention:
+            if self.execution is not None:
+                self.execution.cancel(launch)
             self._terminate(
                 process, adapter=adapter, route=route,
                 runner_run_id=str(run["id"]),
             )
             raise
         except StaleAttempt as error:
+            if self.execution is not None:
+                self.execution.cancel(launch)
             self._terminate(
                 process, adapter=adapter, route=route,
                 runner_run_id=str(run["id"]),
@@ -1826,6 +1859,8 @@ class LiveRunner:
                 pass
             raise
         except Exception as error:
+            if self.execution is not None:
+                self.execution.cancel(launch)
             self._terminate(
                 process, adapter=adapter, route=route,
                 runner_run_id=str(run["id"]),

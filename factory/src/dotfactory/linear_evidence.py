@@ -278,6 +278,12 @@ def render_linear_run_summary(
         f"`{_scrub(trace['trace_id'], 160)}`",
         f"- **Workspace:** `{_scrub(workspace_status, 120)}`",
         f"- **Attention:** {len(attention)} open",
+        *[
+            f"- **Worker:** `{_scrub(item['state'], 80)}` → `{_scrub(item['worker'], 80)}` "
+            f"· {worker_location_label(item.get('location', 'unknown'))} · {_scrub(item['status'], 40)}"
+            + (f" · commit `{_scrub(item['output_sha'], 64)}`" if item.get("output_sha") else "")
+            for item in snapshot.get("worker_handoffs", [])[-20:]
+        ],
         "", "### Delivery facts", "",
         f"- **Runner / version:** {runner_phrase}",
         f"- **Changed artifacts:** {artifact_phrase}",
@@ -333,6 +339,11 @@ def render_linear_run_summary(
     )
     body = visible + "\n\n" + marker
     return body, hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def worker_location_label(location: str) -> str:
+    """Operator-declared physical placement, independent of transport."""
+    return {"local": "💻 Local", "cloud": "☁️ Cloud"}.get(location, "Location unknown")
 
 
 class LinearEvidenceWorker:

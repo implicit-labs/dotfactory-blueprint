@@ -311,3 +311,7 @@ planning, frozen checks, implementation, and final Review. `doctor` checks local
 readiness without starting work. `status` reads active or stopped executions.
 Use [the local HTTP gateway](../factory/CONTROL_API.md#run-the-local-http-gateway)
 to serve the existing control API; setup remains CLI-only.
+
+## Proposed hosted worker support
+
+Configure optional [owned workers](../factory/CLOUD_EXECUTION.md) for stage-specific local or cloud execution. Provisioning and native sign-in are explicit operator steps; complete the documented live checks before relying on a hosted worker.

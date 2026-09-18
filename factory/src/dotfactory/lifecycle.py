@@ -151,6 +151,14 @@ class FactoryRuntime:
             self.preflights: list[dict[str, Any]] = []
             self._build_projects()
             routes = _runner_routes(config, environment=self.environment)
+            self.execution = None
+            if config.values.get("execution"):
+                from .execution import ExecutionManager, WorkerPreparation
+                self.execution = ExecutionManager(self.ledger, config.values["execution"], routes)
+                self.projects = {
+                    key: ScheduledProject(value.kernel, WorkerPreparation(value.preparation, self.execution))
+                    for key, value in self.projects.items()
+                }
             if control_only:
                 runner = LiveRunner(
                     self.ledger, routes=routes, environment=self.environment,
@@ -162,6 +170,14 @@ class FactoryRuntime:
                     "reason": "external runner preflight skipped",
                     "capabilities": [],
                 })
+            elif runner is None and self.execution is not None:
+                runner = LiveRunner(
+                    self.ledger, routes=routes, environment=self.environment,
+                    cancel_requested=self._runner_cancel_requested,
+                    execution=self.execution,
+                )
+                self.preflights.append({"kind": "worker", "available": None,
+                                        "reason": "worker requirements checked before each stage"})
             elif runner is None:
                 router = LiveRunnerRouter(self.ledger, routes)
                 reports = router.preflight_all()
@@ -503,6 +519,7 @@ class FactoryRuntime:
                 "url": issue.get("url"), "linear_issue_id": issue["id"],
                 "description": issue.get("description") or "",
                 "source_revision": issue.get("updatedAt"),
+
             })
         if not isinstance(intent["description"], str) or len(intent["description"]) > 65536:
             raise LifecycleError("issue description must be text of at most 65536 characters")
@@ -521,7 +538,7 @@ class FactoryRuntime:
             self._sync_linear_evidence()
         return execution_id
 
-    def discover_issue(self, project_key: str) -> dict[str, Any]:
+    def discover_issue(self, project_key: str, *, allow_empty: bool = False) -> dict[str, Any] | None:
         worker = self.linear_workers.get(project_key)
         if not worker:
             raise LifecycleError(
@@ -543,6 +560,8 @@ class FactoryRuntime:
             identifier = str(issue.get("identifier", ""))
             if identifier and not self._has_execution(project_key, identifier):
                 return issue
+        if allow_empty:
+            return None
         raise LifecycleError(
             f"no eligible Linear issue is available for {project_key}"
         )

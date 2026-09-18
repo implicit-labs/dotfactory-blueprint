@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 from .ledger import LedgerError, SQLiteLedger, redact_payload
 from .linear_api import LinearAPIError, LinearGraphQLClient
-from .linear_evidence import readable_incidents, render_linear_run_summary
+from .linear_evidence import readable_incidents, render_linear_run_summary, worker_location_label
 from .observability import canonical_json
 
 
@@ -92,6 +92,23 @@ def build_agent_projection(
             "content": {
                 "type": "thought",
                 "body": f"Workflow reached `{state_id}` — {status}.",
+            },
+        })
+
+    # A separate immutable activity can arrive after the state-start event.
+    # Never infer physical placement from transport or mutable current config.
+    for handoff in list(snapshot.get("worker_handoffs") or [])[-60:]:
+        if not handoff.get("attempt_id"):
+            continue
+        activities.append({
+            "semantic_key": f"worker-location:{handoff['attempt_id']}",
+            "content": {
+                "type": "thought",
+                "body": (
+                    f"{worker_location_label(handoff.get('location', 'unknown'))} · "
+                    f"`{_safe(handoff.get('state'), 120)}` · "
+                    f"worker `{_safe(handoff.get('worker'), 80)}`."
+                ),
             },
         })
 
