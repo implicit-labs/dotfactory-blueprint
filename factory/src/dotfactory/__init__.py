@@ -22,12 +22,13 @@ from .datasets import (
     score_execution_case, write_dataset_bundle,
 )
 from .live_runner import (
-    ClaudeCodeAdapter, CodexAdapter, LiveRunner, LiveRunnerRouter,
+    AdapterSkillPresentation, ClaudeCodeAdapter, CodexAdapter, LiveRunner, LiveRunnerRouter,
     OmpRpcAdapter, OmpRpcFrameDecoder, RunnerCapabilityReport, RunnerCanceled,
     RunnerEvent, RunnerExecutionError, RunnerProtocolError, RunnerProviderError,
     RunnerReceipt,
     RunnerRoute, RunnerTimedOut,
 )
+from .skills import ResolvedSkill, SkillResolutionError, SkillResolver
 from .lifecycle import FactoryRuntime, InstanceLock, LifecycleError, LifecycleReceipt
 from .resources import (
     FakePreparedRunner, PreparationEngine, PreparationError, PreparationResult,
@@ -63,7 +64,8 @@ __all__ = [
     "FakePreparedRunner", "ObservationService", "PreparationEngine",
     "PreparationError", "PreparationResult", "PreparedLaunch", "Principal",
     "RunnerRequest", "RunnerResult",
-    "ClaudeCodeAdapter", "CodexAdapter", "LiveRunner", "LiveRunnerRouter",
+    "AdapterSkillPresentation", "ClaudeCodeAdapter", "CodexAdapter", "LiveRunner",
+    "LiveRunnerRouter",
     "OmpRpcAdapter", "OmpRpcFrameDecoder", "RunnerCapabilityReport",
     "RunnerCanceled", "RunnerEvent", "RunnerExecutionError",
     "RunnerNeedsAttention", "RunnerProtocolError", "RunnerProviderError",
@@ -72,6 +74,7 @@ __all__ = [
     "ProjectPreparation", "ScheduledProject", "Scheduler", "SchedulerPolicy",
     "SchedulerTick",
     "SQLiteLedger", "WorkflowDefinition", "WorkflowError", "load_workflow",
+    "ResolvedSkill", "SkillResolutionError", "SkillResolver",
     "execution_waterfall", "readable_error_groups", "render_waterfall_html",
     "summary_fact",
     "LogfireProjectionWorker", "LogfireSettings", "TelemetryProjectionError",

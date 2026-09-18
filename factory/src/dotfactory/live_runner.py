@@ -16,11 +16,13 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .ledger import SQLiteLedger, StaleAttempt
 from .resources import PreparationError, PreparedLaunch
 from .runner import RunnerNeedsAttention, RunnerResult
+from .skills import SkillResolutionError, verify_resolved_skill
 from .token_usage import normalize_token_usage
 
 
@@ -60,6 +62,7 @@ class RunnerRoute:
     maximum_reassembled_frame_bytes: int = 64 * 1024 * 1024
     maximum_events: int = 10000
     maximum_payload_bytes: int = 256 * 1024
+    skill_directory: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,24 @@ class RunnerReceipt:
     started_at: str | None = None
     completed_at: str | None = None
     exit_code: int | None = None
+
+
+@dataclass(frozen=True)
+class AdapterSkillPresentation:
+    mechanism: str
+    command_arguments: tuple[str, ...] = ()
+    prompt_prefix: str = ""
+    references: tuple[Mapping[str, str], ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mechanism": self.mechanism,
+            "command_arguments": list(self.command_arguments),
+            "prompt_prefix_sha256": hashlib.sha256(
+                self.prompt_prefix.encode("utf-8")
+            ).hexdigest(),
+            "references": [dict(item) for item in self.references],
+        }
 
 
 class RunnerExecutionError(RunnerProtocolError):
@@ -430,10 +451,38 @@ class RunnerAdapter:
 
     def command(
         self, route: RunnerRoute, launch: PreparedLaunch, *, session_id: str | None,
+        skill_presentation: AdapterSkillPresentation | None = None,
     ) -> tuple[str, ...]:
         raise NotImplementedError
 
-    def stdin(self, launch: PreparedLaunch, *, prompt_text: str) -> str:
+    def present_skills(
+        self, launch: PreparedLaunch,
+    ) -> AdapterSkillPresentation | None:
+        declared = launch.request.config.get("skills", [])
+        if not isinstance(declared, list) or any(
+            not isinstance(item, str) or not item for item in declared
+        ):
+            raise SkillResolutionError(
+                "declared skills must be an array of names", requested=(),
+            )
+        expected = tuple(dict.fromkeys(declared))
+        observed = tuple(skill.name for skill in launch.skills)
+        if observed != expected:
+            missing = tuple(name for name in expected if name not in observed)
+            raise SkillResolutionError(
+                "prepared launch is missing declared skills: "
+                + ", ".join(missing or expected),
+                requested=expected, missing=missing or expected,
+                resolved=launch.skills,
+            )
+        for skill in launch.skills:
+            verify_resolved_skill(skill)
+        return None
+
+    def stdin(
+        self, launch: PreparedLaunch, *, prompt_text: str,
+        skill_presentation: AdapterSkillPresentation | None = None,
+    ) -> str:
         if not isinstance(prompt_text, str) or not prompt_text.strip():
             raise RunnerProtocolError("live runner requires immutable prompt text")
         allowed = launch.request.config.get("allowed_preferred_labels", [])
@@ -458,14 +507,22 @@ class RunnerAdapter:
         if launch.request.config.get("exit_contract") == "plan-result-v2":
             from .delivery import verification_policy_guidance
             policy_guidance = "\n\n" + verification_policy_guidance()
-        return prompt_text + policy_guidance + contract
+        prefix = (
+            skill_presentation.prompt_prefix.rstrip() + "\n\n"
+            if skill_presentation and skill_presentation.prompt_prefix else ""
+        )
+        return prefix + prompt_text + policy_guidance + contract
 
     def input_payload(
         self, launch: PreparedLaunch, *, prompt_text: str,
         session_id: str | None,
+        skill_presentation: AdapterSkillPresentation | None = None,
     ) -> bytes:
         del session_id
-        return (self.stdin(launch, prompt_text=prompt_text) + "\n").encode("utf-8")
+        return (self.stdin(
+            launch, prompt_text=prompt_text,
+            skill_presentation=skill_presentation,
+        ) + "\n").encode("utf-8")
 
     def keep_stdin_open(self) -> bool:
         return False
@@ -487,7 +544,30 @@ class RunnerAdapter:
 class CodexAdapter(RunnerAdapter):
     kind = "codex"
 
-    def command(self, route, launch, *, session_id=None):
+    def present_skills(self, launch):
+        super().present_skills(launch)
+        if not launch.skills:
+            return None
+        references = tuple({
+            "name": skill.name, "token": f"${skill.name}",
+            "entrypoint": skill.entrypoint,
+        } for skill in launch.skills)
+        prompt = (
+            "Load every factory-declared skill before task work. These declarations "
+            "are mandatory:\n" + "\n".join(
+                f"- ${skill.name} from {skill.entrypoint} "
+                f"(package sha256 {skill.content_hash})"
+                for skill in launch.skills
+            )
+        )
+        return AdapterSkillPresentation(
+            "codex-explicit-skill-reference", prompt_prefix=prompt,
+            references=references,
+        )
+
+    def command(
+        self, route, launch, *, session_id=None, skill_presentation=None,
+    ):
         if session_id:
             command = [
                 route.command, "exec", "resume", "--json",
@@ -521,6 +601,8 @@ class CodexAdapter(RunnerAdapter):
             command.extend(["-c", f"mcp_servers.{server}.enabled=false"])
         if session_id:
             command.append(session_id)
+        if skill_presentation:
+            command.extend(skill_presentation.command_arguments)
         command.append("-")
         return tuple(command)
 
@@ -570,7 +652,34 @@ class CodexAdapter(RunnerAdapter):
 class ClaudeCodeAdapter(RunnerAdapter):
     kind = "claude-code"
 
-    def command(self, route, launch, *, session_id=None):
+    def present_skills(self, launch):
+        super().present_skills(launch)
+        if not launch.skills:
+            return None
+        names = tuple(skill.name for skill in launch.skills)
+        allowlist = ",".join(f"Skill({name})" for name in names)
+        references = tuple({
+            "name": skill.name, "tool": f"Skill({skill.name})",
+            "entrypoint": skill.entrypoint,
+        } for skill in launch.skills)
+        prompt = (
+            "Before task work, use the Skill tool to load every factory-declared "
+            "skill below. If the tool cannot resolve one, report that failure instead "
+            "of continuing:\n" + "\n".join(
+                f"- {skill.name} from {skill.entrypoint} "
+                f"(package sha256 {skill.content_hash})"
+                for skill in launch.skills
+            )
+        )
+        return AdapterSkillPresentation(
+            "claude-skill-tool-allowlist",
+            command_arguments=("--allowedTools", allowlist),
+            prompt_prefix=prompt, references=references,
+        )
+
+    def command(
+        self, route, launch, *, session_id=None, skill_presentation=None,
+    ):
         command = [
             route.command, "-p", "--output-format", "stream-json", "--verbose",
             "--permission-mode", route.permission_mode,
@@ -588,6 +697,8 @@ class ClaudeCodeAdapter(RunnerAdapter):
             command.extend(["--model", str(model)])
         if reasoning_effort:
             command.extend(["--effort", str(reasoning_effort)])
+        if skill_presentation:
+            command.extend(skill_presentation.command_arguments)
         return tuple(command)
 
     def frame_event(self, frame):
@@ -629,7 +740,39 @@ class OmpRpcAdapter(RunnerAdapter):
     protocol_version = 2
     kind = "omp-rpc"
 
-    def command(self, route, launch, *, session_id=None):
+    def present_skills(self, launch):
+        super().present_skills(launch)
+        if not launch.skills:
+            return None
+        names = tuple(skill.name for skill in launch.skills)
+        references = tuple({
+            "name": skill.name, "entrypoint": skill.entrypoint,
+            "content_hash": skill.content_hash,
+        } for skill in launch.skills)
+        blocks = []
+        for skill in launch.skills:
+            instructions = Path(skill.entrypoint).read_text(encoding="utf-8")
+            blocks.append(
+                f"<factory_skill name={json.dumps(skill.name)} "
+                f"package_sha256={json.dumps(skill.content_hash)} "
+                f"directory={json.dumps(skill.path)}>\n"
+                f"{instructions.rstrip()}\n"
+                "</factory_skill>"
+            )
+        prompt = (
+            "The factory resolved and supplied the mandatory skills below. Follow "
+            "every skill before task work; resolve referenced files relative to its "
+            "directory.\n" + "\n\n".join(blocks)
+        )
+        return AdapterSkillPresentation(
+            "omp-inline-skill-content",
+            command_arguments=("--skills=" + ",".join(names),),
+            prompt_prefix=prompt, references=references,
+        )
+
+    def command(
+        self, route, launch, *, session_id=None, skill_presentation=None,
+    ):
         command = [route.command, "--mode", "rpc", "--cwd", launch.workspace_path]
         if route.profile:
             command.extend(["--profile", route.profile])
@@ -643,9 +786,13 @@ class OmpRpcAdapter(RunnerAdapter):
             command.extend(["--model", str(model)])
         if reasoning_effort:
             command.extend(["--thinking", str(reasoning_effort)])
+        if skill_presentation:
+            command.extend(skill_presentation.command_arguments)
         return tuple(command)
 
-    def input_payload(self, launch, *, prompt_text, session_id):
+    def input_payload(
+        self, launch, *, prompt_text, session_id, skill_presentation=None,
+    ):
         frames = [{
             "id": "protocol-1", "type": "negotiate_protocol",
             "protocolVersion": 2,
@@ -655,7 +802,10 @@ class OmpRpcAdapter(RunnerAdapter):
                 "id": f"resume-{launch.request.attempt_id}",
                 "type": "switch_session", "sessionPath": session_id,
             })
-        frames.append(json.loads(self.prompt_frame(launch, prompt_text=prompt_text)))
+        frames.append(json.loads(self.prompt_frame(
+            launch, prompt_text=prompt_text,
+            skill_presentation=skill_presentation,
+        )))
         return ("\n".join(json.dumps(frame, sort_keys=True) for frame in frames) + "\n").encode(
             "utf-8"
         )
@@ -668,10 +818,16 @@ class OmpRpcAdapter(RunnerAdapter):
             "id": f"abort-{runner_run_id}", "type": "abort",
         }, sort_keys=True) + "\n").encode("utf-8")
 
-    def prompt_frame(self, launch: PreparedLaunch, *, prompt_text: str) -> str:
+    def prompt_frame(
+        self, launch: PreparedLaunch, *, prompt_text: str,
+        skill_presentation: AdapterSkillPresentation | None = None,
+    ) -> str:
         return json.dumps({
             "id": f"attempt-{launch.request.attempt_id}",
-            "type": "prompt", "message": self.stdin(launch, prompt_text=prompt_text),
+            "type": "prompt", "message": self.stdin(
+                launch, prompt_text=prompt_text,
+                skill_presentation=skill_presentation,
+            ),
         }, sort_keys=True)
 
     def frame_event(self, frame):
@@ -1204,6 +1360,84 @@ class LiveRunner:
             raise RunnerExecutionError(
                 f"runner attempt already has non-resumable status {existing['status']}"
             )
+        try:
+            skill_presentation = adapter.present_skills(launch)
+        except SkillResolutionError as error:
+            requested = tuple(error.requested) or tuple(
+                str(item) for item in launch.request.config.get("skills", [])
+            )
+            if requested:
+                self.ledger.record_skill_receipt(
+                    launch.request.attempt_id,
+                    fence_token=launch.request.fence_token,
+                    receipt={
+                        "schema_version": 1, "status": "failed",
+                        "attempt_id": launch.request.attempt_id,
+                        "preparation_id": launch.preparation_id,
+                        "runner": route.name, "adapter_kind": route.kind,
+                        "requested": list(requested),
+                        "resolved": [item.as_dict() for item in error.resolved],
+                        "missing": list(error.missing),
+                        "error": {
+                            "message": str(error),
+                            "category": "skill-presentation",
+                        },
+                    },
+                )
+            raise RunnerProtocolError(str(error)) from error
+        skill_receipt = None
+        if skill_presentation:
+            skill_receipt = {
+                "schema_version": 1, "status": "presented",
+                "attempt_id": launch.request.attempt_id,
+                "preparation_id": launch.preparation_id,
+                "runner": route.name, "adapter_kind": route.kind,
+                "requested": [skill.name for skill in launch.skills],
+                "resolved": [skill.as_dict() for skill in launch.skills],
+                "missing": [], "presented": skill_presentation.as_dict(),
+            }
+        try:
+            return self._run_presented(
+                launch=launch, route=route, adapter=adapter, existing=existing,
+                skill_presentation=skill_presentation,
+                skill_receipt=skill_receipt,
+            )
+        except Exception as error:
+            if (
+                skill_receipt
+                and not self.ledger.skill_receipt_for_attempt(
+                    launch.request.attempt_id
+                )
+            ):
+                failed_receipt = {
+                    key: value for key, value in skill_receipt.items()
+                    if key not in ("status", "presented", "receipt_digest")
+                }
+                failed_receipt.update({
+                    "status": "failed", "missing": [],
+                    "error": {
+                        "message": str(error),
+                        "category": "skill-presentation",
+                    },
+                })
+                failed_receipt["receipt_digest"] = hashlib.sha256(
+                    json.dumps(
+                        failed_receipt, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                self.ledger.record_skill_receipt(
+                    launch.request.attempt_id,
+                    fence_token=launch.request.fence_token,
+                    receipt=failed_receipt,
+                )
+            raise
+
+    def _run_presented(
+        self, *, launch: PreparedLaunch, route: RunnerRoute,
+        adapter: RunnerAdapter, existing: Mapping[str, Any] | None,
+        skill_presentation: AdapterSkillPresentation | None,
+        skill_receipt: dict[str, Any] | None,
+    ) -> RunnerResult:
         version = self._version(route)
         route = self._resolve_workspace_integrations(route, launch)
         prompt = self._prompt(launch, route)
@@ -1215,7 +1449,10 @@ class LiveRunner:
                 or int(existing.get("resume_count", 0)) > 0
             ) else None
         )
-        command = list(adapter.command(route, launch, session_id=session_id))
+        command = list(adapter.command(
+            route, launch, session_id=session_id,
+            skill_presentation=skill_presentation,
+        ))
         command_digest = hashlib.sha256(
             json.dumps(command, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -1251,6 +1488,7 @@ class LiveRunner:
         return self._execute(
             launch=launch, route=route, adapter=adapter, version=version,
             run=run, command=command, prompt=prompt, session_id=session_id,
+            skill_presentation=skill_presentation, skill_receipt=skill_receipt,
         )
 
     def remedy_attention(
@@ -1266,6 +1504,8 @@ class LiveRunner:
         self, *, launch: PreparedLaunch, route: RunnerRoute,
         adapter: RunnerAdapter, version: str, run: Mapping[str, Any],
         command: list[str], prompt: str, session_id: str | None,
+        skill_presentation: AdapterSkillPresentation | None,
+        skill_receipt: Mapping[str, Any] | None,
     ) -> RunnerResult:
         process: subprocess.Popen[bytes] | None = None
         selector: selectors.BaseSelector | None = None
@@ -1294,7 +1534,8 @@ class LiveRunner:
             )
             phase = "running"
             payload = adapter.input_payload(
-                launch, prompt_text=prompt, session_id=session_id
+                launch, prompt_text=prompt, session_id=session_id,
+                skill_presentation=skill_presentation,
             )
             if len(payload) > route.maximum_reassembled_frame_bytes:
                 raise RunnerProtocolError("runner input exceeds the byte limit")
@@ -1302,6 +1543,21 @@ class LiveRunner:
                 raise RunnerExecutionError("runner stdin is unavailable")
             process.stdin.write(payload)
             process.stdin.flush()
+            if skill_receipt:
+                skill_receipt = dict(skill_receipt)
+                presented = dict(skill_receipt["presented"])
+                presented["input_sha256"] = hashlib.sha256(payload).hexdigest()
+                skill_receipt["presented"] = presented
+                skill_receipt["receipt_digest"] = hashlib.sha256(
+                    json.dumps(
+                        skill_receipt, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                self.ledger.record_skill_receipt(
+                    launch.request.attempt_id,
+                    fence_token=launch.request.fence_token,
+                    receipt=skill_receipt,
+                )
             if not adapter.keep_stdin_open():
                 process.stdin.close()
             if not process.stdout or not process.stderr:
@@ -1542,6 +1798,8 @@ class LiveRunner:
                 "started_at": run["started_at"], "completed_at": completed_at,
                 "evidence_uri": f"ledger://runner-runs/{run['id']}",
             }
+            if skill_receipt:
+                receipt_payload["skill_receipt"] = dict(skill_receipt)
             self.ledger.record_runner_result(
                 str(run["id"]), fence_token=launch.request.fence_token,
                 result=result_payload, receipt=receipt_payload,

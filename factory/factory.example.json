@@ -37,6 +37,7 @@
       "permission_mode": "approve-for-me",
       "default_model": "gpt-5.6-sol",
       "default_reasoning_effort": "medium",
+      "skill_directory": "~/.agents/skills",
       "disabled_mcp_servers": ["linear"],
       "capabilities": []
     },
@@ -45,6 +46,7 @@
       "command": "claude",
       "minimum_version": "2.1.251",
       "permission_mode": "auto",
+      "skill_directory": "~/.claude/skills",
       "capabilities": ["runner-browser"]
     },
     "omp": {
@@ -52,6 +54,7 @@
       "command": "omp",
       "minimum_version": "18.0.4",
       "permission_mode": "write",
+      "skill_directory": "~/.omp/agent/skills",
       "profile": "dotfactory-claude-api",
       "environment_envs": ["ANTHROPIC_API_KEY"],
       "capabilities": ["runner-browser", "runner-computer"]

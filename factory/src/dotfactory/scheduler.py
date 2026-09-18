@@ -378,9 +378,44 @@ class Scheduler:
                 detail={"attention_id": preparation.attention["id"]},
             ))
         if preparation.disposition == "fatal":
-            message = str((preparation.error or {}).get(
+            error = dict(preparation.error or {})
+            message = str(error.get(
                 "message", "resource preparation failed"
             ))
+            if (
+                error.get("category") == "skill-resolution"
+                and "failed" in request.config.get("allowed_preferred_labels", [])
+            ):
+                decision = project.kernel.complete_attempt(
+                    str(dispatch["execution_id"]), preferred_label="failed",
+                    outcome="failed to resolve declared skills",
+                    evidence=[{
+                        "kind": "skill_receipt",
+                        "uri": (
+                            f"ledger://attempts/{dispatch['attempt_id']}"
+                            "/skill-receipt"
+                        ),
+                    }],
+                    attempt_id=str(dispatch["attempt_id"]),
+                    fence_token=str(dispatch["attempt_fence_token"]),
+                    owner=request.owner,
+                    command_id=f"scheduler:{dispatch['id']}:complete",
+                )
+                self._fault("after_workflow_commit")
+                current = self.ledger.dispatch(str(dispatch["id"]))
+                self.ledger.supersede_dispatch(
+                    str(dispatch["id"]), claim_token=str(current["claim_token"]),
+                    reason="declared skill resolution failed",
+                )
+                return self._emit(SchedulerTick(
+                    "failed", dispatch_id=str(dispatch["id"]),
+                    execution_id=str(dispatch["execution_id"]),
+                    attempt_id=str(dispatch["attempt_id"]),
+                    detail={
+                        "to_state": decision["to_state"],
+                        "category": "skill-resolution", "message": message,
+                    },
+                ))
             return self._attention(
                 current, category="preparation-fatal", message=message,
                 resume_phase="preparing",

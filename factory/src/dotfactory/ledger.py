@@ -983,6 +983,7 @@ class SQLiteLedger:
             "workspace": "workspace", "resource": "resource",
             "runner": "runner", "cleanup": "cleanup", "attention": "attention",
             "control": "control",
+            "skill": "skill",
         }.get(prefix, "kernel")
 
     @staticmethod
@@ -995,7 +996,7 @@ class SQLiteLedger:
             return "failed"
         if suffix in (
             "completed", "ready", "released", "resolved", "accepted",
-            "observed", "expired", "skipped", "result",
+            "observed", "expired", "skipped", "result", "presented",
         ):
             return "completed"
         if suffix in ("waiting", "requested"):
@@ -2571,6 +2572,46 @@ class SQLiteLedger:
                 idempotency_key=f"preparation:{preparation_id}:started",
             )
         return self.preparation(preparation_id)
+
+    def record_skill_receipt(
+        self, attempt_id: str, *, fence_token: str, receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        if receipt.get("schema_version") != 1:
+            raise LedgerError("skill receipt requires schema_version 1")
+        if receipt.get("status") not in ("presented", "failed"):
+            raise LedgerError("skill receipt status must be presented or failed")
+        if receipt.get("attempt_id") != attempt_id:
+            raise LedgerError("skill receipt does not match its attempt")
+        requested = receipt.get("requested")
+        if not isinstance(requested, list) or not requested or any(
+            not isinstance(item, str) or not item for item in requested
+        ):
+            raise LedgerError("skill receipt requires requested skill names")
+        payload = {"skill_receipt": redact_payload(receipt)}
+        if receipt["status"] == "failed":
+            payload["error"] = redact_payload(receipt.get("error", {}))
+        idempotency_key = f"skill-receipt:{attempt_id}"
+        existing = self.event_for_command(idempotency_key)
+        if existing:
+            if canonical_json(existing["payload"]) != canonical_json(payload):
+                raise LedgerError("skill receipt changed after durable creation")
+            return dict(existing["payload"]["skill_receipt"])
+        with self.transaction() as db:
+            attempt = self._active_attempt(db, attempt_id, fence_token)
+            self._event(
+                db, execution_id=attempt["execution_id"],
+                state_run_id=attempt["state_run_id"], attempt_id=attempt_id,
+                event_type=f"skill_receipt_{receipt['status']}", payload=payload,
+                idempotency_key=idempotency_key,
+            )
+        return dict(payload["skill_receipt"])
+
+    def skill_receipt_for_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        event = self.event_for_command(f"skill-receipt:{attempt_id}")
+        if not event:
+            return None
+        receipt = event["payload"].get("skill_receipt")
+        return dict(receipt) if isinstance(receipt, dict) else None
 
     def preparation(self, preparation_id: str) -> dict[str, Any]:
         row = self.connection.execute(
