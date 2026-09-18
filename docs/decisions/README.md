@@ -34,6 +34,8 @@ configured by dotfactory belong to their owning repository.
 | [0031](0031-freeze-bounded-verification-host-policy.md) | Freeze a bounded verification host policy | Proposed | — |
 | [0021](0021-activate-declared-skills-before-runner-launch.md) | Activate declared skills before runner launch | Accepted | — |
 | [0032](0032-preserve-agent-activity-order-and-identity.md) | Preserve agent activity order and identity | Proposed | — |
+| [0033](0033-place-stages-on-owned-workers.md) | Place stages on owned workers and accept Git handoffs centrally | Proposed | — |
+| [0034](0034-host-owned-workers-on-render.md) | Host owned workers on Render | Proposed | — |
 
 ## Lifecycle
 

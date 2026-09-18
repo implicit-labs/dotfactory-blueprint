@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -160,6 +161,31 @@ def _run(args: argparse.Namespace) -> int:
         print(json.dumps(receipt.as_dict(), indent=2, sort_keys=True))
         exit_code = _run_exit_code(runtime, receipt)
     return exit_code
+
+
+def _work(args: argparse.Namespace) -> int:
+    from .linear_api import LinearAPIError
+    config = FactoryConfig.load(args.config)
+    with FactoryRuntime(config, project_keys=args.project) as runtime:
+        if not runtime.linear_workers:
+            raise RuntimeError("work requires enabled Linear projection")
+        _install_signals(runtime)
+        runtime.enable_operator()
+        ticks = 0
+        while not runtime.stop_requested and (args.max_ticks is None or ticks < args.max_ticks):
+            ticks += 1
+            try:
+                for project in runtime.project_keys:
+                    issue = runtime.discover_issue(project, allow_empty=True)
+                    if issue:
+                        runtime.start_issue(project, str(issue["identifier"]), title=str(issue["title"]))
+                print(json.dumps(runtime.step(), sort_keys=True), flush=True)
+            except LinearAPIError:
+                print(json.dumps({"status": "tracker_unavailable", "retry": "next_poll"}), flush=True)
+            deadline = time.monotonic() + runtime.scheduler.policy.poll_interval_ms / 1000
+            while not runtime.stop_requested and time.monotonic() < deadline:
+                time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+    return 0
 
 
 def _attention(args: argparse.Namespace) -> int:
@@ -358,6 +384,13 @@ def main(arguments: list[str] | None = None) -> int:
     doctor.add_argument("--config", required=True)
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(callback=_doctor)
+    from .worker_cli import add_commands
+    add_commands(commands)
+    work = commands.add_parser("work", help="continuously discover Linear work and run the coordinator")
+    work.add_argument("--config", default=os.environ.get("DOTFACTORY_CONFIG"))
+    work.add_argument("--project", action="append")
+    work.add_argument("--max-ticks", type=int)
+    work.set_defaults(callback=_work)
     run = commands.add_parser("run", help="run one recoverable factory lifecycle")
     run.add_argument("--config", default=os.environ.get("DOTFACTORY_CONFIG"))
     run.add_argument("--project", required=True)
@@ -445,7 +478,7 @@ def main(arguments: list[str] | None = None) -> int:
     server.add_argument("--subject", default=os.environ.get("USER", "local-operator"))
     server.set_defaults(callback=serve)
     args = parser.parse_args(arguments)
-    if args.command in ("run", "attention", "operator", "dataset", "delivery", "status", "serve") and not args.config:
+    if args.command in ("run", "attention", "operator", "dataset", "delivery", "status", "serve", "work") and not args.config:
         parser.error(f"{args.command} requires --config or DOTFACTORY_CONFIG")
     try:
         return int(args.callback(args))

@@ -5430,6 +5430,21 @@ class SQLiteLedger:
                 "ORDER BY created_at,id", (execution_id,)
             )
         ]
+        current["worker_handoffs"] = []
+        if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_handoffs'").fetchone():
+            for row in self.connection.execute(
+                "SELECT manifest_json,attempt_id FROM worker_handoffs WHERE execution_id=? ORDER BY rowid",
+                (execution_id,),
+            ):
+                manifest = json.loads(row[0])
+                handoff = {
+                    key: manifest[key] for key in
+                    ("worker", "state", "status", "requirements", "source_sha", "output_sha", "checks")
+                    if key in manifest
+                }
+                handoff["attempt_id"] = row[1]
+                handoff["location"] = manifest.get("worker_config", {}).get("location", "unknown")
+                current["worker_handoffs"].append(handoff)
         return current
 
     def events_page(

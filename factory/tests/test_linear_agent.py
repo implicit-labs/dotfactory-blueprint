@@ -364,6 +364,35 @@ class LinearAgentTests(unittest.TestCase):
         self.assertEqual(session_id, worker.session(self.execution)["session_id"])
         self.assertEqual(1, remote.updates)
 
+    def test_worker_location_is_per_attempt_and_replay_safe(self):
+        snapshot = self.ledger.run_snapshot(self.execution)
+        projection = ObservationService(self.ledger, self.kernel).execution_projection(self.execution)
+        history = self.ledger.run_history(self.execution)
+        snapshot["worker_handoffs"] = [
+            {"attempt_id": "a", "state": "Implementing", "worker": "render", "location": "cloud"},
+            {"attempt_id": "b", "state": "Verifying", "worker": "mac", "location": "local"},
+            {"attempt_id": "c", "state": "Reworking", "worker": "legacy"},
+        ]
+        urls, activities = build_agent_projection(snapshot, projection, history,
+                                                 marker_url="https://runs.example/EXAMPLE-574")
+        location_activities = [a for a in activities if a["semantic_key"].startswith("worker-location:")]
+        self.assertEqual([
+            "☁️ Cloud · `Implementing` · worker `render`.",
+            "💻 Local · `Verifying` · worker `mac`.",
+            "Location unknown · `Reworking` · worker `legacy`.",
+        ], [a["content"]["body"] for a in location_activities])
+        remote = FakeAgentAPI()
+        worker = LinearAgentSessionWorker(self.ledger, remote)
+        for status in ("selected", "accepted"):
+            for handoff in snapshot["worker_handoffs"]:
+                handoff["status"] = status
+            urls, activities = build_agent_projection(snapshot, projection, history,
+                                                     marker_url="https://runs.example/EXAMPLE-574")
+            worker.sync(self.execution, issue_id="issue-574", marker_url="https://runs.example/EXAMPLE-574",
+                        external_urls=urls, activities=activities)
+            worker = LinearAgentSessionWorker(self.ledger, remote)
+        self.assertEqual(len(activities), remote.activity_creates)
+
     def test_projection_redacts_secrets_and_terminal_activity_is_final(self):
         snapshot = self.ledger.run_snapshot(self.execution)
         projection = ObservationService(

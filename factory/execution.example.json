@@ -1,0 +1,91 @@
+{
+  "workers": {
+    "render": {
+      "transport": "ssh",
+      "target": "srv-REPLACE_ME@ssh.virginia.render.com",
+      "entrypoint": "/opt/dotfactory/worker.py",
+      "root": "/data/work",
+      "billing": "subscription",
+      "location": "cloud"
+    },
+    "mac": {
+      "transport": "ssh",
+      "target": "builder@mac-host",
+      "entrypoint": "/opt/dotfactory-worker/worker.py",
+      "root": "/opt/dotfactory-work",
+      "billing": "subscription",
+      "location": "local"
+    }
+  },
+  "stages": {
+    "Autoplanning": {
+      "workers": [
+        "render",
+        "mac"
+      ],
+      "scope": "portable",
+      "requires": [
+        "tool:git"
+      ],
+      "checks": []
+    },
+    "Planning": {
+      "workers": [
+        "mac"
+      ],
+      "scope": "portable",
+      "requires": [
+        "tool:git"
+      ],
+      "checks": []
+    },
+    "Implementing": {
+      "workers": [
+        "render",
+        "mac"
+      ],
+      "scope": "portable",
+      "requires": [
+        "tool:git"
+      ],
+      "checks": []
+    },
+    "Verifying": {
+      "workers": [
+        "mac"
+      ],
+      "scope": "native",
+      "requires": [
+        "os:darwin",
+        "tool:xcodebuild"
+      ],
+      "checks": [
+        [
+          "xcodebuild",
+          "-list"
+        ]
+      ]
+    },
+    "Reworking": {
+      "workers": [
+        "render",
+        "mac"
+      ],
+      "scope": "portable",
+      "requires": [
+        "tool:git"
+      ],
+      "checks": []
+    },
+    "Investigating": {
+      "workers": [
+        "mac"
+      ],
+      "scope": "native",
+      "requires": [
+        "tool:git"
+      ],
+      "checks": []
+    }
+  }
+}
