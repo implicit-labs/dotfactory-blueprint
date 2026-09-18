@@ -125,7 +125,10 @@
       "endpoint": "https://api.linear.app/graphql",
       "timeout_seconds": 15,
       "poll_interval_seconds": 30,
-      "webhook_secret_env": "LINEAR_WEBHOOK_SECRET"
+      "webhook_secret_env": "LINEAR_WEBHOOK_SECRET",
+      "agent_sessions_enabled": false,
+      "agent_token_env": "LINEAR_AGENT_TOKEN",
+      "agent_session_url_template": "https://factory.example/runs/{execution_id}"
     },
     "logfire": {
       "enabled": false,

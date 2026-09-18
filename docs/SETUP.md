@@ -67,6 +67,18 @@ every workflow status to one team status ID before activation. Polling is the
 recovery path; a signed webhook may only accelerate it. A timeout after a status
 write remains ambiguous until a read confirms the remote issue.
 
+Agent Sessions are optional because Linear requires an OAuth app token acting as
+an agent. Inject it using `agent_token_env` (default `LINEAR_AGENT_TOKEN`),
+separately from the issue/status credential. Missing agent credentials retain
+classic comment fallback. Follow the
+[native-session canary](../factory/LINEAR_AGENT_SESSIONS.md). Set
+`agent_sessions_enabled` only with that actor configured and give
+`agent_session_url_template` one `{execution_id}` placeholder. The factory emits
+only workflow milestones, attention, errors, and a terminal response. It stores
+session and activity identities before writes, reconciles unknown outcomes by
+identity, and falls back to the one owned summary comment when the preview API is
+unsupported. It never retries an unreconciled session create blindly.
+
 For Logfire, set `project` to your Logfire project identity, choose its `us` or
 `eu` region, and inject the matching OTLP endpoint and write-token header through
 the named environment variables.

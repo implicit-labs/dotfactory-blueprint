@@ -24,7 +24,7 @@ from .observability import (
 from .token_usage import normalize_token_usage
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 LEGACY_STATE_IDS = {
     "todo": "Todo",
@@ -506,6 +506,11 @@ class SQLiteLedger:
                 self._create_schema_twelve_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
+        if version == 12:
+            with self.transaction() as db:
+                self._create_schema_thirteen_additions(db)
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            return
         raise LedgerError(f"no migration from ledger schema {version}")
 
     def _create_schema_three_additions(self, db: sqlite3.Connection) -> None:
@@ -908,6 +913,57 @@ class SQLiteLedger:
             "request_digest TEXT NOT NULL,status TEXT NOT NULL,response_hash TEXT,"
             "error_json TEXT,started_at TEXT NOT NULL,completed_at TEXT,"
             "UNIQUE(execution_id,attempt_number))"
+        )
+        self._create_schema_thirteen_additions(db)
+
+    def _create_schema_thirteen_additions(self, db: sqlite3.Connection) -> None:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_agent_sessions ("
+            "execution_id TEXT PRIMARY KEY REFERENCES workflow_executions(id),"
+            "issue_id TEXT NOT NULL,marker_url TEXT NOT NULL UNIQUE,"
+            "session_id TEXT UNIQUE,remote_url TEXT,"
+            "desired_external_urls_json TEXT NOT NULL,desired_digest TEXT NOT NULL,"
+            "applied_digest TEXT,status TEXT NOT NULL,"
+            "attempt_count INTEGER NOT NULL DEFAULT 0,last_error_json TEXT,"
+            "next_attempt_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,"
+            "confirmed_at TEXT)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS linear_agent_sessions_pending "
+            "ON linear_agent_sessions(status,updated_at)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_agent_session_attempts ("
+            "id TEXT PRIMARY KEY,execution_id TEXT NOT NULL "
+            "REFERENCES linear_agent_sessions(execution_id),"
+            "attempt_number INTEGER NOT NULL,operation TEXT NOT NULL,"
+            "request_digest TEXT NOT NULL,status TEXT NOT NULL,response_hash TEXT,"
+            "error_json TEXT,started_at TEXT NOT NULL,completed_at TEXT,"
+            "UNIQUE(execution_id,attempt_number))"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_agent_activities ("
+            "id TEXT PRIMARY KEY,execution_id TEXT NOT NULL "
+            "REFERENCES linear_agent_sessions(execution_id),"
+            "semantic_key TEXT NOT NULL,content_json TEXT NOT NULL,"
+            "content_digest TEXT NOT NULL,status TEXT NOT NULL,"
+            "attempt_count INTEGER NOT NULL DEFAULT 0,remote_id TEXT,"
+            "response_hash TEXT,last_error_json TEXT,next_attempt_at TEXT,"
+            "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,confirmed_at TEXT,"
+            "UNIQUE(execution_id,semantic_key))"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS linear_agent_activities_pending "
+            "ON linear_agent_activities(status,updated_at)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS linear_agent_activity_attempts ("
+            "id TEXT PRIMARY KEY,activity_id TEXT NOT NULL "
+            "REFERENCES linear_agent_activities(id),"
+            "attempt_number INTEGER NOT NULL,status TEXT NOT NULL,"
+            "request_digest TEXT NOT NULL,response_hash TEXT,error_json TEXT,"
+            "started_at TEXT NOT NULL,completed_at TEXT,"
+            "UNIQUE(activity_id,attempt_number))"
         )
 
     @staticmethod
@@ -4247,6 +4303,29 @@ class SQLiteLedger:
             raise LedgerError("Linear evidence not found")
         return self._linear_evidence_dict(row)
 
+    def linear_agent_session(self, execution_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM linear_agent_sessions WHERE execution_id=?",
+            (execution_id,),
+        ).fetchone()
+        if not row:
+            raise LedgerError("Linear agent session not found")
+        item = dict(row)
+        item["external_urls"] = json.loads(
+            item.pop("desired_external_urls_json")
+        )
+        error = item.pop("last_error_json")
+        item["last_error"] = json.loads(error) if error else None
+        item["activity_statuses"] = {
+            str(activity["status"]): int(activity["count"])
+            for activity in self.connection.execute(
+                "SELECT status,COUNT(*) AS count FROM linear_agent_activities "
+                "WHERE execution_id=? GROUP BY status ORDER BY status",
+                (execution_id,),
+            )
+        }
+        return item
+
     def pending_linear_evidence(self, limit: int = 100) -> list[dict[str, Any]]:
         if limit < 1 or limit > 1000:
             raise LedgerError("Linear evidence limit must be between 1 and 1000")
@@ -5090,6 +5169,14 @@ class SQLiteLedger:
             bindings[str(item["attempt_id"])] = item
         for attempt in attempts:
             attempt["binding"] = bindings.get(str(attempt["id"]))
+        runner_runs = [
+            dict(row) for row in self.connection.execute(
+                "SELECT id,attempt_id,runner_key,adapter_kind,adapter_version,"
+                "protocol_version,status,created_at,started_at,completed_at "
+                "FROM runner_runs WHERE execution_id=? ORDER BY created_at,id",
+                (execution_id,),
+            )
+        ]
         events = []
         for row in self.connection.execute(
             "SELECT * FROM events WHERE execution_id=? ORDER BY seq", (execution_id,)
@@ -5130,6 +5217,7 @@ class SQLiteLedger:
             "state_runs": state_runs,
             "state_token_usage": self._state_token_usage(execution_id, state_runs),
             "attempts": attempts,
+            "runner_runs": runner_runs,
             "events": events,
             "artifacts": artifacts,
             "feedback": feedback,

@@ -289,6 +289,7 @@ def _validate_projections(values: dict[str, Any]) -> None:
         allowed = {
             "enabled", "token_env", "endpoint", "timeout_seconds",
             "poll_interval_seconds", "webhook_secret_env",
+            "agent_sessions_enabled", "agent_session_url_template", "agent_token_env",
         }
         if set(linear) - allowed:
             raise FactoryConfigError("config.projections.linear contains unknown fields")
@@ -309,6 +310,25 @@ def _validate_projections(values: dict[str, Any]) -> None:
         endpoint = linear.get("endpoint", "https://api.linear.app/graphql")
         if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
             raise FactoryConfigError("config.projections.linear.endpoint must use HTTPS")
+        agent_sessions_enabled = linear.get("agent_sessions_enabled", False)
+        if not isinstance(agent_sessions_enabled, bool):
+            raise FactoryConfigError(
+                "config.projections.linear.agent_sessions_enabled must be true or false"
+            )
+        agent_token_env = linear.get("agent_token_env", "LINEAR_AGENT_TOKEN")
+        if not isinstance(agent_token_env, str) or not ENV_NAME.fullmatch(agent_token_env):
+            raise FactoryConfigError("config.projections.linear.agent_token_env must name an environment variable")
+        template = linear.get("agent_session_url_template")
+        if agent_sessions_enabled and (
+            not isinstance(template, str) or not template.startswith("https://")
+            or template.count("{execution_id}") != 1
+            or "{" in template.replace("{execution_id}", "")
+            or "}" in template.replace("{execution_id}", "")
+        ):
+            raise FactoryConfigError(
+                "enabled Linear agent sessions require an HTTPS "
+                "agent_session_url_template with one {execution_id} placeholder"
+            )
         for key, default, maximum in (
             ("timeout_seconds", 15, 60), ("poll_interval_seconds", 30, 3600),
         ):
@@ -642,6 +662,13 @@ class FactoryConfig:
             "poll_interval_seconds": int(linear.get("poll_interval_seconds", 30)),
             "token_env": str(linear["token_env"]),
             "webhook_secret_env": linear.get("webhook_secret_env"),
+            "agent_sessions_enabled": bool(
+                linear.get("agent_sessions_enabled", False)
+            ),
+            "agent_token_env": str(linear.get("agent_token_env", "LINEAR_AGENT_TOKEN")),
+            "agent_session_url_template": linear.get(
+                "agent_session_url_template"
+            ),
         }
         if result["enabled"] and not environment.get(result["token_env"]):
             raise FactoryConfigError(

@@ -311,6 +311,11 @@ class LinearEvidenceTests(unittest.TestCase):
             "**Attempts:** 1 total · 0 completed · 0 failed · 1 active", body
         )
         self.assertIn("### Active incident", body)
+        self.assertIn("### Delivery facts", body)
+        self.assertIn("**Runner / version:** not launched", body)
+        self.assertIn("**Verification:** not reached", body)
+        self.assertIn("**Evidence coverage:**", body)
+        self.assertIn("**Next action:**", body)
         self.assertIn("[REDACTED]", body)
         self.assertNotIn("supersecretvalue", body)
         self.assertLessEqual(len(body), 12000)
@@ -351,6 +356,30 @@ class LinearEvidenceTests(unittest.TestCase):
                                             self.ledger.run_history(self.execution))
         self.assertIn("Dotfactory run — Needs attention", body)
 
+    def test_renderer_names_runner_version_artifacts_and_verification(self):
+        snapshot = self.ledger.run_snapshot(self.execution)
+        projection = ObservationService(
+            self.ledger, self.kernel
+        ).execution_projection(self.execution)
+        history = self.ledger.run_history(self.execution)
+        history["runner_runs"] = [{
+            "runner_key": "codex", "adapter_kind": "codex",
+            "adapter_version": "1.2.3", "protocol_version": 1,
+        }]
+        history["artifacts"] = [
+            {"kind": "commit", "uri": "git://commit"},
+            {"kind": "test", "uri": "local://tests"},
+        ]
+        history["state_runs"].append({
+            "id": "verify-run", "state_id": "Verifying", "status": "completed",
+            "started_at": snapshot["created_at"],
+            "completed_at": snapshot["created_at"],
+        })
+        body, _digest = render_linear_run_summary(snapshot, projection, history)
+        self.assertIn("`codex` · codex 1.2.3 · protocol v1", body)
+        self.assertIn("2 recorded · `commit`, `test`", body)
+        self.assertIn("1 node run(s) completed", body)
+
     def test_renderer_shows_durable_time_and_token_coverage_per_node(self):
         self.kernel.transition(
             self.execution, "Autoplanning", actor="agent", signal="listener_claim",
@@ -388,7 +417,7 @@ class LinearEvidenceTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        self.assertEqual(12, migrated.connection.execute(
+        self.assertEqual(13, migrated.connection.execute(
             "PRAGMA user_version"
         ).fetchone()[0])
         self.assertTrue({
