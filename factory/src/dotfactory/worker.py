@@ -109,6 +109,59 @@ def environment(billing, kind, names=()):
     return env
 
 
+def validate_readiness(probes):
+    if not isinstance(probes, list) or len(probes) > 8:
+        raise ValueError("readiness must contain at most eight probes")
+    names = set()
+    total = 0
+    for probe in probes:
+        if not isinstance(probe, dict) or set(probe) - {"name", "command", "timeout_seconds"}:
+            raise ValueError("unknown readiness probe setting")
+        name = probe.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name) or name in names:
+            raise ValueError("readiness probes require unique safe names")
+        names.add(name)
+        argv = probe.get("command")
+        if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in argv):
+            raise ValueError("readiness probe command must be an argument array")
+        timeout = probe.get("timeout_seconds", 10)
+        if type(timeout) is not int or not 1 <= timeout <= 30:
+            raise ValueError("readiness timeout must be 1..30 seconds")
+        total += timeout
+    if total > 60:
+        raise ValueError("readiness probes must total at most 60 seconds")
+
+
+def readiness(probes, env):
+    """Run trusted operator probes without retaining command output or credentials."""
+    validate_readiness(probes)
+    results = []
+    for probe in probes:
+        process = None
+        result = {"name": probe["name"], "passed": False}
+        try:
+            process = subprocess.Popen(probe["command"], cwd="/", env=env,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+            code = process.wait(timeout=probe.get("timeout_seconds", 10))
+            result.update(exit_code=code, passed=code == 0,
+                          reason="passed" if code == 0 else "nonzero-exit")
+        except subprocess.TimeoutExpired:
+            result["reason"] = "timeout"
+        except OSError:
+            result["reason"] = "unavailable"
+        finally:
+            # Also reap descendants if a probe parent exits before its children.
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        results.append(result)
+    return results
+
+
 def probe(spec):
     kind = spec["kind"]
     if kind not in ("codex", "claude-code"):
@@ -142,7 +195,11 @@ def probe(spec):
         methods = ("oauth_token", "claude.ai") if spec["billing"] == "subscription" else ("api_key",)
         if login.returncode or not status.get("loggedIn") or status.get("authMethod") not in methods:
             missing.append("auth:claude-" + spec["billing"])
-    return {"available": not missing, "missing": missing, "facts": sorted(facts), "version": version[:160]}
+    probes = readiness(spec.get("readiness", []), env)
+    missing.extend("readiness:" + item["name"] + ":" + item["reason"]
+                   for item in probes if not item["passed"])
+    return {"available": not missing, "missing": missing, "facts": sorted(facts),
+            "version": version[:160], "readiness": probes}
 
 
 def workspace(spec):

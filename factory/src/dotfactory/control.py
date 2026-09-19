@@ -279,7 +279,10 @@ class ObservationService:
             agent_session = self.ledger.linear_agent_session(execution_id)
         except LedgerError:
             agent_session = None
+        _workflow, states, _edges = self.kernel.graph_for_execution(execution_id)
+        state = states[str(current["current_state_id"])]
         return {
+            "awaiting_human": state.get("node_type") == "human" or state.get("checkpoint_role") == "human",
             "waterfall": waterfall, "summary": summary,
             "error_groups": groups, "linear_evidence": evidence,
             "linear_agent_session": agent_session,

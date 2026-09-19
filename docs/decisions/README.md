@@ -39,6 +39,8 @@ configured by dotfactory belong to their owning repository.
 | [0035](0035-abandon-uncertain-runs-without-assuming-process-exit.md) | Abandon uncertain runs without assuming process exit | Proposed | — |
 | [0036](0036-admit-continuous-work-explicitly.md) | Admit continuous work explicitly and gate dispatch on recorded usage | Proposed | — |
 
+| [0037](0037-check-worker-readiness-before-allocation.md) | Check worker readiness before allocation | Proposed | — |
+
 ## Lifecycle
 
 | Status | Meaning |
