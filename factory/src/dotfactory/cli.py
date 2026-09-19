@@ -9,7 +9,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
@@ -164,27 +163,27 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _work(args: argparse.Namespace) -> int:
-    from .linear_api import LinearAPIError
+    from .work_queue import WorkQueue
     config = FactoryConfig.load(args.config)
+    if args.max_ticks is not None and args.max_ticks < 1:
+        raise ValueError("max-ticks must be positive")
+    if not config.values.get("work_queue", {}).get("enabled", False):
+        raise ValueError("work requires work_queue.enabled=true; opt in before starting discovery")
     with FactoryRuntime(config, project_keys=args.project) as runtime:
-        if not runtime.linear_workers:
-            raise RuntimeError("work requires enabled Linear projection")
+        queue = WorkQueue(runtime)
         _install_signals(runtime)
         runtime.enable_operator()
         ticks = 0
-        while not runtime.stop_requested and (args.max_ticks is None or ticks < args.max_ticks):
+        while (not runtime.stop_requested and not runtime.drain_requested
+               and (args.max_ticks is None or ticks < args.max_ticks)):
             ticks += 1
-            try:
-                for project in runtime.project_keys:
-                    issue = runtime.discover_issue(project, allow_empty=True)
-                    if issue:
-                        runtime.start_issue(project, str(issue["identifier"]), title=str(issue["title"]))
-                print(json.dumps(runtime.step(), sort_keys=True), flush=True)
-            except LinearAPIError:
-                print(json.dumps({"status": "tracker_unavailable", "retry": "next_poll"}), flush=True)
-            deadline = time.monotonic() + runtime.scheduler.policy.poll_interval_ms / 1000
-            while not runtime.stop_requested and time.monotonic() < deadline:
-                time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+            print(json.dumps(queue.step(), sort_keys=True), flush=True)
+            if args.max_ticks is None or ticks < args.max_ticks:
+                runtime._wait(runtime.scheduler.policy.poll_interval_ms / 1000)
+        reason = "drained" if runtime.drain_requested else runtime.shutdown_reason if runtime.stop_requested else "max_ticks"
+        for project in runtime.project_keys:
+            runtime.ledger.record_operating_receipt("queue", project, None, {"status": reason})
+        print(json.dumps({"status": reason, "ticks": ticks}), flush=True)
     return 0
 
 

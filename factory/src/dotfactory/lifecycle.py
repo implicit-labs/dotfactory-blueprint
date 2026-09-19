@@ -229,6 +229,7 @@ class FactoryRuntime:
                 self.ledger, projects=self.projects, runner=runner,
                 owner=self.owner,
                 policy=SchedulerPolicy.from_config(config.resolve_scheduler()),
+                dispatch_budget=self._dispatch_budget,
             )
             if control_only:
                 self.preflights.append({
@@ -494,6 +495,7 @@ class FactoryRuntime:
     def start_issue(
         self, project_key: str, identifier: str, *, title: str | None = None,
         description: str = "",
+        admission_snapshot: dict[str, Any] | None = None,
     ) -> str:
         if project_key not in self.kernels:
             raise LifecycleError(f"project is not enabled: {project_key}")
@@ -501,11 +503,17 @@ class FactoryRuntime:
         if existing:
             return existing
         intent = {"title": title or identifier, "description": description,
-                  "source": "explicit_issue"}
+                  "source": "admitted_queue" if admission_snapshot is not None else "explicit_issue"}
+        if admission_snapshot is not None:
+            intent["admission"] = {
+                "label": self.config.values.get("work_queue", {}).get("admission_label", "factory-ready"),
+                "source_revision": admission_snapshot.get("updatedAt"),
+                "eligibility_digest": hashlib.sha256(canonical_json(admission_snapshot).encode()).hexdigest(),
+            }
         adopted_state = None
         worker = self.linear_workers.get(project_key)
         if worker:
-            issue = worker.client.issue(identifier)
+            issue = admission_snapshot if admission_snapshot is not None else worker.client.issue(identifier)
             if str(issue["identifier"]) != identifier:
                 raise LifecycleError("Linear returned a different issue identifier")
             project = self.config.resolve_project(project_key, environment=self.environment)
@@ -575,8 +583,15 @@ class FactoryRuntime:
             f"no eligible Linear issue is available for {project_key}"
         )
 
+    def _owned_runs(self, status: str | None = None) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.ledger.connection.execute(
+            "SELECT we.*,wi.project_key,wi.identifier AS work_item_identifier "
+            "FROM workflow_executions we JOIN work_items wi ON wi.id=we.work_item_id "
+            "WHERE (? IS NULL OR we.status=?) ORDER BY we.created_at,we.id", (status, status),
+        ) if row["project_key"] in self.kernels]
+
     def _poll_linear(self) -> None:
-        for run in self.ledger.list_runs(status="running", limit=1000):
+        for run in self._owned_runs("running"):
             worker = self.linear_workers.get(str(run["project_key"]))
             if worker:
                 worker.poll(str(run["id"]), str(run["work_item_identifier"]))
@@ -608,7 +623,7 @@ class FactoryRuntime:
         linear_projection = self.config.resolve_linear_projection(
             environment=self.environment
         ) if hasattr(self, "config") else {"agent_session_url_template": None}
-        for run in reversed(self.ledger.list_runs(limit=1000)):
+        for run in self._owned_runs():
             execution_id = str(run["id"])
             project_key = str(run["project_key"])
             if project_key not in self.linear_evidence_workers:
@@ -654,7 +669,7 @@ class FactoryRuntime:
 
     def _claim_pickups(self) -> list[str]:
         claimed = []
-        for run in reversed(self.ledger.list_runs(status="running", limit=1000)):
+        for run in self._owned_runs("running"):
             project_key = str(run["project_key"])
             kernel = self.kernels.get(project_key)
             if not kernel:
@@ -704,7 +719,7 @@ class FactoryRuntime:
 
     def _cleanup_terminal_workspaces(self) -> list[dict[str, Any]]:
         results = []
-        for run in self.ledger.list_runs(limit=1000):
+        for run in self._owned_runs():
             if run["status"] != "completed":
                 continue
             project_key = str(run["project_key"])
@@ -729,10 +744,16 @@ class FactoryRuntime:
             })
         return results
 
+    def _dispatch_budget(self, project: str, execution: str) -> dict[str, Any]:
+        from .budgets import evaluate
+        decision = evaluate(self.ledger, self.config.values.get("budgets", {}), project, execution)
+        self.ledger.record_operating_receipt("budget", project, execution, decision)
+        return decision
+
     def step(self) -> dict[str, Any]:
         if self.operator_server:
             self.operator_server.pump()
-        if self.drain_requested:
+        if self.drain_requested or self.stop_requested:
             return {"claimed": [], "scheduler": {"disposition": "idle"}, "cleanup": []}
         self._poll_linear()
         self._drain_linear()
@@ -759,7 +780,7 @@ class FactoryRuntime:
         if step["claimed"]:
             return False
         disposition = str(step["scheduler"]["disposition"])
-        return disposition in ("idle", "capacity", "needs_attention")
+        return disposition in ("idle", "capacity", "needs_attention", "budget_blocked")
 
     def _at_target(self) -> bool:
         return bool(self.target_execution_id and self.target_state and self.ledger.current(

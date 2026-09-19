@@ -88,6 +88,7 @@ class Scheduler:
         runner: PreparedRunner, owner: str, policy: SchedulerPolicy,
         observer: Callable[[SchedulerTick], None] | None = None,
         fault_hook: Callable[[str], None] | None = None,
+        dispatch_budget: Callable[[str, str], Mapping[str, Any]] | None = None,
     ) -> None:
         self.ledger = ledger
         self.projects = dict(projects)
@@ -96,6 +97,7 @@ class Scheduler:
         self.policy = policy
         self.observer = observer
         self.fault_hook = fault_hook
+        self.dispatch_budget = dispatch_budget
 
     def _fault(self, boundary: str) -> None:
         if self.fault_hook:
@@ -342,6 +344,21 @@ class Scheduler:
         self, dispatch: Mapping[str, Any], project: ScheduledProject,
         request: RunnerRequest, *, recovered: bool,
     ) -> SchedulerTick:
+        if self.dispatch_budget:
+            budget = self.dispatch_budget(str(dispatch["project_key"]), str(dispatch["execution_id"]))
+            if budget["status"] == "blocked":
+                available_at = (parse_timestamp(self.ledger.clock()) + timedelta(
+                    milliseconds=self.policy.poll_interval_ms,
+                )).isoformat()
+                self.ledger.defer_dispatch(
+                    str(dispatch["id"]), claim_token=str(dispatch["claim_token"]),
+                    available_at=available_at, error=dict(budget),
+                )
+                return self._emit(SchedulerTick(
+                    "budget_blocked", dispatch_id=str(dispatch["id"]),
+                    execution_id=str(dispatch["execution_id"]), attempt_id=str(dispatch["attempt_id"]),
+                    detail=dict(budget),
+                ))
         preparation = project.preparation.prepare(request)
         self._fault("after_preparation_result")
         current = self.ledger.dispatch(str(dispatch["id"]))

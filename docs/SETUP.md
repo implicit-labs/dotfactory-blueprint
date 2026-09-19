@@ -60,6 +60,11 @@ Codex routes default to `gpt-5.6-sol` with medium reasoning and pass both values
 explicitly at launch. Set `default_model` or `default_reasoning_effort` on the
 route to change that baseline; DOT node and profile values take precedence.
 
+For repeated, explicitly admitted work, follow [continuous work](../factory/CONTINUOUS_WORK.md).
+`work` is disabled until opted in; use one host slot, an admission label and
+reviewed token limits. The guide covers status, drain/restart and a Linux user
+service. Empty-queue polling does not launch model calls.
+
 For live Linear convergence, configure each Linear project's stable team and
 project IDs, export the variables named by their `_env` fields, and export the
 authorization value named by `projections.linear.token_env`. The factory binds

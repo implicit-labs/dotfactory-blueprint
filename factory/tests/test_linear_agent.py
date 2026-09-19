@@ -530,7 +530,7 @@ class LinearAgentTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        self.assertEqual(13, self.ledger.connection.execute(
+        self.assertEqual(14, self.ledger.connection.execute(
             "PRAGMA user_version"
         ).fetchone()[0])
         self.assertTrue({
