@@ -6,6 +6,7 @@
 | Date | 2026-09-13 |
 | Deciders | Project maintainers |
 | Supersedes | — |
+| Superseded by | [ADR-0039](0039-replace-unusable-frozen-verifiers-through-reviewed-replanning.md) (replanning policy only) |
 
 ## Decision
 

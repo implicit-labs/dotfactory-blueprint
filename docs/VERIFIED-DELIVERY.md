@@ -177,28 +177,43 @@ its distinct local state prevents agent pickup. A Ready issue adopted without a
 local approved plan waits without launching implementation: explicitly transition it to
 Planning first. PlanReview can also transition to Planning for revisions.
 
-After implementation begins, changing approved checks requires a new issue/planning
-execution against the intended base; this preset does not silently reopen or
-rewrite an approval. Code-only rework uses the existing Review → Reworking path
-and the same approved checks. Use a bounded two-step rework/verification pass.
+After implementation begins, agents cannot change approved checks. Code-only
+rework uses Review → Reworking and the same approved checks. A verifier that is
+itself unusable follows the separate audited path below.
 
 ## Recover an incompatible frozen plan
 
-Never rewrite or resume an accepted plan with replacement checks. Preserve its
-workspace, ledger events, failed receipts, and execution snapshots.
+Do not edit an accepted plan during implementation or investigation. A failed
+`python-verification-v2` receipt is classified as `frozen_verification_failed`.
+Investigation must diagnose whether the product is wrong or the harness is
+unusable. Product failures use ordinary recovery/rework. If investigation reaches
+Blocked and the harness is unusable, an approver may request replacement planning:
 
-1. If the execution is nonterminal, cancel it through the existing audited
-   operator/control transition. Do not add a bypass edge.
-2. Start the same work item again. `start_issue` returns an existing active
-   execution, or derives its begin-command identity from the next execution
-   number after terminal completion. The ledger atomically assigns that number
-   and key; validate and approve the new plan independently.
-3. Record both execution IDs in operator evidence so the new attempt is linked
-   without changing the old one.
+```json
+{
+  "action": "replan",
+  "expected_state": "Blocked",
+  "confirmed": true,
+  "parameters": {
+    "owner": "planner-1",
+    "reason": "The verifier passes the export path to unittest as a test name."
+  }
+}
+```
 
-Stop for human intervention if the existing execution cannot be terminalized or
-a fresh execution cannot be created. This route does not migrate accepted checks
-or authorize implementation in place.
+The command fails unless the workspace still equals the exact failed verification
+revision. It records that revision, the replaced plan attempt, the approver, and
+the reason before entering Replanning. Replanning may change only the plan and
+declared verification files. `ReplanReview` requires a new exact-SHA approval and
+an owner for verification; approval proceeds directly to Verifying against the
+implementation already present. The old plan, failure, investigation, and source
+revision remain immutable ledger history.
+
+This edge exists only in workflow snapshots created after its release. For an
+older blocked execution, preserve it and use the cancel/new-execution procedure.
+Structural validation still uses `ast.parse`; it proves syntax, not that a test
+harness accepts the host invocation. Do not run proposed acceptance tests during
+planning because pre-implementation assertion failures are expected.
 
 ## Export the delivered change
 

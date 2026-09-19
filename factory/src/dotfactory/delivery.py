@@ -233,8 +233,10 @@ def approved_plan(ledger: Any, execution_id: str) -> dict[str, Any]:
     plan = planned_receipt(ledger, execution_id)
     decision = ledger.connection.execute(
         "SELECT id,event_seq,from_state FROM transition_decisions WHERE execution_id=? AND "
-        "((from_state='PlanReview' AND actor='human') OR (from_state='Autoplanning' AND actor='agent')) "
-        "AND to_state='Ready' AND event_seq>? ORDER BY event_seq DESC LIMIT 1",
+        "event_seq>? AND (((from_state='PlanReview' AND actor='human') "
+        "OR (from_state='Autoplanning' AND actor='agent')) AND to_state='Ready' "
+        "OR (from_state='ReplanReview' AND actor='human' AND to_state='Verifying')) "
+        "ORDER BY event_seq DESC LIMIT 1",
         (execution_id, plan["seq"]),
     ).fetchone()
     if not decision:
@@ -251,8 +253,77 @@ def approved_plan(ledger: Any, execution_id: str) -> dict[str, Any]:
     for name, expected in receipt["verification_plan"]["files"].items():
         if digest(local_file(root, name).read_bytes()) != expected:
             raise DeliveryError(f"approved verification file changed: {name}")
+    replacement = receipt.get("replan") or {}
     return {"decision_id": decision["id"], "plan_attempt_id": receipt["attempt_id"],
-            "head_sha": receipt["source"]["head_sha"], **receipt["verification_plan"]}
+            "plan_receipt_seq": plan["seq"], "head_sha": receipt["source"]["head_sha"],
+            "implementation_base_sha": replacement.get(
+                "implementation_base_sha", receipt["source"]["head_sha"]
+            ), **receipt["verification_plan"]}
+
+
+def replan_context(ledger: Any, execution_id: str) -> dict[str, str]:
+    """Bind replanning to the exact failed frozen-verifier source revision."""
+    approved = approved_plan(ledger, execution_id)
+    row = ledger.connection.execute(
+        "SELECT seq,payload_json FROM events WHERE execution_id=? "
+        "AND event_type='delivery_checked' AND seq>? ORDER BY seq DESC",
+        (execution_id, approved["plan_receipt_seq"]),
+    ).fetchone()
+    if not row:
+        raise DeliveryError("replan requires a failed frozen verification receipt")
+    receipt = json.loads(row["payload_json"])
+    verification = receipt.get("verification") or {}
+    if (
+        receipt.get("contract") != "python-verification-v2"
+        or receipt.get("passed") is not False
+        or receipt.get("error") != "pinned verification failed"
+        or verification.get("exit_code") in (None, 0)
+    ):
+        raise DeliveryError("replan requires a failed frozen verification receipt")
+    workspace = ledger.workspace_for_execution(execution_id)
+    if not workspace:
+        raise DeliveryError("replan requires workspace provenance")
+    current = source_snapshot(workspace)
+    failed = receipt.get("source") or {}
+    if current["head_sha"] != failed.get("head_sha"):
+        raise DeliveryError(
+            "source changed after frozen verification failed; restore or cancel before replanning"
+        )
+    return {
+        "baseline_head_sha": current["head_sha"],
+        "replaces_plan_attempt_id": approved["plan_attempt_id"],
+        "implementation_base_sha": approved["implementation_base_sha"],
+    }
+
+
+def _recorded_replan_context(ledger: Any, execution_id: str) -> dict[str, str]:
+    row = ledger.connection.execute(
+        "SELECT e.payload_json FROM transition_decisions td JOIN events e "
+        "ON e.seq=td.event_seq WHERE td.execution_id=? "
+        "AND td.from_state='Blocked' AND td.to_state='Replanning' "
+        "ORDER BY td.event_seq DESC LIMIT 1",
+        (execution_id,),
+    ).fetchone()
+    payload = json.loads(row["payload_json"]) if row else {}
+    evidence = [
+        item for item in payload.get("evidence", [])
+        if item.get("kind") == "replan_baseline"
+    ]
+    if len(evidence) != 1:
+        raise DeliveryError("replanning requires one recorded source baseline")
+    item = evidence[0]
+    uri = str(item.get("uri", ""))
+    context = {
+        "baseline_head_sha": uri.removeprefix("git:"),
+        "replaces_plan_attempt_id": str(item.get("replaces_plan_attempt_id", "")),
+        "implementation_base_sha": str(item.get("implementation_base_sha", "")),
+    }
+    if (
+        not uri.startswith("git:")
+        or any(not value for value in context.values())
+    ):
+        raise DeliveryError("recorded replanning baseline is incomplete")
+    return context
 
 
 def guard_planned_transition(ledger: Any, execution_id: str, states: dict[str, Any],
@@ -262,12 +333,19 @@ def guard_planned_transition(ledger: Any, execution_id: str, states: dict[str, A
     if from_state == "Autoplanning" and to_state == "Ready":
         plan = planned_receipt(ledger, execution_id)["receipt"]
         require_receipt(ledger, plan["attempt_id"], "plan-result-v2")
-    if from_state == "PlanReview" and to_state == "Ready":
+    if (
+        (from_state == "PlanReview" and to_state == "Ready")
+        or (from_state == "ReplanReview" and to_state == "Verifying")
+    ):
         plan = planned_receipt(ledger, execution_id)["receipt"]
         require_receipt(ledger, plan["attempt_id"], "plan-result-v2")
         if not any(plan["source"]["head_sha"] in str(item.get("body", "")) for item in feedback or []):
             raise DeliveryError("approval feedback must name the exact reviewed plan commit")
-    if states[to_state].get("execution", {}).get("exit_contract") in ("implementation-result-v2", "python-verification-v2"):
+    if (
+        states[to_state].get("execution", {}).get("exit_contract")
+        in ("implementation-result-v2", "python-verification-v2")
+        and not (from_state == "ReplanReview" and to_state == "Verifying")
+    ):
         plan = approved_plan(ledger, execution_id)
         if from_state == "Ready":
             workspace = ledger.workspace_for_execution(execution_id)
@@ -432,7 +510,25 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
         receipt["plan_sha256"] = digest(plan.read_bytes())
         if contract == "plan-result-v2":
             receipt["verification_plan"] = verification_definition(root)
-            if any(name not in receipt["verification_plan"]["files"] for name in source["changed_files"]):
+            if request.state_id == "Replanning":
+                context = _recorded_replan_context(ledger, request.execution_id)
+                git(root, "merge-base", "--is-ancestor", context["baseline_head_sha"], source["head_sha"])
+                changes = git(
+                    root, "diff", "--name-only", "-z",
+                    context["baseline_head_sha"], source["head_sha"], "--",
+                ).decode().split("\0")
+                if any(
+                    name and name not in receipt["verification_plan"]["files"]
+                    for name in changes
+                ):
+                    raise DeliveryError(
+                        "replanning may change only its plan and declared verification files"
+                    )
+                receipt["replan"] = context
+            elif any(
+                name not in receipt["verification_plan"]["files"]
+                for name in source["changed_files"]
+            ):
                 raise DeliveryError("planning may change only its plan and declared verification files")
         approved = None
         if contract in ("implementation-result-v2", "python-verification-v2"):
@@ -445,7 +541,10 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
         if contract not in ("plan-result-v1", "plan-result-v2"):
             changes = source["changed_files"]
             if approved:
-                changes = git(root, "diff", "--name-only", "-z", approved["head_sha"], "HEAD").decode().split("\0")
+                changes = git(
+                    root, "diff", "--name-only", "-z",
+                    approved.get("implementation_base_sha", approved["head_sha"]), "HEAD",
+                ).decode().split("\0")
             if not any(name and not name.startswith(".factory/") for name in changes):
                 raise DeliveryError("delivery has no change outside its planning/evidence files")
             report = local_file(root, ".factory/delivery.json")
@@ -469,6 +568,10 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
                     policy=policy,
                 )
                 if receipt["verification"]["exit_code"] != 0:
+                    receipt["failure"] = {
+                        "category": "frozen_verification_failed",
+                        "recovery": "investigate_then_request_confirmed_replan_if_harness_is_unusable",
+                    }
                     raise DeliveryError("pinned verification failed")
         if source_snapshot(workspace) != source:
             raise DeliveryError("verification changed the source being checked")
@@ -515,7 +618,7 @@ def latest_check(ledger: Any, execution_id: str) -> dict[str, Any] | None:
 def export_review(ledger: Any, execution_id: str, output: str) -> dict[str, Any]:
     current = ledger.current(execution_id)
     receipt = latest_check(ledger, execution_id)
-    planning = current["current_state_id"] == "PlanReview" and receipt and receipt["contract"] == "plan-result-v2"
+    planning = current["current_state_id"] in ("PlanReview", "ReplanReview") and receipt and receipt["contract"] == "plan-result-v2"
     if not planning and (current["current_state_id"] != "Review" or not receipt or receipt["contract"] not in ("python-verification-v1", "python-verification-v2")):
         raise DeliveryError("review export requires the verified Python workflow at Review")
     require_receipt(ledger, receipt["attempt_id"], receipt["contract"])

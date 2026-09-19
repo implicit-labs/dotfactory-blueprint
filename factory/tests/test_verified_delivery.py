@@ -5,7 +5,10 @@ from unittest.mock import patch
 from pathlib import Path
 
 from dotfactory.cli import _demo_config, _git
-from dotfactory.delivery import DeliveryError, evaluate, require_receipt, export_review, local_file, _verify, git
+from dotfactory.delivery import (
+    DeliveryError, _verify, evaluate, export_review, git, local_file,
+    planned_receipt, require_receipt,
+)
 from dotfactory.control import Principal, ControlError
 from dotfactory.handoff import build_handoff
 from dotfactory.instance import FactoryConfig
@@ -23,6 +26,12 @@ from greeting import greet
 assert greet() == "こんにちは", greet()
 print("PASS description requirement: Japanese greeting")
 '''
+BROKEN_ARGV_VERIFY = '''import sys, unittest
+class GreetingTest(unittest.TestCase):
+    def test_placeholder(self):
+        self.assertTrue(True)
+unittest.main()
+'''
 
 
 class ApprovedRuntime(FactoryRuntime):
@@ -38,11 +47,13 @@ class ApprovedRuntime(FactoryRuntime):
 def approve_plan(runtime, execution):
     from dotfactory.delivery import planned_receipt
     head = planned_receipt(runtime.ledger, execution)["receipt"]["source"]["head_sha"]
+    state = runtime.ledger.current(execution)["current_state_id"]
     result = runtime.control_service("demo").execute(
         execution, command_id="approve-" + head,
         principal=Principal("reviewer", "approver", "test"),
-        request={"action": "approve", "expected_state": "PlanReview",
-                 "parameters": {"plan_sha": head, "note": "Reviewed acceptance coverage"}})
+        request={"action": "approve", "expected_state": state,
+                 "parameters": {"plan_sha": head, "note": "Reviewed acceptance coverage",
+                                **({"owner": "verifier"} if state == "ReplanReview" else {})}})
     if result["status"] != "completed":
         raise AssertionError(result)
 
@@ -395,6 +406,104 @@ class VerifiedDeliveryTests(unittest.TestCase):
             runtime.step()
             runtime.step()
             self.assertEqual("Blocked", runtime.ledger.current(execution)["current_state_id"])
+
+    def test_approver_can_replace_unusable_frozen_verifier_without_losing_history(self):
+        class BrokenThenFixedRunner(EditingRunner):
+            def run(self, launch):
+                if launch.request.state_id == "Investigating":
+                    self.calls.append("Investigating")
+                    return RunnerResult(
+                        "Frozen verifier treated the export path as a unittest name.",
+                        "blocked", ({"kind": "diagnosis", "uri": "ledger://argv-failure"},),
+                    )
+                if launch.request.state_id == "Replanning":
+                    root = Path(launch.workspace_path)
+                    (root / ".factory/verify.py").write_text(VERIFY)
+                result = super().run(launch)
+                if launch.request.state_id == "Autoplanning":
+                    root = Path(launch.workspace_path)
+                    (root / ".factory/verify.py").write_text(BROKEN_ARGV_VERIFY)
+                    _git(root, "add", ".factory/verify.py")
+                    _git(root, "commit", "--amend", "--no-edit")
+                return result
+
+        self.use_automatic_workflow()
+        runner = BrokenThenFixedRunner()
+        with FactoryRuntime(self.config, runner=runner) as runtime:
+            execution = runtime.start_issue("demo", "DEMO-ARGV-REPLAN")
+            for _ in range(4):
+                runtime.step()
+            self.assertEqual("Blocked", runtime.ledger.current(execution)["current_state_id"])
+            failed = json.loads(runtime.ledger.connection.execute(
+                "SELECT payload_json FROM events WHERE execution_id=? "
+                "AND event_type='delivery_checked' AND payload_json LIKE '%pinned verification failed%' "
+                "ORDER BY seq DESC LIMIT 1", (execution,),
+            ).fetchone()[0])
+            self.assertEqual("frozen_verification_failed", failed["failure"]["category"])
+            self.assertNotEqual(0, failed["verification"]["exit_code"])
+            self.assertIn("has no attribute", failed["verification"]["output"])
+            delivery = runtime.control_service("demo").observation.delivery(execution)
+            self.assertEqual(
+                "frozen_verification_failed", delivery["data"]["failure"]["category"],
+            )
+            actions = runtime.control_service("demo").observation.run(execution)["data"]["available_actions"]
+            replan = next(item for item in actions if item["action"] == "replan")
+            self.assertTrue(replan["confirmation_required"])
+
+            denied = runtime.control_service("demo").execute(
+                execution, command_id="operator-replan",
+                principal=Principal("operator", "operator", "test"),
+                request={"action": "replan", "expected_state": "Blocked", "confirmed": True,
+                         "parameters": {"owner": "planner", "reason": "argv harness is unusable"}},
+            )
+            self.assertEqual("denied", denied["status"])
+            root = Path(runtime.ledger.workspace_for_execution(execution)["path"])
+            greeting = (root / "greeting.py").read_text()
+            (root / "greeting.py").write_text('def greet():\n    return "changed after failure"\n')
+            with self.assertRaisesRegex(ControlError, "commit all delivery files"):
+                runtime.control_service("demo").execute(
+                    execution, command_id="dirty-replan",
+                    principal=Principal("reviewer", "approver", "test"),
+                    request={"action": "replan", "expected_state": "Blocked", "confirmed": True,
+                             "parameters": {"owner": "planner", "reason": "argv harness is unusable"}},
+                )
+            (root / "greeting.py").write_text(greeting)
+            runtime.control_service("demo").execute(
+                execution, command_id="approved-replan",
+                principal=Principal("reviewer", "approver", "test"),
+                request={"action": "replan", "expected_state": "Blocked", "confirmed": True,
+                         "parameters": {"owner": "planner", "reason": "Remove export path before unittest parses argv"}},
+            )
+            runtime.step()
+            self.assertEqual("ReplanReview", runtime.ledger.current(execution)["current_state_id"])
+            replacement = planned_receipt(runtime.ledger, execution)["receipt"]
+            self.assertEqual(
+                failed["approved_plan"]["plan_attempt_id"],
+                replacement["replan"]["replaces_plan_attempt_id"],
+            )
+            packet = export_review(runtime.ledger, execution, str(self.root / "replan-review"))
+            self.assertEqual(replacement["source"]["head_sha"], packet["head_sha"])
+            approve_plan(runtime, execution)
+            runtime.step()
+            latest = json.loads(runtime.ledger.connection.execute(
+                "SELECT payload_json FROM events WHERE execution_id=? "
+                "AND event_type='delivery_checked' ORDER BY seq DESC LIMIT 1",
+                (execution,),
+            ).fetchone()[0])
+            self.assertEqual(
+                "Review", runtime.ledger.current(execution)["current_state_id"],
+                json.dumps(latest),
+            )
+            failures = runtime.ledger.connection.execute(
+                "SELECT count(*) FROM events WHERE execution_id=? "
+                "AND event_type='delivery_checked' AND payload_json LIKE '%frozen_verification_failed%'",
+                (execution,),
+            ).fetchone()[0]
+            self.assertEqual(1, failures)
+            self.assertEqual(
+                ["Autoplanning", "Implementing", "Verifying", "Investigating", "Replanning", "Verifying"],
+                runner.calls,
+            )
 
     def test_nonexistent_evidence_cannot_complete_planning(self):
         with ApprovedRuntime(self.config, runner=EditingRunner(missing=True)) as runtime:

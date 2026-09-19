@@ -316,9 +316,12 @@ class ObservationService:
         if receipt:
             source = receipt.get("source", {})
             verification = receipt.get("verification", {})
+            failure = receipt.get("failure", {})
             receipt = {key: receipt[key] for key in
                        ("attempt_id", "contract", "passed") if key in receipt} | {
                 "error": str(receipt.get("error", ""))[:2000],
+                "failure": {key: failure[key] for key in
+                            ("category", "recovery") if key in failure},
                 "source": {key: source[key] for key in
                            ("base_sha", "head_sha", "patch_sha256") if key in source},
                 "verification": {key: verification[key] for key in
@@ -394,7 +397,7 @@ class ObservationService:
             self.ledger, self.kernel, str(snapshot["id"]), state
         ) if snapshot["status"] == "running" else []
         actions: list[dict[str, Any]] = []
-        for action in ("cancel", "approve", "retry"):
+        for action in ("cancel", "approve", "retry", "replan"):
             candidates = [
                 edge for edge in edges if edge.get("action", "transition") == action
             ]
@@ -455,7 +458,9 @@ class ControlService:
                 "Idempotency-Key must use 1 to 200 URL-safe characters",
             )
         action = request.get("action")
-        if action not in ("cancel", "retry", "approve", "transition", "attention"):
+        if action not in (
+            "cancel", "retry", "approve", "replan", "transition", "attention",
+        ):
             raise ControlError("invalid_action", "action is not supported")
         if not isinstance(request.get("expected_state"), str):
             raise ControlError("expected_state_required", "expected_state is required")
@@ -672,8 +677,9 @@ class ControlService:
         if action == "approve":
             edge = action_edge("approve")
             note = parameters.get("note")
+            owner = parameters.get("owner")
             _workflow, delivery_states, _edges = self.kernel.graph_for_execution(execution_id)
-            if state == "PlanReview" and any(
+            if state in ("PlanReview", "ReplanReview") and any(
                 node.get("execution", {}).get("exit_contract") == "plan-result-v2"
                 for node in delivery_states.values()
             ):
@@ -686,6 +692,10 @@ class ControlService:
                 not isinstance(note, str) or not note.strip()
             ):
                 raise ControlError("approval_note_required", "approval note is required")
+            if delivery_states[str(edge["to"])]["kind"] == "work" and (
+                not isinstance(owner, str) or not owner.strip()
+            ):
+                raise ControlError("owner_required", "approve requires an owner for work")
             feedback = []
             if isinstance(note, str) and note.strip():
                 feedback.append({
@@ -697,6 +707,7 @@ class ControlService:
                 })
             return self._transition(
                 execution_id, str(edge["to"]), command_id=command_id, current=current,
+                owner=owner.strip() if isinstance(owner, str) else None,
                 feedback=feedback,
             )
         if action == "retry":
@@ -721,6 +732,42 @@ class ControlService:
                 execution_id, target, command_id=command_id, current=current,
                 owner=owner.strip() if isinstance(owner, str) else None,
                 outcome=outcome, evidence=evidence,
+            )
+        if action == "replan":
+            edge = action_edge("replan")
+            owner = parameters.get("owner")
+            reason = parameters.get("reason")
+            if not isinstance(owner, str) or not owner.strip():
+                raise ControlError("owner_required", "replan requires an owner")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ControlError(
+                    "replan_reason_required",
+                    "replan requires a reason describing why the frozen verifier is unusable",
+                )
+            from .delivery import DeliveryError, replan_context
+            try:
+                context = replan_context(self.ledger, execution_id)
+            except DeliveryError as error:
+                raise ControlError(
+                    "replan_not_safe", str(error), status=409,
+                ) from error
+            feedback = [{
+                "source": "control_api",
+                "kind": str(edge.get("feedback_kind", "changes_requested")),
+                "author": principal.subject,
+                "body": reason.strip(),
+                "url": f"control://commands/{command_id}",
+            }]
+            return self._transition(
+                execution_id, str(edge["to"]), command_id=command_id,
+                current=current, owner=owner.strip(), feedback=feedback,
+                evidence=[{
+                    "kind": "replan_baseline",
+                    "uri": f"git:{context['baseline_head_sha']}",
+                    "replaces_plan_attempt_id": context["replaces_plan_attempt_id"],
+                    "implementation_base_sha": context["implementation_base_sha"],
+                    "reason": reason.strip(),
+                }],
             )
         target = parameters.get("to_state")
         if not isinstance(target, str) or not target:
