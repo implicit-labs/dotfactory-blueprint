@@ -210,6 +210,75 @@ else:
             self.assertEqual(3, runtime.ledger.connection.execute(
                 "SELECT COUNT(*) FROM worker_handoffs").fetchone()[0])
 
+    def test_failed_readiness_blocks_before_allocation_and_native_launch(self):
+        values = json.loads(self.path.read_text())
+        values["execution"]["stages"]["Autoplanning"]["readiness"] = [{
+            "name": "python-version", "command": [sys.executable, "-c",
+                "import sys; raise SystemExit(sys.version_info < (99, 0))"]}]
+        self.path.write_text(json.dumps(values))
+        with FactoryRuntime(FactoryConfig.load(self.path)) as runtime:
+            execution = runtime.start_issue("demo", "DEMO-READINESS")
+            runtime.run([execution], max_ticks=3)
+            self.assertIsNone(runtime.ledger.workspace_for_execution(execution))
+            attention = runtime.ledger.run_snapshot(execution)["attention_requests"]
+            self.assertIn("readiness:python-version:nonzero-exit", json.dumps(attention))
+            self.assertFalse((self.root / "cloud").exists())
+            self.assertEqual(0, runtime.ledger.connection.execute("SELECT COUNT(*) FROM runner_runs").fetchone()[0])
+
+    def test_skill_notice_reaches_trace_without_creating_error_fact(self):
+        notice = ("Skill descriptions were shortened to fit the skills context budget. "
+                  "Codex can still see every skill, but some descriptions are shorter. "
+                  "Disable unused skills or plugins to leave more room for the rest.")
+        self.fixture.write_text(self.fixture.read_text().replace("    text = sys.stdin.read()",
+            "    print(json.dumps(" + repr({"type": "item.completed", "item": {
+                "type": "error", "message": notice}}) + "))\n    text = sys.stdin.read()"))
+        with FactoryRuntime(FactoryConfig.load(self.path)) as runtime:
+            execution = runtime.start_issue("demo", "DEMO-NOTICE")
+            runtime.run([execution], max_ticks=20)
+            self.assertEqual("Review", runtime.ledger.current(execution)["current_state_id"])
+            self.assertEqual(0, runtime.ledger.connection.execute("SELECT COUNT(*) FROM error_facts").fetchone()[0])
+            rows = runtime.ledger.connection.execute("SELECT payload_json FROM runner_events WHERE kind='warning'").fetchall()
+            self.assertEqual(3, len(rows))
+            self.assertTrue(all(json.loads(row[0])["excerpt"] == notice for row in rows))
+
+    def test_old_worker_cannot_silently_skip_requested_readiness(self):
+        values = json.loads(self.path.read_text())
+        values["execution"]["stages"]["Autoplanning"]["readiness"] = [{
+            "name": "python-version", "command": [sys.executable, "-c", "pass"]}]
+        self.path.write_text(json.dumps(values))
+        with FactoryRuntime(FactoryConfig.load(self.path)) as runtime:
+            execution = runtime.start_issue("demo", "DEMO-OLD-WORKER")
+            with patch("dotfactory.execution.call", return_value={"available": True,
+                    "missing": [], "version": "codex-cli 1.0.0"}):
+                runtime.run([execution], max_ticks=3)
+            self.assertIsNone(runtime.ledger.workspace_for_execution(execution))
+            self.assertIn("did not report requested readiness", json.dumps(
+                runtime.ledger.run_snapshot(execution)["attention_requests"]))
+            self.assertFalse((self.root / "cloud").exists())
+
+    def test_probe_reports_success_without_retaining_output(self):
+        report = call(self.policy["workers"]["cloud"], {"op": "probe", "kind": "codex",
+            "command": str(self.fixture), "billing": "subscription", "requires": [],
+            "readiness": [{"name": "python-version", "command": [sys.executable, "-c",
+                "print('private-fixture-output'); import sys; assert sys.version_info >= (3, 9)"]}]})
+        self.assertTrue(report["available"])
+        self.assertEqual([{"name": "python-version", "passed": True, "exit_code": 0, "reason": "passed"}], report["readiness"])
+        self.assertNotIn("private-fixture-output", json.dumps(report))
+
+    def test_readiness_validation_and_bounded_failures(self):
+        valid = {"name": "test", "command": [sys.executable, "-c", "pass"]}
+        for probes in (None, [valid] * 9, [valid, valid],
+                       [dict(valid, name="bad name")], [dict(valid, timeout_seconds=True)],
+                       [dict(valid, timeout_seconds=31)], [dict(valid, command="echo")],
+                       [dict(valid, name=str(i), timeout_seconds=30) for i in range(3)]):
+            with self.subTest(probes=probes), self.assertRaises(ValueError):
+                worker.validate_readiness(probes)
+        results = worker.readiness([
+            {"name": "missing", "command": ["/nonexistent-readiness-tool"]},
+            {"name": "timeout", "command": [sys.executable, "-c", "import time; time.sleep(30)"], "timeout_seconds": 1},
+        ], dict(os.environ))
+        self.assertEqual(["unavailable", "timeout"], [r["reason"] for r in results])
+
     def test_ineligible_stage_never_runs_or_allocates_workspace(self):
         values = json.loads(self.path.read_text())
         values["execution"]["stages"]["Autoplanning"]["requires"] = ["os:unavailable"]
@@ -301,11 +370,17 @@ else:
             self.assertEqual("accepted", runtime.execution.record(launch.request)["status"])
 
     def test_policy_is_snapshotted_before_future_stage_placement(self):
+        values = json.loads(self.path.read_text())
+        frozen = [{"name": "version", "command": [sys.executable, "-c", "pass"]}]
+        values["execution"]["stages"]["Verifying"]["readiness"] = frozen
+        self.path.write_text(json.dumps(values))
         with FactoryRuntime(FactoryConfig.load(self.path)) as runtime:
             execution, launch = self.prepared(runtime)
             runtime.execution.policy["stages"]["Verifying"]["workers"] = ["cloud"]
+            runtime.execution.policy["stages"]["Verifying"]["readiness"] = []
             stored = runtime.execution._policy(launch.request)
             self.assertEqual(["mac"], stored["policy"]["stages"]["Verifying"]["workers"])
+            self.assertEqual(frozen, stored["policy"]["stages"]["Verifying"]["readiness"])
 
     def test_fallback_never_changes_billing_method(self):
         self.policy["workers"]["mac"]["billing"] = "api"

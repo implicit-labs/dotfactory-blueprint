@@ -50,7 +50,7 @@ def validate_policy(policy):
     if not isinstance(policy["stages"], dict) or not policy["stages"]:
         raise ValueError("execution stages must be a nonempty object")
     for rule in policy["stages"].values():
-        if not isinstance(rule, dict) or set(rule) - {"workers", "requires", "scope", "checks", "check_timeout_seconds"}:
+        if not isinstance(rule, dict) or set(rule) - {"workers", "requires", "scope", "checks", "check_timeout_seconds", "readiness"}:
             raise ValueError("unknown execution stage setting")
         if rule.get("scope") not in ("portable", "native"):
             raise ValueError("stage scope must explicitly be portable or native")
@@ -62,6 +62,7 @@ def validate_policy(policy):
             raise ValueError("stage requires explicit OS, architecture, or tool requirements")
         if not isinstance(rule.get("checks"), list) or any(not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or not arg or '\x00' in arg for arg in argv) for argv in rule["checks"]):
             raise ValueError("stage checks must be arrays of command arguments")
+        worker.validate_readiness(rule.get("readiness", []))
         timeout = rule.get("check_timeout_seconds", 300)
         if type(timeout) is not int or not 1 <= timeout <= 3600:
             raise ValueError("check timeout must be 1..3600 seconds")
@@ -184,9 +185,24 @@ class ExecutionManager:
             config = policy["workers"][name]
             spec = {"op": "probe", "kind": route.kind, "command": route.command,
                     "billing": config["billing"], "requires": sorted(requirements),
-                    "environment_envs": list(route.environment_envs)}
+                    "environment_envs": list(route.environment_envs),
+                    "readiness": rule.get("readiness", [])}
             try:
-                report = call(config, spec)
+                budget = 45 + sum(item.get("timeout_seconds", 10) for item in spec["readiness"])
+                report = call(config, spec, timeout=budget)
+                expected = [item["name"] for item in spec["readiness"]]
+                results = report.get("readiness", [])
+                if expected and (not isinstance(results, list) or
+                        len(results) != len(expected) or not all(isinstance(item, dict) for item in results) or
+                        [item.get("name") for item in results if isinstance(item, dict)] != expected):
+                    failures.append(name + ": worker did not report requested readiness probes")
+                    continue
+                if expected and any(item.get("passed") is not True or item.get("exit_code") != 0
+                                    for item in results):
+                    report["available"] = False
+                    report["missing"] = list(report.get("missing", [])) + [
+                        "readiness:" + item["name"] + ":failed" for item in results
+                        if item.get("passed") is not True or item.get("exit_code") != 0]
                 if not report["available"]:
                     failures.append(name + ": " + ", ".join(report["missing"]))
                     continue

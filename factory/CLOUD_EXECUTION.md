@@ -18,6 +18,7 @@ acceptance commands; listing a project is not verification of an iOS change.
 | `scope: portable` | Explicit operator decision that this stage can run without Apple SDKs |
 | `scope: native` | Tracked Xcode projects/workspaces require macOS and Xcode |
 | `requires` | Checked `os:`, `arch:`, and `tool:` requirements; unknown kinds fail closed |
+| `readiness` | Bounded operator probes before allocation; [configuration and limits](../docs/guides/worker-readiness.md) |
 | `checks` | Argument arrays executed on the worker before accepting its output |
 | `check_timeout_seconds` | Per-command deadline, 1–3600 seconds |
 | `location` | Worker metadata: `local` (💻) or `cloud` (☁️), shown in Linear per selected attempt; omitted values display “Location unknown” |
@@ -32,7 +33,8 @@ config changes apply to new executions and do not relabel historical work.
 Declare requirements inside shell scripts explicitly; the precheck does not
 interpret arbitrary shell code. A successful executable probe does not prove
 physical-device access, signing identity, network reachability, or test data.
-Represent those requirements with a verification command that fails when absent.
+Use readiness probes to reject missing prerequisites before launch, then verification
+commands to prove the delivered behavior.
 
 Missing requirements become durable scheduler attention before source allocation.
 The workflow retains its existing owned work state with an attention reason;
