@@ -41,6 +41,8 @@ configured by dotfactory belong to their owning repository.
 
 | [0037](0037-check-worker-readiness-before-allocation.md) | Check worker readiness before allocation | Proposed | — |
 
+| [0038](0038-scope-execution-settings-to-projects-and-runs.md) | Scope execution settings to projects and runs | Proposed | — |
+
 ## Lifecycle
 
 | Status | Meaning |
