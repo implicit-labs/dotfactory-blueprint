@@ -574,11 +574,15 @@ class FactoryConfig:
         except ValueError as error:
             raise FactoryConfigError(str(error)) from error
         if "execution" in values:
-            from .execution import validate_policy
+            from .execution import validate_policy, overlay_policy
             try:
                 validate_policy(values["execution"])
+                for project in values["projects"].values():
+                    overlay_policy(values["execution"], project.get("execution", {}), origin="project")
             except (ValueError, TypeError) as error:
                 raise FactoryConfigError(str(error)) from error
+        elif any("execution" in project for project in values["projects"].values()):
+            raise FactoryConfigError("project execution overrides require instance execution configuration")
         _validate_projections(values)
         return cls(resolved, values)
 

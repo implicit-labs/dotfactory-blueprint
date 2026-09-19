@@ -72,6 +72,7 @@ class DurableKernel:
         self, project_key: str, identifier: str, intent: dict[str, Any], *,
         command_id: str, owner: str | None = None, actor: str = "agent",
         adopted_state: str | None = None,
+        execution_settings: dict[str, Any] | None = None,
     ) -> str:
         idempotency_key = (
             f"project:{project_key}:work:{identifier}:begin:{command_id}"
@@ -92,7 +93,7 @@ class DurableKernel:
             workflow_version=self.workflow["schema_version"], state_id=state_id,
             state_kind=state["kind"], linear_status=state["linear_status"],
             workflow_snapshot=self.definition.snapshot(),
-            resolved_node=state.get("execution", {}),
+            resolved_node=state.get("execution", {}), execution_settings=execution_settings,
             owner=owner, actor=actor,
             idempotency_key=idempotency_key,
             observed_linear_status=state["linear_status"] if adopted_state else None,
