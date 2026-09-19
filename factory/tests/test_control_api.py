@@ -102,6 +102,26 @@ class ControlAPITests(unittest.TestCase):
             [item["event_type"] for item in first["events"]],
         )
 
+    def test_ambiguous_dispatch_exposes_cancel_and_rejects_other_commands(self):
+        execution = self.move_to_review()
+        self.ledger.open_attention(
+            execution_id=execution, attempt_id=None, preparation_id=None,
+            dedupe_key="uncertain-dispatch", category="ambiguous-dispatch",
+            provider="scheduler", detail={"allowed_actions": []},
+        )
+        actions = self.observation.run(execution)["data"]["available_actions"]
+        self.assertEqual(["cancel"], [item["action"] for item in actions])
+        with self.assertRaisesRegex(ControlError, "side effects are uncertain"):
+            self.control.execute(
+                execution, command_id="unsafe-approve", principal=self.approver,
+                request={"action": "approve", "expected_state": "Review",
+                         "confirmed": True, "parameters": {"note": "Do not bypass uncertainty"}},
+            )
+        self.assertEqual("Review", self.ledger.current(execution)["current_state_id"])
+        receipt = self.ledger.control_command("unsafe-approve")
+        self.assertEqual("failed", receipt["status"])
+        self.assertEqual("ambiguous_dispatch", receipt["error"]["code"])
+
     def test_command_id_cannot_be_reused_with_different_inputs(self):
         execution = self.begin()
         self.control.execute(

@@ -132,6 +132,32 @@ it reports the owned comment ID, desired/applied digest, `pending`, `sending`,
 `ambiguous`, `confirmed`, or `failed` state, last redacted error, and remote URL.
 The comment is a rebuildable view; its state never changes the workflow result.
 
+### Projection health
+
+Overview, run snapshots, and each execution in lifecycle receipts include
+`projection_health` v1. Existing aggregate fields remain unchanged.
+
+- Channels separate Linear status, evidence comments, agent sessions/activities,
+  legacy event outboxes, and Logfire traces. Counts are local source records.
+- Each channel reports configured `enabled`, pending/retry/ambiguous/failed counts,
+  oldest outstanding age, last confirmed local delivery reference, and a safe error.
+- `disabled` retains queued counts without presenting them as an active delivery
+  failure. Legacy event outboxes have no sender in the composed runtime; they are
+  not the dedicated Linear status queue or Logfire trace delivery queue.
+- `unknown` means a standalone ledger reader has no runtime configuration.
+  `idle` means enabled but without confirmed delivery; it is not live-provider proof.
+- Native session `active` is confirmed delivery; `fallback` means the native
+  projection stopped and the separately reported evidence-comment channel remains
+  the human surface. Neither is an unexplained pending delivery.
+- Unconfirmed Logfire records conservatively inherit their fixed delivery attempt's
+  worst batch state. Accepted records are counted separately, once. A request in
+  flight is ambiguous until acknowledged; reads do not retry or change state.
+- Error bodies, request payloads, tokens, and remote URLs are never included in
+  this health object. Configuration says whether delivery is enabled, not whether
+  a sender process is currently running.
+- Logfire confirmations belong to the configured project and region. A standalone
+  reader without that configuration cannot attribute delivery to a destination.
+
 ## Commands
 
 `POST /v1/runs/{execution_id}/commands` requires an `Idempotency-Key` header of
@@ -172,6 +198,19 @@ The comment is a rebuildable view; its state never changes the workflow result.
 Attention commands reject resolved requests, changed workflow state, replaced
 attempts, stale internal fences, unauthorized roles, and reused command IDs
 with different inputs. Exact command retries return the original receipt.
+
+While a runner dispatch has no durable result, control exposes only cancellation.
+After a crash, inspect the original errors/trace and `ambiguous-dispatch` attention;
+do not force a new workflow transition or retry the launch. Cancellation abandons
+the execution without inventing a runner result. It does not establish ownership
+of or kill an unknown surviving process. Terminal workspace cleanup follows the
+configured retention policy on the running lifecycle. Canceled dispatches with
+uncertain side effects are quarantined even under `until_terminal`. Inspect and
+stop any surviving process before an approver uses confirmed attention `release`;
+`retain` and `quarantine` also resolve the cleanup decision without deleting work.
+No process is killed by this release command. Retained or unsafe workspaces
+are not silently deleted. No adapter currently proves safe continuation of an
+ambiguous dispatch.
 
 ### Receipt
 

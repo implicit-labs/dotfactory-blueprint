@@ -93,15 +93,33 @@ def _control_edges(
     ledger: SQLiteLedger, kernel: DurableKernel, execution_id: str, state: str
 ) -> list[dict[str, Any]]:
     edges = []
+    ambiguous = _ambiguous_dispatch(ledger, execution_id)
     _workflow, _states, execution_edges = kernel.graph_for_execution(execution_id)
     for edge in execution_edges:
         if edge["from"] not in (state, "@any_nonterminal"):
             continue
         if {"actor": "human", "signal": "control_command"} not in edge["evocations"]:
             continue
+        if ambiguous and edge.get("action") != "cancel":
+            continue
         if kernel.condition_matches(execution_id, edge):
             edges.append(edge)
     return edges
+
+
+def _ambiguous_dispatch(ledger: SQLiteLedger, execution_id: str) -> bool:
+    # Includes the window before restart has materialized recovery attention.
+    # A live in-flight child also cannot safely be bypassed by a fresh transition.
+    if ledger.connection.execute(
+        "SELECT 1 FROM scheduler_dispatches WHERE execution_id=? "
+        "AND status='dispatching' LIMIT 1", (execution_id,),
+    ).fetchone():
+        return True
+    return ledger.connection.execute(
+        "SELECT 1 FROM attention_requests WHERE execution_id=? AND status='open' "
+        "AND provider='scheduler' AND category='ambiguous-dispatch' LIMIT 1",
+        (execution_id,),
+    ).fetchone() is not None
 
 
 def _control_targets(
@@ -395,6 +413,8 @@ class ObservationService:
                 "action": "transition", "confirmation_required": "terminal_only",
                 "targets": targets,
             })
+        if _ambiguous_dispatch(self.ledger, str(snapshot["id"])):
+            return actions
         for attention in snapshot.get("attention_requests", []):
             remedies = list(attention.get("detail", {}).get("allowed_actions", []))
             if remedies:
@@ -500,6 +520,13 @@ class ControlService:
                     "stale_state",
                     f"expected {normalized['expected_state']}, found "
                     f"{current['current_state_id']}", status=409,
+                )
+            if action != "cancel" and _ambiguous_dispatch(self.ledger, execution_id):
+                raise ControlError(
+                    "ambiguous_dispatch",
+                    "Runner side effects are uncertain. Inspect the original trace, then cancel "
+                    "to abandon this execution. Fresh retry or continuation is not proven safe.",
+                    status=409,
                 )
             result = self._apply(
                 execution_id, command_id=command_id, principal=principal,

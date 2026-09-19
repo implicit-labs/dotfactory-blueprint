@@ -737,6 +737,24 @@ class PreparationEngine:
             "retain", "quarantine",
         ):
             return PreparationResult("retained")
+        uncertain = [str(row["id"]) for row in self.ledger.connection.execute(
+            "SELECT id,error_json FROM runner_runs WHERE execution_id=? AND status='canceled'",
+            (execution_id,),
+        ) if json.loads(row["error_json"] or "{}").get("ambiguous_side_effect")]
+        if uncertain and not explicit_release:
+            if record["status"] != "quarantined":
+                self.ledger.set_workspace_status(
+                    execution_id, owner_token=self.owner_token, status="quarantined",
+                    detail={"message": "Canceled dispatch has no proven process exit", "runner_run_ids": uncertain},
+                )
+            attention = self.ledger.open_attention(
+                execution_id=execution_id, attempt_id=None, preparation_id=None,
+                dedupe_key=f"workspace:{record['id']}:uncertain-runner-exit",
+                category="uncertain-runner-exit", provider="git-worktree",
+                detail={"message": "Inspect surviving processes before explicitly releasing this workspace. Cancellation alone does not prove process exit.",
+                        "runner_run_ids": uncertain, "allowed_actions": ["retain", "quarantine", "release"]},
+            )
+            return PreparationResult("needs_attention", attention=attention)
         outstanding = self.ledger.connection.execute(
             "SELECT id FROM resource_allocations WHERE execution_id=? "
             "AND status IN ('active','release_pending')", (execution_id,),

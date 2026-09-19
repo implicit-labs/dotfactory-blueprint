@@ -137,6 +137,15 @@ class FactoryRuntime:
         self.lock.acquire()
         try:
             self.ledger = SQLiteLedger(_ledger_path(config))
+            projections = config.values.get("projections", {})
+            linear = projections.get("linear", {})
+            logfire = projections.get("logfire", {})
+            self.ledger.projection_configuration = {
+                "linear": bool(linear.get("enabled", False)),
+                "linear_agent": bool(linear.get("enabled", False) and linear.get("agent_sessions_enabled", False)),
+                "logfire": bool(projections.get("logfire", {}).get("enabled", False)),
+                "logfire_destination": f"logfire:{logfire.get('project', '')}:{logfire.get('region', 'us')}:otel-v2",
+            }
             config.configure_ledger(
                 self.ledger, environment=self.environment,
                 only=list(self.project_keys),
@@ -833,6 +842,7 @@ class FactoryRuntime:
             item = dict(projection["summary"])
             item["linear_evidence"] = projection["linear_evidence"]
             item["linear_agent_session"] = projection["linear_agent_session"]
+            item["projection_health"] = self.ledger.run_snapshot(execution_id)["projection_health"]
             executions.append(item)
         payload: dict[str, Any] = {
             "schema_version": 1,
