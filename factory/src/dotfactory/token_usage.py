@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping
 
 
@@ -22,6 +23,8 @@ ALIASES = {
 
 def _count(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
         return None
     if value < 0 or int(value) != value:
         return None

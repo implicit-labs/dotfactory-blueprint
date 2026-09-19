@@ -3,6 +3,12 @@
   "factory_id": "example-local",
   "ledger_path": "~/.local/share/dotfactory/factory.db",
   "default_workflow": "default",
+  "work_queue": {
+    "enabled": false,
+    "admission_label": "factory-ready",
+    "excluded_labels": ["TEST", "demo"]
+  },
+  "budgets": {},
   "workflows": {
     "default": {
       "path": "./workflows/default.dot",

@@ -1238,7 +1238,7 @@ class SchemaEightMigrationTests(unittest.TestCase):
             ledger.connection.execute("PRAGMA user_version=7")
             ledger.close()
             migrated = SQLiteLedger(path)
-            self.assertEqual(13, migrated.connection.execute(
+            self.assertEqual(14, migrated.connection.execute(
                 "PRAGMA user_version"
             ).fetchone()[0])
             self.assertIsNotNone(migrated.connection.execute(

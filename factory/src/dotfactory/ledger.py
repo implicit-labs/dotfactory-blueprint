@@ -24,7 +24,7 @@ from .observability import (
 from .token_usage import normalize_token_usage
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 LEGACY_STATE_IDS = {
     "todo": "Todo",
@@ -511,6 +511,11 @@ class SQLiteLedger:
                 self._create_schema_thirteen_additions(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return
+        if version == 13:
+            with self.transaction() as db:
+                self._create_schema_fourteen_additions(db)
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            return
         raise LedgerError(f"no migration from ledger schema {version}")
 
     def _create_schema_three_additions(self, db: sqlite3.Connection) -> None:
@@ -917,6 +922,7 @@ class SQLiteLedger:
         self._create_schema_thirteen_additions(db)
 
     def _create_schema_thirteen_additions(self, db: sqlite3.Connection) -> None:
+        self._create_schema_fourteen_additions(db)
         db.execute(
             "CREATE TABLE IF NOT EXISTS linear_agent_sessions ("
             "execution_id TEXT PRIMARY KEY REFERENCES workflow_executions(id),"
@@ -3006,6 +3012,48 @@ class SQLiteLedger:
                 ),
             )
         return self.preparation(preparation_id)
+
+    def _create_schema_fourteen_additions(self, db: sqlite3.Connection) -> None:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS operating_receipts ("
+            "seq INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,"
+            "project_key TEXT NOT NULL,execution_id TEXT,"
+            "detail_json TEXT NOT NULL,created_at TEXT NOT NULL)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS operating_receipts_scope "
+            "ON operating_receipts(kind,project_key,execution_id,seq)"
+        )
+
+    def record_operating_receipt(
+        self, kind: str, project_key: str, execution_id: str | None,
+        detail: dict[str, Any],
+    ) -> dict[str, Any]:
+        encoded = canonical_json(redact_payload(detail))
+        with self.transaction() as db:
+            previous = db.execute(
+                "SELECT * FROM operating_receipts WHERE kind=? AND project_key=? "
+                "AND execution_id IS ? ORDER BY seq DESC LIMIT 1",
+                (kind, project_key, execution_id),
+            ).fetchone()
+            if previous and previous["detail_json"] == encoded:
+                return {**{key: previous[key] for key in previous.keys() if key != "detail_json"},
+                        "detail": json.loads(encoded)}
+            now = self.clock()
+            cursor = db.execute(
+                "INSERT INTO operating_receipts(kind,project_key,execution_id,detail_json,created_at) "
+                "VALUES(?,?,?,?,?)", (kind, project_key, execution_id, encoded, now),
+            )
+        return {"seq": cursor.lastrowid, "kind": kind, "project_key": project_key,
+                "execution_id": execution_id, "detail": json.loads(encoded), "created_at": now}
+
+    def operating_receipts(self, project_key: str | None = None) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM operating_receipts WHERE (? IS NULL OR project_key=?) "
+            "ORDER BY seq DESC LIMIT 25", (project_key, project_key),
+        )
+        return [{**{key: row[key] for key in row.keys() if key != "detail_json"},
+                 "detail": json.loads(row["detail_json"])} for row in rows]
 
     def open_attention(
         self, *, execution_id: str, attempt_id: str | None,

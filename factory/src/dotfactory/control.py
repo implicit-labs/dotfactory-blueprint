@@ -154,7 +154,8 @@ class ObservationService:
         next_cursor = None
         if has_more and data:
             next_cursor = _encode_cursor(data[-1]["created_at"], data[-1]["id"])
-        return {"api_version": API_VERSION, "data": data, "next_cursor": next_cursor}
+        return {"api_version": API_VERSION, "data": data, "next_cursor": next_cursor,
+                "operating_receipts": self.ledger.operating_receipts(project_key)}
 
     def run(self, execution_id: str) -> dict[str, Any]:
         snapshot = self.ledger.run_snapshot(execution_id)

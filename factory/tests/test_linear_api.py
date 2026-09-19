@@ -160,6 +160,18 @@ class LinearWorkerTests(unittest.TestCase):
         self.assertEqual(["FactoryIssue"], [call["request"]["operationName"] for call in transport.calls])
         self.assertEqual("Todo", self.ledger.current(self.execution)["observed_linear_status"])
 
+    def test_queue_adoption_and_normal_poll_share_one_observation_contract(self):
+        self.bind("Todo", "status-todo")
+        worker = LinearConvergenceWorker(self.ledger, self.kernel, LinearGraphQLClient("auth"))
+        rich = {**issue(), "createdAt": "earlier", "priority": 1,
+                "labels": {"nodes": [{"name": "factory-ready"}]},
+                "inverseRelations": {"nodes": []}}
+        worker.observe_issue(self.execution, rich)
+        worker.observe_issue(self.execution, issue())
+        self.assertEqual(1, self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM linear_observations WHERE execution_id=?", (self.execution,),
+        ).fetchone()[0])
+
     def test_signed_webhook_is_deduped_and_rechecked_against_current_issue(self):
         self.bind("Todo", "status-todo")
         now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)

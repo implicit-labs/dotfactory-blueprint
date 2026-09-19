@@ -124,7 +124,9 @@ python3 -m dotfactory init --repository /data/repositories/example \
 4. Run one selected issue with `python3 -m dotfactory run --config
    /data/instances/example/factory.json --project example --issue ISSUE-ID`.
    Stop at human gates, including exact-plan-SHA approval before implementation.
-5. For continuous discovery, set Render's `DOTFACTORY_CONFIG` to that config path
+5. For continuous discovery, first configure the explicit admission label,
+   exclusions, single-child limit and budgets in [continuous work](CONTINUOUS_WORK.md).
+   Then set Render's `DOTFACTORY_CONFIG` to that config path
    and `DOTFACTORY_PROJECT` to `example`. Startup validates persistent ledger,
    repository and workspace paths, then executes the existing `work` command.
    Its instance lock prevents a second writer. Drain any manual run first.

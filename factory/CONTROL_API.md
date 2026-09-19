@@ -109,7 +109,7 @@ identity/replay handling; serving these routes does not implement that listener.
 | Endpoint | Query | Returns |
 |---|---|---|
 | `GET /v1/overview` | — | Factory identity, projects, run counts, active leases and allocations, open attention, and projection outbox counts. |
-| `GET /v1/runs` | `project_key`, `status`, `state`, `limit` 1–100, `cursor` | Run summaries and `next_cursor`. |
+| `GET /v1/runs` | `project_key`, `status`, `state`, `limit` 1–100, `cursor` | Run summaries, `next_cursor`, and last 25 durable queue/budget `operating_receipts` for the project. |
 | `GET /v1/runs/{execution_id}` | — | Intent, state, active attempt, workspace summary, preparation, allocations, attention, Linear evidence delivery, projection lag, and available actions. |
 | `GET /v1/runs/{execution_id}/events` | `after_seq` ≥ 0, `limit` 1–100 | Ordered normalized events and `next_after_seq`. |
 | `GET /v1/runs/{execution_id}/trace` | `after_seq` ≥ 0, `limit` 1–100 | Canonical trace records and `next_after_seq`. |

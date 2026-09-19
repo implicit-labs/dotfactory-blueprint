@@ -443,6 +443,58 @@ class LinearGraphQLClient:
                               str(item.get("identifier", ""))),
         )
 
+    _QUEUE_FIELDS = (
+        "id identifier title description url createdAt updatedAt priority "
+        "state{id name} team{id} project{id} "
+        "labels(first:100){nodes{name} pageInfo{hasNextPage}} "
+        "inverseRelations(first:100){nodes{type issue{id state{type}}} pageInfo{hasNextPage}}"
+    )
+
+    def queue_issue(self, identifier: str) -> dict[str, Any]:
+        data = self.execute(
+            "FactoryQueueIssue",
+            "query FactoryQueueIssue($id:String!){issue(id:$id){" + self._QUEUE_FIELDS + "}}",
+            {"id": identifier},
+        )
+        issue = data.get("issue")
+        if not isinstance(issue, dict) or issue.get("identifier") != identifier:
+            raise LinearAPIError("invalid_queue_issue", "Linear returned no matching queue issue", retryable=False)
+        return issue
+
+    def queue_issues(self, *, project_id: str, status_names: list[str],
+                     should_continue: Callable[[], bool] | None = None) -> list[dict[str, Any]]:
+        if not project_id or not status_names:
+            raise LinearAPIError("invalid_queue_scope", "queue requires project and pickup statuses", retryable=False)
+        cursor = None
+        seen_cursors = set()
+        by_id = {}
+        for _ in range(100):
+            if should_continue and not should_continue():
+                return []  # Never admit from a partially scanned queue.
+            data = self.execute(
+                "FactoryQueueIssues",
+                "query FactoryQueueIssues($projectId:ID!,$statusNames:[String!]!,$after:String){"
+                "issues(first:100,after:$after,filter:{project:{id:{eq:$projectId}},"
+                "state:{name:{in:$statusNames}}}){nodes{" + self._QUEUE_FIELDS
+                + "} pageInfo{hasNextPage endCursor}}}",
+                {"projectId": project_id, "statusNames": sorted(set(status_names)), "after": cursor},
+            )
+            connection = data.get("issues")
+            if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+                raise LinearAPIError("invalid_queue_page", "Linear returned an invalid queue page", retryable=False)
+            for issue in connection["nodes"]:
+                if not isinstance(issue, dict) or not issue.get("id"):
+                    raise LinearAPIError("invalid_queue_page", "Linear returned an invalid queue issue", retryable=False)
+                by_id[str(issue["id"])] = issue
+            page = connection.get("pageInfo", {})
+            if page.get("hasNextPage") is False:
+                return list(by_id.values())
+            cursor = page.get("endCursor")
+            if page.get("hasNextPage") is not True or not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                raise LinearAPIError("invalid_queue_cursor", "Linear queue cursor did not advance", retryable=False)
+            seen_cursors.add(cursor)
+        raise LinearAPIError("queue_page_limit", "queue exceeds 100 pages; narrow its project scope", retryable=False)
+
     def viewer_id(self) -> str:
         data = self.execute(
             "FactoryViewer", "query FactoryViewer{viewer{id}}", {}
@@ -613,6 +665,13 @@ class LinearConvergenceWorker:
         return stored
 
     def observe_issue(self, execution_id: str, issue: dict[str, Any]) -> dict[str, Any]:
+        # Discovery carries labels, relations and priority that the ordinary
+        # status query does not request. Hash the common observation contract,
+        # not the query's incidental selection set, for revision idempotency.
+        issue = {key: issue[key] for key in (
+            "id", "identifier", "title", "description", "url", "updatedAt",
+            "state", "team", "project",
+        ) if key in issue}
         state = issue.get("state", {})
         observed_at = self.ledger.clock()
         current = self._validate_issue_scope(execution_id, issue)

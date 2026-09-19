@@ -225,6 +225,9 @@ def _durable_event_payload(
     elif event.protocol_type in ("assistant", "message_end"):
         message = frame.get("message")
         if isinstance(message, dict):
+            role = message.get("role")
+            if role in ("assistant", "user", "tool", "toolResult", "system"):
+                payload["message_role"] = role
             usage = normalize_token_usage(message.get("usage"))
             usage_scope = "call"
     elif isinstance(frame.get("usage"), dict):
