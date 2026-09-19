@@ -13,7 +13,7 @@ from dotfactory.lifecycle import fixture_runner
 
 
 class FactoryCLITests(unittest.TestCase):
-    def _run_with_description(self, description_file=None):
+    def _run_with_description(self, description_file=None, execution_config=None):
         runtime = MagicMock()
         runtime.start_issue.return_value = "execution-1"
         runtime.run.return_value.as_dict.return_value = {}
@@ -25,6 +25,8 @@ class FactoryCLITests(unittest.TestCase):
         ]
         if description_file is not None:
             arguments.extend(("--description-file", str(description_file)))
+        if execution_config is not None:
+            arguments.extend(("--execution-config", str(execution_config)))
         stdout = io.StringIO()
         stderr = io.StringIO()
         with patch(
@@ -38,6 +40,21 @@ class FactoryCLITests(unittest.TestCase):
         ), redirect_stdout(stdout), redirect_stderr(stderr):
             result = main(arguments)
         return result, stdout.getvalue(), stderr.getvalue(), factory, runtime
+
+    def test_execution_config_is_explicit_bounded_and_passed_to_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run.json"
+            override = {"stages": {"Verifying": {"requires": [], "readiness": []}}}
+            path.write_text(json.dumps(override))
+            rc, _out, err, _factory, runtime = self._run_with_description(execution_config=path)
+            self.assertEqual(0, rc, err)
+            runtime.start_issue.assert_called_once_with("demo", "DEMO-1", title=None,
+                description="", execution_override=override)
+            for text in ("null", "[]", "{", " " * 65537):
+                path.write_text(text)
+                rc, _out, _err, factory, _runtime = self._run_with_description(execution_config=path)
+                self.assertEqual(1, rc)
+                factory.assert_not_called()
 
     def test_description_file_path_failures_precede_runtime_construction(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import re
@@ -18,6 +19,53 @@ from .resources import PreparationResult
 
 class ExecutionError(RuntimeError):
     pass
+
+
+def overlay_policy(policy, override, *, origin, provenance=None):
+    """Omitted fields inherit; supplied fields replace, including empty lists."""
+    if not isinstance(override, dict) or set(override) - {"stages"}:
+        raise ValueError("execution override accepts only stages")
+    stages = override.get("stages", {})
+    if not isinstance(stages, dict):
+        raise ValueError("execution override stages must be an object")
+    result = copy.deepcopy(policy)
+    sources = copy.deepcopy(provenance or {
+        state: {field: "instance" for field in rule}
+        for state, rule in policy["stages"].items()})
+    for state, fields in stages.items():
+        if not isinstance(state, str) or not state or not isinstance(fields, dict):
+            raise ValueError("execution override stages require named objects")
+        result["stages"].setdefault(state, {}).update(copy.deepcopy(fields))
+        sources.setdefault(state, {}).update({field: origin for field in fields})
+    validate_policy(result)
+    return result, sources
+
+
+def record_admission(db, execution_id, settings):
+    db.execute("INSERT INTO execution_policies VALUES (?,?)",
+               (execution_id, json.dumps(settings, sort_keys=True)))
+
+
+def assert_no_frozen_worker_runs(ledger, project_keys):
+    if not ledger.connection.execute("SELECT 1 FROM sqlite_master WHERE name='execution_policies'").fetchone():
+        return
+    rows = ledger.connection.execute(
+        "SELECT wi.project_key FROM execution_policies ep "
+        "JOIN workflow_executions we ON we.id=ep.execution_id "
+        "JOIN work_items wi ON wi.id=we.work_item_id WHERE we.status!='completed'").fetchall()
+    if any(row[0] in project_keys for row in rows):
+        raise ExecutionError("active runs have frozen worker settings; restore execution configuration before dispatch")
+
+
+def settings_view(ledger, execution_id):
+    if not ledger.connection.execute("SELECT 1 FROM sqlite_master WHERE name='execution_policies'").fetchone():
+        return None
+    row = ledger.connection.execute("SELECT policy_json FROM execution_policies WHERE execution_id=?", (execution_id,)).fetchone()
+    if not row:
+        return None
+    value = json.loads(row[0])
+    return {"stages": value["policy"]["stages"], "provenance": value.get("provenance", {}),
+            "digest": worker.digest(value), "frozen_at": value.get("frozen_at", "legacy-first-placement")}
 
 
 def validate_policy(policy):
@@ -112,21 +160,48 @@ def call(config, spec, *, timeout=60):
 
 
 class ExecutionManager:
-    def __init__(self, ledger, policy, routes):
+    def __init__(self, ledger, policy, routes, project_overrides=None):
         validate_policy(policy)
         self.ledger = ledger
         self.policy = policy
+        self.project_overrides = copy.deepcopy(project_overrides or {})
         self.routes = routes
         self.last_renewal = {}
         with ledger.connection:
             ledger.connection.execute("CREATE TABLE IF NOT EXISTS execution_policies (execution_id TEXT PRIMARY KEY REFERENCES workflow_executions(id), policy_json TEXT NOT NULL)")
             ledger.connection.execute("CREATE TABLE IF NOT EXISTS worker_handoffs (attempt_id TEXT PRIMARY KEY REFERENCES attempts(id), execution_id TEXT NOT NULL REFERENCES workflow_executions(id), manifest_json TEXT NOT NULL)")
 
+    def admission(self, project_key, override=None, *, work_states=None):
+        project = self.project_overrides.get(project_key, {})
+        override = {} if override is None else override
+        policy, sources = overlay_policy(self.policy, project, origin="project")
+        policy, sources = overlay_policy(policy, override, origin="run", provenance=sources)
+        if work_states is not None:
+            for layer in (project, override):
+                if set(layer.get("stages", {})) - set(work_states):
+                    raise ValueError("execution override names a non-work or unknown workflow stage")
+        return {"policy": policy, "routes": {key: asdict(value) for key, value in self.routes.items()},
+                "project_key": project_key, "run_overrides": copy.deepcopy(override),
+                "provenance": sources, "frozen_at": "admission"}
+
+    def assert_same_override(self, execution_id, override):
+        if override is None:
+            return
+        row = self.ledger.connection.execute("SELECT policy_json FROM execution_policies WHERE execution_id=?", (execution_id,)).fetchone()
+        if not row or json.loads(row[0]).get("run_overrides", {}) != override:
+            raise ExecutionError("existing run settings are frozen; start a new run to change overrides")
+
     def _policy(self, request):
-        # Snapshot before the first placement; later config edits affect new executions only.
-        with self.ledger.connection:
-            self.ledger.connection.execute("INSERT OR IGNORE INTO execution_policies VALUES (?,?)",
-                                           (request.execution_id, json.dumps({"policy": self.policy, "routes": {key: asdict(value) for key, value in self.routes.items()}}, sort_keys=True)))
+        row = self.ledger.connection.execute("SELECT policy_json FROM execution_policies WHERE execution_id=?", (request.execution_id,)).fetchone()
+        if row:
+            return json.loads(row[0])
+        # Compatibility for runs created before admission snapshots existed.
+        project = self.ledger.current(request.execution_id)["project_key"]
+        settings = self.admission(project)
+        settings["frozen_at"] = "legacy-first-placement"
+        with self.ledger.transaction() as db:
+            db.execute("INSERT OR IGNORE INTO execution_policies VALUES (?,?)",
+                       (request.execution_id, json.dumps(settings, sort_keys=True)))
         row = self.ledger.connection.execute("SELECT policy_json FROM execution_policies WHERE execution_id=?", (request.execution_id,)).fetchone()
         return json.loads(row[0])
 

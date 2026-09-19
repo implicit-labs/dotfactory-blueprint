@@ -1567,6 +1567,7 @@ class SQLiteLedger:
         owner: str | None = None,
         actor: str = "agent",
         observed_linear_status: str | None = None,
+        execution_settings: dict[str, Any] | None = None,
     ) -> str:
         existing = self.connection.execute(
             "SELECT execution_id FROM events WHERE idempotency_key=?", (idempotency_key,)
@@ -1630,6 +1631,9 @@ class SQLiteLedger:
                     "INSERT INTO execution_workflow_snapshots VALUES(?,?)",
                     (execution_id, workflow_digest),
                 )
+            if execution_settings is not None:
+                from .execution import record_admission
+                record_admission(db, execution_id, execution_settings)
             initial_attempt = None
             if state_kind == "work":
                 if not owner:

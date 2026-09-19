@@ -1,6 +1,8 @@
 # Check a worker before launching an agent
 
-Add `readiness` to each applicable `execution.stages` rule. Existing `requires`
+Define project defaults and explicit run overrides using the
+[project/run configuration guide](project-run-configuration.md). Add `readiness`
+to each applicable stage rule. Existing `requires`
 checks OS, architecture and tool presence; readiness probes assert versions,
 installed runtimes, fixtures or device availability on the selected host.
 
