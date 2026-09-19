@@ -143,6 +143,20 @@ def build_agent_projection(
                 "content": {"type": "elicitation", "body": reason},
             })
 
+    current_state = next((item for item in state_runs
+                          if item.get("id") == snapshot.get("current_state_run_id")), {})
+    if not completed and projection.get("awaiting_human") and current_state:
+        activities.append({
+            "semantic_key": f"human-input:{current_state['id']}",
+            "content": {
+                "type": "elicitation",
+                "body": (
+                    f"Waiting for human input at `{_safe(current_state.get('state_id'), 120)}`. "
+                    "Continue through the configured workflow approval controls."
+                ),
+            },
+        })
+
     if completed:
         body, _body_digest = render_linear_run_summary(snapshot, projection, history)
         successful = str(snapshot.get("current_state_id")) == "Done"

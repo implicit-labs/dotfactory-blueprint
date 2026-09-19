@@ -364,6 +364,33 @@ class LinearAgentTests(unittest.TestCase):
         self.assertEqual(session_id, worker.session(self.execution)["session_id"])
         self.assertEqual(1, remote.updates)
 
+    def test_human_gate_uses_frozen_workflow_and_replay_safe_elicitation(self):
+        self.kernel = DurableKernel(self.ledger, ROOT / "workflows" / "verified-python.dot")
+        remote = FakeAgentAPI()
+        for state in ("PlanReview", "Review"):
+            execution = self.ledger.begin_execution(project_key="dotfactory", identifier="GATE-" + state,
+                intent={"title": state}, workflow_name=self.kernel.workflow["name"],
+                workflow_version=2, state_id=state, state_kind="checkpoint",
+                linear_status=state, workflow_snapshot=self.kernel.definition.snapshot(),
+                idempotency_key="begin-" + state)
+            snapshot = self.ledger.run_snapshot(execution)
+            projection = ObservationService(self.ledger, self.kernel).execution_projection(execution)
+            history = self.ledger.run_history(execution)
+            self.assertEqual("checkpoint", history["state_runs"][-1]["state_kind"])
+            urls, activities = build_agent_projection(snapshot, projection, history,
+                marker_url="https://runs.example/" + state)
+            self.assertEqual("elicitation", activities[-1]["content"]["type"])
+            self.assertIn(state, activities[-1]["content"]["body"])
+            count = remote.activity_creates
+            for _ in range(2):
+                LinearAgentSessionWorker(self.ledger, remote).sync(execution,
+                    issue_id="issue-" + state, marker_url="https://runs.example/" + state,
+                    external_urls=urls, activities=activities)
+            self.assertEqual(len(activities), remote.activity_creates - count)
+            self.assertEqual("running", self.ledger.current(execution)["status"])
+        urls, activities = self.projection()
+        self.assertFalse(any(a["semantic_key"].startswith("human-input:") for a in activities))
+
     def test_worker_location_is_per_attempt_and_replay_safe(self):
         snapshot = self.ledger.run_snapshot(self.execution)
         projection = ObservationService(self.ledger, self.kernel).execution_projection(self.execution)

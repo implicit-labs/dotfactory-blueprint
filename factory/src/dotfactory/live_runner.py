@@ -238,11 +238,22 @@ def _durable_event_payload(
             key.removesuffix("_tokens"): value for key, value in usage.items()
         }
         payload["usage_scope"] = usage_scope
-    if event.kind == "error":
-        for key in ("error", "message"):
-            item = frame.get(key)
-            if isinstance(item, str):
-                payload["excerpt"] = item[:2048]
+    if event.kind in ("error", "warning"):
+        sources = [frame]
+        nested = frame.get("item")
+        if isinstance(nested, dict) and nested.get("type") in ("error", "warning"):
+            sources.append(nested)
+        for source in sources:
+            for key in ("error", "message"):
+                message = source.get(key)
+                if isinstance(message, str) and message:
+                    # Redact before truncating: a boundary must not expose a
+                    # prefix of a known secret that would no longer match.
+                    redacted = _replace_sensitive(message, sensitive)
+                    payload["excerpt"] = redacted[:2048]
+                    payload["excerpt_truncated"] = len(redacted) > 2048
+                    break
+            if "excerpt" in payload:
                 break
     item = frame.get("item")
     if isinstance(item, dict):
@@ -616,14 +627,27 @@ class CodexAdapter(RunnerAdapter):
         elif raw in ("item.started", "exec_command.started", "tool_call.started"):
             kind = "tool_call"
         elif raw in ("item.completed", "exec_command.completed", "tool_call.completed"):
+            item = frame.get("item")
+            item_type = item.get("type") if isinstance(item, dict) else None
+            skill_notice = (
+                "Skill descriptions were shortened to fit the skills context budget. "
+                "Codex can still see every skill, but some descriptions are shorter. "
+                "Disable unused skills or plugins to leave more room for the rest."
+            )
+            known_notice = (raw == "item.completed" and item_type == "error"
+                            and item.get("message") == skill_notice)
             kind = (
-                "assistant" if frame.get("item", {}).get("type") == "agent_message"
+                "warning" if item_type == "warning" or known_notice else
+                "error" if item_type == "error" else
+                "assistant" if item_type == "agent_message"
                 else "tool_result"
             )
         elif raw == "turn.completed":
             kind = "terminal"
         elif raw in ("turn.failed", "error"):
             kind = "error"
+        elif raw == "warning":
+            kind = "warning"
         else:
             kind = "usage" if frame.get("usage") else "protocol"
         return RunnerEvent(kind, raw, frame, source_occurred_at=_source_timestamp(frame))
