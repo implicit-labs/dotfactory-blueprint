@@ -275,7 +275,7 @@ deletion policy.
 | unknown process or route | retain and escalate; ownership is not proven |
 | `release_pending` | finish provider cleanup before dispatching new work |
 | ambiguous preparation | inspect mutations, then retry the recorded safe phase |
-| ambiguous dispatch | retain and escalate; there is no automated retry or cancel |
+| ambiguous dispatch | inspect original trace; explicitly cancel to abandon (never auto-retry); inspect surviving processes before confirmed workspace release, or retain/quarantine |
 | scheduler `result_ready` | authorize retry, then replay the stored result; never rerun the runner |
 
 Cleanup is planned in the ledger before mutation. Worktrees remain until the

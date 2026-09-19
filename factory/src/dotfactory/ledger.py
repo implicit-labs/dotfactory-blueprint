@@ -5285,6 +5285,7 @@ class SQLiteLedger:
         return facts
 
     def overview(self) -> dict[str, Any]:
+        from .projection_health import projection_health
         identity = self.connection.execute(
             "SELECT factory_id,created_at FROM factory_identity WHERE singleton=1"
         ).fetchone()
@@ -5331,6 +5332,7 @@ class SQLiteLedger:
             "active_resource_allocations": active_allocations,
             "open_attention_requests": open_attention,
             "projection_outbox": outbox,
+            "projection_health": projection_health(self),
             "generated_at": self.clock(),
         }
 
@@ -5371,7 +5373,9 @@ class SQLiteLedger:
         return result
 
     def run_snapshot(self, execution_id: str) -> dict[str, Any]:
+        from .projection_health import projection_health
         current = self.current(execution_id)
+        current["projection_health"] = projection_health(self, execution_id)
         current["intent"] = json.loads(current.pop("intent_snapshot_json"))
         current["pending_transition"] = self.pending_transition(execution_id)
         workflow = self.workflow_snapshot(execution_id)

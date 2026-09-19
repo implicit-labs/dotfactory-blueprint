@@ -36,6 +36,7 @@ configured by dotfactory belong to their owning repository.
 | [0032](0032-preserve-agent-activity-order-and-identity.md) | Preserve agent activity order and identity | Proposed | — |
 | [0033](0033-place-stages-on-owned-workers.md) | Place stages on owned workers and accept Git handoffs centrally | Proposed | — |
 | [0034](0034-host-owned-workers-on-render.md) | Host owned workers on Render | Proposed | — |
+| [0035](0035-abandon-uncertain-runs-without-assuming-process-exit.md) | Abandon uncertain runs without assuming process exit | Proposed | — |
 
 ## Lifecycle
 

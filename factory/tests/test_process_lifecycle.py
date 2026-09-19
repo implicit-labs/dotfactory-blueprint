@@ -20,6 +20,7 @@ class ProcessLifecycleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="df-process-", dir="/tmp")
         self.root = Path(self.temp.name)
         self.children = []
+        self.orphan_groups = []
         self.config = _demo_config(self.root)
         self.mode = self.root / "mode"
         self.mode.write_text("complete")
@@ -35,8 +36,11 @@ if (root / "mode").read_text() == "hold":
     child = subprocess.Popen([sys.executable, "-c", "import pathlib,time; p=pathlib.Path(" + repr(str(root / "heartbeat")) + "); exec('while True: p.write_text(str(time.time())); time.sleep(0.05)')"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     (root / "descendant-pid").write_text(str(child.pid))
+(root / "effects").open("a").write("one-dispatch\\n")
 (root / "runner-pid").write_text(str(os.getpid()))
 print(json.dumps({{"type":"thread.started","thread_id":"process-fixture"}}), flush=True)
+if (root / "mode").read_text() == "hold":
+    print(json.dumps({{"type":"error","message":"CONTROLLED_INTERRUPTION: side effect recorded before crash"}}), flush=True)
 deadline = time.monotonic() + 25
 while (root / "mode").read_text() == "hold":
     if time.monotonic() > deadline:
@@ -64,6 +68,11 @@ print(json.dumps({{"type":"turn.completed"}}), flush=True)
         self.base = [sys.executable, "-m", "dotfactory"]
 
     def tearDown(self):
+        for group in self.orphan_groups:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         for process in reversed(self.children):
             if process.poll() is None:
                 process.terminate()
@@ -169,3 +178,82 @@ print(json.dumps({{"type":"turn.completed"}}), flush=True)
         self.assertIn({"from_state": "Investigating", "to_state": "Autoplanning"}, edges)
         self.assertEqual("Review", edges[-1]["to_state"])
         self.assertEqual([], self.query("SELECT id FROM runner_runs WHERE status='running'"))
+
+    def test_sigkill_recovery_cancels_without_replaying_uncertain_side_effect(self):
+        values = json.loads(self.config.read_text())
+        values["preparation"]["workspace"]["retention"] = "until_terminal"
+        values["scheduler"]["poll_interval_ms"] = 100
+        self.config.write_text(json.dumps(values))
+        self.mode.write_text("hold")
+        worker = self.worker()
+        pid = self.await_runner(worker)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.query("SELECT error_id FROM error_facts WHERE message LIKE 'CONTROLLED_INTERRUPTION:%'"):
+                break
+            time.sleep(0.05)
+        original_errors = self.query("SELECT error_id,message FROM error_facts")
+        self.assertTrue(any("CONTROLLED_INTERRUPTION" in row["message"] for row in original_errors))
+        original_run = self.query("SELECT id FROM runner_runs")[0]["id"]
+        execution = self.query("SELECT id FROM workflow_executions")[0]["id"]
+        # Kill only the coordinator first: the fixture-owned child survives.
+        self.orphan_groups.append(pid)
+        worker.kill()
+        worker.communicate(timeout=5)
+        restarted = self.start(["run", "--config", str(self.config), "--project", "demo",
+                                "--issue", "PROCESS-1", "--watch", "--max-ticks", "100"])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.query("SELECT id FROM attention_requests WHERE status='open'"):
+                break
+            time.sleep(0.05)
+        self.assertEqual("ambiguous-dispatch", self.query(
+            "SELECT category FROM attention_requests WHERE status='open'")[0]["category"])
+        self.assertEqual("one-dispatch\n", (self.root / "effects").read_text())
+        token = secrets.token_urlsafe(32)
+        gateway = self.start(["serve", "--config", str(self.config), "--port", "0", "--role", "operator"],
+                             dict(self.env, DOTFACTORY_API_TOKEN=token))
+        url = json.loads(gateway.stdout.readline())["url"]
+        payload = json.dumps({"action": "cancel", "expected_state": "Autoplanning", "confirmed": True}).encode()
+        def cancel():
+            request = urllib.request.Request(url + "/v1/runs/" + execution + "/commands", data=payload,
+                headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                         "Idempotency-Key": "resolve-interrupted-run"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return json.load(response)
+        first = cancel()
+        self.assertEqual(first, cancel())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.query("SELECT status FROM execution_workspaces") == [{"status": "quarantined"}]:
+                break
+            time.sleep(0.05)
+        self.assertEqual([{"status": "quarantined"}], self.query("SELECT status FROM execution_workspaces"))
+        os.kill(pid, 0)  # cancellation did not claim ownership of the orphan
+        self.assertTrue(any((self.root / "workspaces").iterdir()))
+        release_id = self.query("SELECT id FROM attention_requests WHERE status='open' AND category='uncertain-runner-exit'")[0]["id"]
+        # Only the test knows the original process group; inspect/stop before release.
+        os.killpg(pid, signal.SIGKILL)
+        self.orphan_groups.remove(pid)
+        release = subprocess.run(self.base + ["attention", "--config", str(self.config), "--project", "demo",
+            "--execution", execution, "--attention-id", release_id, "--expected-state", "Canceled",
+            "--remedy", "release", "--confirm", "--command-id", "release-inspected-workspace"],
+            env=self.env, capture_output=True, text=True)
+        self.assertEqual(0, release.returncode, release.stdout + release.stderr)
+        drain = subprocess.run(self.base + ["operator", "drain", "--config", str(self.config),
+                               "--project", "demo"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(0, drain.returncode, drain.stderr)
+        self.finish(restarted)
+        self.assertEqual("one-dispatch\n", (self.root / "effects").read_text())
+        self.assertEqual([{"id": original_run, "status": "canceled"}],
+                         self.query("SELECT id,status FROM runner_runs"))
+        self.assertEqual([], self.query("SELECT id FROM attention_requests WHERE status='open'"))
+        self.assertEqual([{"status": "cleaned"}], self.query("SELECT status FROM execution_workspaces"))
+        self.assertEqual([{"status": "superseded"}], self.query("SELECT status FROM scheduler_dispatches"))
+        self.assertEqual(1, len(self.query("SELECT id FROM transition_decisions WHERE to_state='Canceled'")))
+        self.assertTrue(all(row in self.query("SELECT error_id,message FROM error_facts") for row in original_errors))
+        request = urllib.request.Request(url + "/v1/runs/" + execution + "/waterfall",
+                                         headers={"Authorization": "Bearer " + token})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            waterfall = json.load(response)
+        self.assertEqual(0, waterfall["data"]["open_span_count"])
