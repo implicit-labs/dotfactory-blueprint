@@ -38,6 +38,7 @@ configured by dotfactory belong to their owning repository.
 | [0034](0034-host-owned-workers-on-render.md) | Host owned workers on Render | Proposed | — |
 | [0035](0035-abandon-uncertain-runs-without-assuming-process-exit.md) | Abandon uncertain runs without assuming process exit | Proposed | — |
 | [0036](0036-admit-continuous-work-explicitly.md) | Admit continuous work explicitly and gate dispatch on recorded usage | Proposed | — |
+| [0039](0039-replace-unusable-frozen-verifiers-through-reviewed-replanning.md) | Replace unusable frozen verifiers through reviewed replanning | Accepted | 0031 (replanning policy only) |
 
 ## Lifecycle
 

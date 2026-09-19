@@ -88,6 +88,21 @@ and the same config/project/issue arguments. A running worker can pick up Ready.
 Pinned checks remain bound across restarts. Automatic authorization is a recorded
 Autoplanning handoff, not a synthetic human approval or an HTTP approve call.
 
+After an investigated frozen-verifier failure reaches Blocked, inspect
+`available_actions` for `replan`. From a gateway started with `--role approver`,
+send a confirmed command with the planner owner and concrete failure reason:
+
+```bash
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer $DOTFACTORY_API_TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: replan-frozen-1' \
+  --data '{"action":"replan","expected_state":"Blocked","confirmed":true,"parameters":{"owner":"planner-1","reason":"unittest parsed the export path as a test name"}}' \
+  http://127.0.0.1:8765/v1/runs/EXECUTION_ID/commands
+```
+
+Review the replacement packet at ReplanReview. Its approval request also needs
+the exact `plan_sha`, a note, and `owner` because approval enters Verifying.
+
 ### Command ownership
 
 | Operation | Interface | Requires a running factory worker? |
@@ -180,7 +195,7 @@ Overview, run snapshots, and each execution in lifecycle receipts include
 
 | Field | Required | Contract |
 |---|---:|---|
-| `action` | yes | `cancel`, `retry`, `approve`, `transition`, or `attention`. |
+| `action` | yes | `cancel`, `retry`, `approve`, `replan`, `transition`, or `attention`. |
 | `expected_state` | yes | Rejects a command from a stale phone view. |
 | `confirmed` | policy-dependent | Required when the selected edge declares confirmation or targets a terminal. |
 | `parameters` | no | Action-specific object; defaults to `{}`. |
@@ -191,7 +206,8 @@ Overview, run snapshots, and each execution in lifecycle receipts include
 |---|---|---|
 | `cancel` | optional `reason` | Follows the unique eligible edge whose action is `cancel`; active work is closed with decision evidence. |
 | `retry` | `owner` when the target is work; optional `reason` | Follows the unique eligible edge whose action is `retry`. |
-| `approve` | `note` when feedback is required | Follows the unique eligible `approve` edge and applies its role and feedback policy. |
+| `approve` | `note` when feedback is required; `owner` when approval enters work | Follows the unique eligible `approve` edge and applies its role and feedback policy. |
+| `replan` | required `owner` and `reason` | From an eligible Blocked frozen-verifier failure, records the exact failed source and reason, then enters Replanning. Requires approver role and explicit confirmation. |
 | `transition` | required `to_state`; optional `owner`, `outcome`, `evidence`, `feedback` | Applies one human-authorized workflow edge. Entering work requires `owner`; leaving work requires `outcome` and evidence. |
 | `attention` | `attention_id`, `remedy`, and the visible `expected_attempt_id` when attempt-scoped | Applies one allowed `retry`, `release`, `retain`, `quarantine`, or `cancel` remedy. Release requires approver confirmation. |
 

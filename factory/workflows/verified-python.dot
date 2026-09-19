@@ -20,6 +20,8 @@ digraph VerifiedPython {
   Reworking [type=work, role=delivery, exit_contract="implementation-result-v2", prompt="prompts/verified-implement.md"]
   Investigating [type=work, role=recovery, prompt="prompts/work.md"]
   Blocked [type=human, role=human]
+  Replanning [type=work, role=planning, exit_contract="plan-result-v2", prompt="prompts/verified-plan.md", linear_status="Planning"]
+  ReplanReview [type=human, role=human, linear_status="Planning"]
   Done [shape=Msquare]
   Canceled [shape=Msquare]
   Duplicate [shape=Msquare]
@@ -48,6 +50,20 @@ digraph VerifiedPython {
   Investigating -> Blocked [on=failed, authority=agent]
   Investigating -> Blocked [on=blocked, authority="human,agent"]
   Blocked -> Investigating [on=resume]
+  Blocked -> Replanning [
+    on=revise,
+    action=replan,
+    authority=human,
+    signal=control_command,
+    required_role=approver,
+    confirmation=true,
+    requires_feedback=true,
+    feedback_kind=changes_requested
+  ]
+  Replanning -> ReplanReview [on=complete, authority="human,agent"]
+  Replanning -> Blocked [on=failed, authority="human,agent"]
+  ReplanReview -> Verifying [on=approve]
+  ReplanReview -> Replanning [on=revise]
 
   @any_nonterminal -> Canceled [on=cancel]
   @any_nonterminal -> Duplicate [on=duplicate, authority="human,agent"]
