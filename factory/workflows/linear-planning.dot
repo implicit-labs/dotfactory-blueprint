@@ -1,0 +1,70 @@
+digraph LinearPlanning {
+  graph [
+    name="linear-planning",
+    schema_version=2,
+    conventions=linear,
+    linear_statuses=node_ids,
+    main_checkpoints="PlanQueued,Ready,Review",
+    external_linear_states="Triage,Backlog"
+  ]
+
+  start [shape=Mdiamond]
+  PlanQueued [type=checkpoint, role=pickup, linear_status="Planning"]
+  Autoplanning [type=work, role=planning, exit_contract="plan-result-v2", prompt="prompts/verified-plan.md"]
+  Planning [type=work, role=planning, exit_contract="plan-result-v2", prompt="prompts/verified-plan.md"]
+  PlanReview [type=human, role=human, linear_status="Planning"]
+  Ready [type=checkpoint, role=pickup]
+  Implementing [type=work, role=delivery, exit_contract="implementation-result-v2", prompt="prompts/verified-implement.md"]
+  Verifying [type=work, role=verification, exit_contract="python-verification-v2", prompt="prompts/verified-verify.md"]
+  Review [type=human, role=human]
+  Reworking [type=work, role=delivery, exit_contract="implementation-result-v2", prompt="prompts/verified-implement.md"]
+  Investigating [type=work, role=recovery, prompt="prompts/work.md"]
+  Blocked [type=human, role=human]
+  Replanning [type=work, role=planning, exit_contract="plan-result-v2", prompt="prompts/verified-plan.md", linear_status="Planning"]
+  ReplanReview [type=human, role=human, linear_status="Planning"]
+  Done [shape=Msquare]
+  Canceled [shape=Msquare]
+  Duplicate [shape=Msquare]
+
+  start -> PlanQueued [on=enter]
+  PlanQueued -> Planning [on=claim, authority=agent]
+  Autoplanning -> Ready [on=complete]
+  Autoplanning -> PlanReview [on=review]
+  Planning -> PlanReview [on=complete, authority="human,agent"]
+  PlanReview -> Ready [on=approve]
+  PlanReview -> Planning [on=revise]
+  Ready -> Planning [on=human]
+  Ready -> Implementing [on=claim, authority="human,agent"]
+  Implementing -> Verifying [on=complete, authority="human,agent"]
+  Verifying -> Review [on=complete, authority="human,agent"]
+  Review -> Done [on=approve]
+  Review -> Reworking [on=revise]
+  Reworking -> Verifying [on=complete, authority="human,agent"]
+
+  Autoplanning -> Investigating [on=failed]
+  Planning -> Investigating [on=failed, authority="human,agent"]
+  Implementing -> Investigating [on=failed, authority="human,agent"]
+  Verifying -> Investigating [on=failed, authority="human,agent"]
+  Reworking -> Investigating [on=failed, authority="human,agent"]
+  Investigating -> @resume [on=retry]
+  Investigating -> Blocked [on=failed, authority=agent]
+  Investigating -> Blocked [on=blocked, authority="human,agent"]
+  Blocked -> Investigating [on=resume]
+  Blocked -> Replanning [
+    on=revise,
+    action=replan,
+    authority=human,
+    signal=control_command,
+    required_role=approver,
+    confirmation=true,
+    requires_feedback=true,
+    feedback_kind=changes_requested
+  ]
+  Replanning -> ReplanReview [on=complete, authority="human,agent"]
+  Replanning -> Blocked [on=failed, authority="human,agent"]
+  ReplanReview -> Verifying [on=approve]
+  ReplanReview -> Replanning [on=revise]
+
+  @any_nonterminal -> Canceled [on=cancel]
+  @any_nonterminal -> Duplicate [on=duplicate, authority="human,agent"]
+}

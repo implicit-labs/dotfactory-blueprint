@@ -43,6 +43,8 @@ configured by dotfactory belong to their owning repository.
 | [0039](0039-replace-unusable-frozen-verifiers-through-reviewed-replanning.md) | Replace unusable frozen verifiers through reviewed replanning | Accepted | 0031 (replanning policy only) |
 | [0040](0040-distinguish-verification-hosts.md) | Distinguish worker and coordinator verification requirements | Proposed | — |
 | [0041](0041-approve-conversational-requirements.md) | Bind conversational requirements to exact human plan approval | Proposed | — |
+| [0042](0042-approve-verification-methods-and-evidence.md) | Approve verification methods and required evidence before coding | Proposed | — |
+| [0043](0043-plan-through-linear-agent-conversations.md) | Plan through native Linear conversations with exact approval | Proposed | — |
 
 ## Lifecycle
 

@@ -61,7 +61,7 @@ class AgentCanaryTests(unittest.TestCase):
                          '--updated-url', 'https://runs.example/2', '--webhook-url', 'https://receiver.example',
                          '--database', str(root / 'canary.db'), '--receipt', str(root / 'receipt.json')]
             remote = CanaryAPI()
-            with patch.dict('os.environ', {'LINEAR_AGENT_TOKEN': 'synthetic-token'}), \
+            with patch.dict('os.environ', {'LINEAR_DOTFACTORY_AGENT_TOKEN': 'synthetic-token'}), \
                  patch('dotfactory.linear_agent_canary.LinearGraphQLClient', return_value=remote), \
                  patch('urllib.request.urlopen') as http:
                 response = http.return_value.__enter__.return_value

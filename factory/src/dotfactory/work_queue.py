@@ -51,7 +51,7 @@ def rejection(issue: dict[str, Any], policy: dict[str, Any], project: str,
     labels = {str(item.get("name", "")).casefold() for item in issue["labels"]["nodes"]}
     if labels & {item.casefold() for item in policy.get("excluded_labels", ["TEST", "demo"])}:
         return "excluded_label"
-    if policy.get("admission_label", "factory-ready").casefold() not in labels:
+    if policy.get("admission_label", "factory-ready") is not None and policy.get("admission_label", "factory-ready").casefold() not in labels:
         return "not_admitted"
     for relation in issue["inverseRelations"]["nodes"]:
         if relation.get("type") == "blocks" and (

@@ -278,6 +278,43 @@ class LinearGraphQLClient:
             seen.add(cursor)
         raise LinearAPIError("agent_sessions_incomplete", "Linear session listing could not be completed", retryable=False)
 
+    def planning_session(self, session_id: str) -> dict[str, Any]:
+        """Read all prompt activities before acting; partial pages cannot authorize approval."""
+        result = None
+        activities = []
+        cursor = None
+        seen = set()
+        for _ in range(20):
+            data = self.execute("FactoryPlanningSession",
+                "query FactoryPlanningSession($id:String!,$after:String){organization{id} "
+                "agentSession(id:$id){id appUser{id} issue{id project{id} team{id}} "
+                "activities(first:100,after:$after){nodes{id createdAt queued signal user{id} "
+                "content{... on AgentActivityPromptContent{type body}}} "
+                "pageInfo{hasNextPage endCursor}}}}", {"id": session_id, "after": cursor})
+            session = data.get('agentSession')
+            connection = session.get('activities') if isinstance(session, dict) else None
+            if not isinstance(connection, dict) or not isinstance(connection.get('nodes'), list):
+                raise LinearAPIError('invalid_planning_session', 'Linear returned invalid planning activities', retryable=False)
+            page = connection.get('pageInfo', {})
+            if not isinstance(page, dict) or type(page.get('hasNextPage')) is not bool:
+                raise LinearAPIError('incomplete_planning_session', 'Linear activity pagination is incomplete', retryable=False)
+            identity = {k: v for k, v in session.items() if k != 'activities'}
+            identity['organization'] = data.get('organization')
+            if result is not None and result != identity:
+                raise LinearAPIError('changed_planning_session', 'Linear session identity changed during pagination', retryable=True)
+            result = identity
+            for node in connection['nodes']:
+                if not isinstance(node, dict) or not isinstance(node.get('id'), str) or not isinstance(node.get('createdAt'), str):
+                    raise LinearAPIError('invalid_planning_activity', 'Linear returned an invalid activity', retryable=False)
+                activities.append(node)
+            if not page['hasNextPage']:
+                return dict(result, activities=activities)
+            cursor = page.get('endCursor')
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                break
+            seen.add(cursor)
+        raise LinearAPIError('incomplete_planning_session', 'Linear activity pagination could not be completed', retryable=False)
+
     def create_agent_session(
         self, *, issue_id: str, external_urls: list[dict[str, str]],
     ) -> dict[str, Any]:

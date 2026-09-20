@@ -73,7 +73,7 @@ recovery path; a signed webhook may only accelerate it. A timeout after a status
 write remains ambiguous until a read confirms the remote issue.
 
 Agent Sessions are optional because Linear requires an OAuth app token acting as
-an agent. Inject it using `agent_token_env` (default `LINEAR_AGENT_TOKEN`),
+an agent. Inject it using `agent_token_env` (default `LINEAR_DOTFACTORY_AGENT_TOKEN`),
 separately from the issue/status credential. Missing agent credentials retain
 classic comment fallback. Follow the
 [native-session canary](../factory/LINEAR_AGENT_SESSIONS.md). Set

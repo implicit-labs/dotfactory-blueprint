@@ -15,10 +15,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .control import ControlService, ObservationService
+from .control import ControlError, ControlService, ObservationService
 from .instance import FactoryConfig, FactoryConfigError
 from .kernel import DurableKernel
-from .ledger import SQLiteLedger
+from .ledger import LedgerError, SQLiteLedger
 from .linear_agent import LinearAgentSessionWorker, build_agent_projection
 from .linear_api import LinearAPIError, LinearConvergenceWorker, LinearGraphQLClient
 from .linear_evidence import LinearEvidenceWorker, render_linear_run_summary
@@ -421,6 +421,13 @@ class FactoryRuntime:
                 self.preflights.append({"kind": "linear-live-poll", "available": False,
                                         "reason": error})
             elif self.ledger.current(execution_id)["status"] == "running":
+                planning_session = issue.pop('_planning_session', None)
+                if planning_session is not None:
+                    from .linear_planning import receive
+                    try:
+                        receive(self, execution_id, planning_session)
+                    except (LedgerError, ControlError) as error:
+                        self.preflights.append({'kind': 'linear-planning', 'available': False, 'reason': str(error)})
                 self.linear_workers[project_key].observe_issue(execution_id, issue)
         now = time.monotonic()
         if self._live_poll_inflight or now - self._last_live_poll < 5:
@@ -433,6 +440,19 @@ class FactoryRuntime:
             return
         identifier = str(current["work_item_identifier"])
         client = worker.client
+        planning_session_id = None
+        planning_client = None
+        from .linear_planning import policy_for
+        try:
+            if policy_for(self, execution_id):
+                planning_session_id = self.ledger.linear_agent_session(execution_id).get('session_id')
+                agent_worker = self.linear_agent_workers.get(project_key)
+                if agent_worker:
+                    planning_client = agent_worker.client
+                else:
+                    planning_session_id = None
+        except LedgerError as error:
+            self.preflights.append({'kind': 'linear-planning', 'available': False, 'reason': str(error)})
         results = self._live_poll_results
         self._last_live_poll = now
         self._live_poll_inflight = True
@@ -440,6 +460,8 @@ class FactoryRuntime:
         def read() -> None:
             try:
                 issue = client.issue(identifier)
+                if planning_session_id:
+                    issue['_planning_session'] = planning_client.planning_session(planning_session_id)
                 results.put((execution_id, project_key, issue, None))
             except Exception as error:
                 reason = error.code if isinstance(error, LinearAPIError) else type(error).__name__
@@ -519,6 +541,24 @@ class FactoryRuntime:
             raise LifecycleError("run execution overrides require worker execution configuration")
         intent = {"title": title or identifier, "description": description,
                   "source": "admitted_queue" if admission_snapshot is not None else "explicit_issue"}
+        planning_policy = self.config.values["projects"][project_key].get("linear_planning", {})
+        if planning_policy.get("enabled"):
+            states = self.kernels[project_key].states
+            if project_key not in self.linear_agent_workers or not any(
+                    n.get("checkpoint_role") == "pickup" and n.get("linear_status") == "Planning" for n in states.values()):
+                raise LifecycleError("Linear planning requires Agent Sessions and a Planning pickup workflow")
+            if states.get('Planning', {}).get('execution', {}).get('exit_contract') != 'plan-result-v2' or 'PlanReview' not in states:
+                raise LifecycleError("Linear planning requires a reviewed plan-result-v2 workflow")
+            intent['linear_planning'] = planning_policy
+        verification = self.config.values["projects"][project_key].get("verification")
+        if verification is not None:
+            from .verification_contract import validate
+            validate(verification)
+            states = self.kernels[project_key].states
+            contracts = {node.get("execution", {}).get("exit_contract") for node in states.values()}
+            if not {"plan-result-v2", "implementation-result-v2", "python-verification-v2"}.issubset(contracts) or "PlanReview" not in states:
+                raise LifecycleError("verification methods require a reviewed plan, implementation and Python verification workflow")
+            intent["verification"] = verification
         if admission_snapshot is not None:
             intent["admission"] = {
                 "label": self.config.values.get("work_queue", {}).get("admission_label", "factory-ready"),
@@ -660,6 +700,13 @@ class FactoryRuntime:
                     snapshot, projection, self.ledger.run_history(execution_id),
                     marker_url=marker_url,
                 )
+                from .linear_planning import activities as planning_activities
+                try:
+                    activities = planning_activities(self, execution_id, activities)
+                except LedgerError as error:
+                    self.ledger.record_operating_receipt('linear-planning', project_key, execution_id,
+                        {'status': 'needs_attention', 'message': str(error)})
+                    continue
                 agent_status = agent_worker.sync(
                     execution_id, issue_id=issue_id, marker_url=marker_url,
                     external_urls=external_urls, activities=activities,
@@ -761,6 +808,9 @@ class FactoryRuntime:
 
     def _dispatch_budget(self, project: str, execution: str) -> dict[str, Any]:
         from .budgets import evaluate
+        from .linear_planning import paused
+        if paused(self.ledger, execution):
+            return {'status': 'blocked', 'reason': 'Paused in Linear. Reply resume to continue.'}
         decision = evaluate(self.ledger, self.config.values.get("budgets", {}), project, execution)
         self.ledger.record_operating_receipt("budget", project, execution, decision)
         return decision
@@ -772,7 +822,10 @@ class FactoryRuntime:
             self.operator_server.pump()
         if self.drain_requested or self.stop_requested:
             return {"claimed": [], "scheduler": {"disposition": "idle"}, "cleanup": []}
+        from .linear_planning import poll as poll_planning, discover as discover_planning
+        poll_planning(self)
         self._poll_linear()
+        discover_planning(self)
         self._drain_linear()
         if self._at_target():
             return {"claimed": [], "scheduler": {"disposition": "idle"}, "cleanup": []}

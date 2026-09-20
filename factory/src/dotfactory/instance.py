@@ -236,7 +236,7 @@ def _validate_projects(projects: Any, workflow_names: set[str] | None = None) ->
         if not isinstance(project, dict):
             raise FactoryConfigError(f"{path} must be an object")
         allowed = {"display_name", "enabled_by_default", "workflow", "tracker", "repository_path",
-                   "repository_path_env", "workspace", "execution", "resources"}
+                   "repository_path_env", "workspace", "execution", "resources", "verification", "linear_planning"}
         if set(project) - allowed:
             raise FactoryConfigError(f"{path} contains unknown fields")
         if not isinstance(project.get("display_name"), str) or not project["display_name"].strip():
@@ -248,6 +248,18 @@ def _validate_projects(projects: Any, workflow_names: set[str] | None = None) ->
             or (workflow_names is not None and project["workflow"] not in workflow_names)
         ):
             raise FactoryConfigError(f"{path}.workflow must name a configured workflow")
+        if "linear_planning" in project:
+            from .linear_planning import validate as validate_planning
+            try:
+                validate_planning(project["linear_planning"])
+            except ValueError as error:
+                raise FactoryConfigError(str(error)) from error
+        if "verification" in project:
+            from .verification_contract import validate
+            try:
+                validate(project["verification"])
+            except ValueError as error:
+                raise FactoryConfigError(str(error)) from error
         tracker = project.get("tracker")
         if (
             not isinstance(tracker, dict)
@@ -319,7 +331,7 @@ def _validate_projections(values: dict[str, Any]) -> None:
             raise FactoryConfigError(
                 "config.projections.linear.agent_sessions_enabled must be true or false"
             )
-        agent_token_env = linear.get("agent_token_env", "LINEAR_AGENT_TOKEN")
+        agent_token_env = linear.get("agent_token_env", "LINEAR_DOTFACTORY_AGENT_TOKEN")
         if not isinstance(agent_token_env, str) or not ENV_NAME.fullmatch(agent_token_env):
             raise FactoryConfigError("config.projections.linear.agent_token_env must name an environment variable")
         template = linear.get("agent_session_url_template")
@@ -691,7 +703,7 @@ class FactoryConfig:
             "agent_sessions_enabled": bool(
                 linear.get("agent_sessions_enabled", False)
             ),
-            "agent_token_env": str(linear.get("agent_token_env", "LINEAR_AGENT_TOKEN")),
+            "agent_token_env": str(linear.get("agent_token_env", "LINEAR_DOTFACTORY_AGENT_TOKEN")),
             "agent_session_url_template": linear.get(
                 "agent_session_url_template"
             ),

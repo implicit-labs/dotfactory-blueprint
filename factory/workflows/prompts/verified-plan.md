@@ -50,3 +50,57 @@ ask for clarification or propose manual verification. Return `complete` after
 committing the proposal; the host routes conversational Autoplanning to
 PlanReview. Human approval must bind both the exact commit and proposal digest.
 Messages arriving after your captured context need a new planning revision.
+
+## Verification methods and evidence
+
+When `planning.verification` is present, a methods proposal is required even
+without chat. Use schema_version 2, retain the fields above, and add:
+
+```json
+"verification": {
+  "paths": ["src/screens/Checkout.tsx"],
+  "categories": ["frontend", "interaction"],
+  "add": [],
+  "omit": {}
+}
+```
+
+List concrete planned source paths. Categories are `ios`, `frontend`,
+`interaction`, `backend`, or `general`; path rules also select methods. Use the
+project's registered methods only. `add` names extra methods; `omit` maps each
+removed default method to a concrete reason for human review. Omitted fields
+are not implicit permission to skip checks. The host checks actual changed
+paths against the approved selection later.
+
+In plan.md show one short review step:
+“This changes [surface]. We will verify [behaviors] on [eligible host and
+prerequisites], producing [before/after screenshots, recordings, reports] for
+[scenario/device/viewport]. Anything to adjust?”
+
+Keep behavioral methods distinct from unit tests and readiness checks. A tool
+being installed does not prove behavior; a unit-test pass does not replace a
+required screenshot. Include interaction category when behavior changes, even
+if the filename does not reveal it. Ask focused questions for missing devices,
+fixtures or scenarios. Do not invent unregistered commands or promise an
+unavailable executor. Project owners configure trusted method commands first.
+Every method proposal stops at PlanReview and requires exact human approval.
+The runtime captures before artifacts before implementation, runs after checks
+on the result revision, and blocks completion when evidence is absent.
+
+## Conversation in Linear
+
+Default to a compact product conversation, with more technical specificity when
+a run or step calls for it. When `planning.linear_ui` is true, always commit the
+typed requirements proposal, even with no incoming messages:
+- Investigate first. Explain the relevant behavior you found in plain English.
+- Batch the material decisions in `questions` (Markdown strings). For each,
+  explain why it matters, recommend an option and state its tradeoff. Offer a
+  small set of choices, allow free-text answers, and say what can proceed now.
+- Keep plan.md under 12,000 characters: intended behavior, scope, open decisions,
+  verification environment, checks and required evidence. Explain inherited
+  defaults and run-specific changes in user terms. Put implementation detail
+  behind repository references unless this run specifically calls for it.
+- A simulator, browser, device or fixture prerequisite is distinct from a unit
+  test. Describe the behavior and evidence being verified, not only commands.
+- Do not interpret conversational agreement as implementation approval. Linear
+  presents a versioned plan and the host separately enforces exact approval.

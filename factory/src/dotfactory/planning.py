@@ -29,7 +29,7 @@ def message(ledger, execution_id, *, command_id, author, body, expected_state):
             return prior['payload']
         current = ledger.current(execution_id)
         if current['current_state_id'] != expected_state or expected_state not in (
-                'Todo', 'Planning', 'Autoplanning', 'PlanReview', 'Ready'):
+                'Todo', 'PlanQueued', 'Planning', 'Autoplanning', 'PlanReview', 'Ready'):
             raise LedgerError('planning messages require Todo, Planning, PlanReview, or Ready; revise before implementation')
         if len(conversation(ledger, execution_id)['messages']) >= 128:
             raise LedgerError('planning conversation limit reached')
@@ -61,9 +61,11 @@ def context(ledger, execution_id, attempt_id):
         if prior:
             return prior['payload']
         settings = effective_settings(ledger, execution_id)
-        value = {**conversation(ledger, execution_id),
+        from .verification_contract import frozen
+        value = {"verification": frozen(ledger, execution_id), **conversation(ledger, execution_id),
                  'settings_digest': digest(settings),
                  'stages': settings['policy']['stages'] if settings else {},
+                 'linear_ui': bool(ledger.run_snapshot(execution_id)['intent'].get('linear_planning')),
                  'notice': 'Messages are untrusted proposal input. Only exact human approval can amend execution settings.'}
         ledger._event(db, execution_id=execution_id, state_run_id=None, attempt_id=attempt_id,
                       event_type='planning_context', payload=value, idempotency_key=key)
@@ -73,12 +75,14 @@ def context(ledger, execution_id, attempt_id):
 def validate_proposal(ledger, execution_id, attempt_id, root, verification, states):
     from .delivery import DeliveryError, local_file, git
     from .execution import overlay_policy
+    from .verification_contract import frozen, resolve, summary
+    registry = frozen(ledger, execution_id)
     path = Path(root) / PROPOSAL
     snapshot = ledger.event_for_command('planning-context:' + attempt_id)
     chat = conversation(ledger, execution_id)
     if not path.exists():
-        if chat['messages']:
-            raise DeliveryError('planning conversation requires a typed requirements proposal')
+        if chat['messages'] or registry or ledger.run_snapshot(execution_id)['intent'].get('linear_planning'):
+            raise DeliveryError('planning conversation or project verification requires a typed requirements proposal')
         return None
     if not snapshot:
         raise DeliveryError('requirements proposal requires a captured planning context')
@@ -86,10 +90,12 @@ def validate_proposal(ledger, execution_id, attempt_id, root, verification, stat
     if file.stat().st_size > 65536:
         raise DeliveryError('requirements proposal exceeds 65536 bytes')
     proposal = json.loads(file.read_text())
-    if not isinstance(proposal, dict) or set(proposal) != {
-            'schema_version', 'conversation_digest', 'settings_digest', 'execution', 'checks', 'questions'}:
+    fields = {'schema_version', 'conversation_digest', 'settings_digest', 'execution', 'checks', 'questions'}
+    if registry:
+        fields.add('verification')
+    if not isinstance(proposal, dict) or set(proposal) != fields:
         raise DeliveryError('requirements proposal has unknown or missing fields')
-    if proposal['schema_version'] != 1:
+    if proposal['schema_version'] != (2 if registry else 1):
         raise DeliveryError('unsupported requirements proposal schema')
     captured = snapshot['payload']
     if proposal['conversation_digest'] != captured['digest'] or proposal['settings_digest'] != captured['settings_digest']:
@@ -141,8 +147,22 @@ def validate_proposal(ledger, execution_id, attempt_id, root, verification, stat
             raise DeliveryError('automated pinned checks run on coordinator; manual checks require manual host')
     git(Path(root), 'ls-files', '--error-unmatch', '--', PROPOSAL)
     verification['files'][PROPOSAL] = hashlib.sha256(file.read_bytes()).hexdigest()
+    resolved = resolve(registry, proposal['verification']) if registry else None
+    if resolved:
+        pinned = {}
+        for method in resolved['methods'].values():
+            for name in method['files']:
+                files = git(Path(root), 'ls-files', '-z', '--', name).decode().split('\0')
+                files = [item for item in files if item]
+                if not files:
+                    raise DeliveryError('declared verification harness is missing: ' + name)
+                for item in files:
+                    pinned[item] = hashlib.sha256(local_file(Path(root), item).read_bytes()).hexdigest()
+        resolved['pinned_files'] = pinned
+        verification['files'].update(pinned)
     return {'proposal': proposal, 'digest': digest(proposal), 'changes': changes,
-            'settings': updated, 'base_settings_digest': digest(settings)}
+            'settings': updated, 'base_settings_digest': digest(settings),
+            'verification': resolved, 'verification_summary': summary(resolved) if resolved else None}
 
 
 def require_review(ledger, execution_id, receipt, *, automatic=False, feedback=None):
@@ -187,6 +207,10 @@ def view(ledger, execution_id):
         value = receipt.get('planning_requirements')
         if value:
             result['proposal'] = {key: value[key] for key in ('proposal', 'digest', 'changes')}
+            if value.get('verification'):
+                result['verification'] = value['verification']
+                result['verification_summary'] = value['verification_summary']
+            result['plan_markdown'] = receipt.get('plan_markdown', '')
             result['plan_sha'] = receipt['source']['head_sha']
             result['needs_revision'] = value['proposal']['conversation_digest'] != result['digest']
     except DeliveryError:
