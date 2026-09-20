@@ -212,6 +212,8 @@ The commit completes the old attempt but preserves its execution and worktree.
 
 ## Operate a running factory
 
+For special checks during Planning, use the [planning conversation interface](guides/planning-conversation.md): send a message, inspect the proposal, answer questions and explicitly revise, then approve the exact plan and requirements.
+
 The `run` command opens an owner-only Unix socket beside its ledger. The runtime
 handles commands on its existing ledger thread, including during live runner
 heartbeats. Tracker reads run separately from the writer so an outage cannot

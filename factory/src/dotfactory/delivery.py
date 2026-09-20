@@ -242,6 +242,8 @@ def approved_plan(ledger: Any, execution_id: str) -> dict[str, Any]:
     if not decision:
         raise DeliveryError("verification plan requires human approval or validated Autoplanning before implementation")
     receipt = plan["receipt"]
+    from .planning import require_review
+    require_review(ledger, execution_id, receipt, automatic=decision["from_state"] == "Autoplanning")
     if decision["from_state"] == "Autoplanning":
         event = ledger.connection.execute("SELECT payload_json FROM events WHERE seq=?", (decision["event_seq"],)).fetchone()
         payload = json.loads(event["payload_json"])
@@ -333,12 +335,17 @@ def guard_planned_transition(ledger: Any, execution_id: str, states: dict[str, A
     if from_state == "Autoplanning" and to_state == "Ready":
         plan = planned_receipt(ledger, execution_id)["receipt"]
         require_receipt(ledger, plan["attempt_id"], "plan-result-v2")
+        from .planning import require_review
+        require_review(ledger, execution_id, plan, automatic=True)
     if (
         (from_state == "PlanReview" and to_state == "Ready")
         or (from_state == "ReplanReview" and to_state == "Verifying")
     ):
         plan = planned_receipt(ledger, execution_id)["receipt"]
         require_receipt(ledger, plan["attempt_id"], "plan-result-v2")
+        if from_state == "PlanReview":
+            from .planning import require_review
+            require_review(ledger, execution_id, plan, feedback=feedback or [])
         if not any(plan["source"]["head_sha"] in str(item.get("body", "")) for item in feedback or []):
             raise DeliveryError("approval feedback must name the exact reviewed plan commit")
     if (
@@ -486,7 +493,7 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
         if not existing["payload"]["passed"]:
             return _failed_result(existing["payload"], uri)
         require_receipt(ledger, request.attempt_id, str(contract))
-        return RunnerResult(result.outcome, result.preferred_label,
+        return RunnerResult(result.outcome, _planning_label(request, existing["payload"], result.preferred_label),
                             (*result.evidence, {"kind": "delivery_check", "uri": uri}))
     receipt = {"schema_version": 1, "contract": contract, "attempt_id": request.attempt_id,
                "workflow_digest": request.workflow_digest, "passed": False,
@@ -522,11 +529,22 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
                         "replanning may change only its plan and declared verification files"
                     )
                 receipt["replan"] = context
-            elif any(
-                name not in receipt["verification_plan"]["files"]
-                for name in source["changed_files"]
-            ):
-                raise DeliveryError("planning may change only its plan and declared verification files")
+            else:
+                from .planning import validate_proposal
+                # Only stages in the admitted workflow may receive requirements.
+                graph = ledger.workflow_snapshot(request.execution_id)["normalized"]
+                receipt["planning_requirements"] = validate_proposal(
+                    ledger, request.execution_id, request.attempt_id, root,
+                    receipt["verification_plan"],
+                    {node["id"]: node for node in graph["states"]},
+                )
+                if any(
+                    name not in receipt["verification_plan"]["files"]
+                    for name in source["changed_files"]
+                ):
+                    raise DeliveryError(
+                        "planning may change only its plan and declared verification files"
+                    )
         approved = None
         if contract in ("implementation-result-v2", "python-verification-v2"):
             approved = approved_plan(ledger, request.execution_id)
@@ -589,8 +607,14 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
     uri = f"ledger://delivery-checks/{request.attempt_id}"
     if not receipt["passed"]:
         return _failed_result(receipt, uri)
-    return RunnerResult(result.outcome, result.preferred_label,
+    return RunnerResult(result.outcome, _planning_label(request, receipt, result.preferred_label),
                         (*result.evidence, {"kind": "delivery_check", "uri": uri}))
+
+
+def _planning_label(request, receipt, preferred):
+    if request.state_id == "Autoplanning" and receipt.get("planning_requirements") and "review" in request.config.get("allowed_preferred_labels", []):
+        return "review"
+    return preferred
 
 
 def require_receipt(ledger: Any, attempt_id: str, contract: str) -> None:

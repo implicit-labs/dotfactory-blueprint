@@ -173,6 +173,8 @@ class ObservationService:
             snapshot["linear_agent_session"] = None
         from .execution import settings_view
         snapshot["execution_settings"] = settings_view(self.ledger, execution_id)
+        from .planning import view as planning_view
+        snapshot["planning"] = planning_view(self.ledger, execution_id)
         snapshot["available_actions"] = self.available_actions(snapshot)
         return {"api_version": API_VERSION, "data": _without_fences(snapshot)}
 
@@ -402,6 +404,16 @@ class ObservationService:
             self.ledger, self.kernel, str(snapshot["id"]), state
         ) if snapshot["status"] == "running" else []
         actions: list[dict[str, Any]] = []
+        _workflow, states, _edges = self.kernel.graph_for_execution(str(snapshot["id"]))
+        if (
+            snapshot["status"] == "running"
+            and state in ("Todo", "Planning", "Autoplanning", "PlanReview", "Ready")
+            and any(
+                node.get("execution", {}).get("exit_contract") == "plan-result-v2"
+                for node in states.values()
+            )
+        ):
+            actions.append({"action": "planning_message", "confirmation_required": False})
         for action in ("cancel", "approve", "retry", "replan"):
             candidates = [
                 edge for edge in edges if edge.get("action", "transition") == action
@@ -465,6 +477,7 @@ class ControlService:
         action = request.get("action")
         if action not in (
             "cancel", "retry", "approve", "replan", "transition", "attention",
+            "planning_message",
         ):
             raise ControlError("invalid_action", "action is not supported")
         if not isinstance(request.get("expected_state"), str):
@@ -517,6 +530,12 @@ class ControlService:
             if not allowed:
                 return receipt
         try:
+            if action == "planning_message":
+                prior_message = self.ledger.event_for_command("planning-message:" + command_id)
+                if prior_message:
+                    return self._complete(execution_id, command_id, {
+                        "message": prior_message["payload"],
+                        "requires_plan_revision": normalized["expected_state"] in ("PlanReview", "Ready")})
             prior_decision = (
                 None if action == "attention" else self.ledger.decision_for_command(
                     f"execution:{execution_id}:transition:control:{command_id}"
@@ -559,6 +578,11 @@ class ControlService:
         action = request["action"]
         if principal.role == "viewer":
             return False, "viewer role is read-only"
+        if action == "planning_message":
+            _workflow, states, _edges = self.kernel.graph_for_execution(execution_id)
+            supported = any(node.get("execution", {}).get("exit_contract") == "plan-result-v2" for node in states.values())
+            return (supported and request["expected_state"] in ("Todo", "Planning", "Autoplanning", "PlanReview", "Ready"),
+                    "planning messages require a planned workflow before implementation")
         if action == "attention":
             remedy = request["parameters"].get("remedy")
             if remedy not in ("retry", "release", "retain", "quarantine", "cancel"):
@@ -626,6 +650,11 @@ class ControlService:
         action = request["action"]
         parameters = request["parameters"]
         state = str(current["current_state_id"])
+        if action == "planning_message":
+            from .planning import message
+            return {"message": message(self.ledger, execution_id, command_id=command_id,
+                                       author=principal.subject, body=parameters.get("body"), expected_state=state),
+                    "requires_plan_revision": state in ("PlanReview", "Ready")}
         if action == "attention":
             attention_id = parameters.get("attention_id")
             remedy = parameters.get("remedy")
@@ -692,7 +721,11 @@ class ControlService:
                 head = planned_receipt(self.ledger, execution_id)["receipt"]["source"]["head_sha"]
                 if parameters.get("plan_sha") != head:
                     raise ControlError("plan_sha_required", "approve requires the exact reviewed plan_sha")
-                note = f"Approved verification plan at {head}. " + str(note or "")
+                receipt = planned_receipt(self.ledger, execution_id)["receipt"]
+                proposal = receipt.get("planning_requirements")
+                if proposal and parameters.get("requirements_digest") != proposal["digest"]:
+                    raise ControlError("requirements_digest_required", "approve requires the exact reviewed requirements_digest")
+                note = f"Approved verification plan at {head}. " + (f"Requirements {proposal['digest']}. " if proposal else "") + str(note or "")
             if edge.get("requires_feedback") and (
                 not isinstance(note, str) or not note.strip()
             ):
