@@ -42,6 +42,7 @@ configured by dotfactory belong to their owning repository.
 | [0038](0038-scope-execution-settings-to-projects-and-runs.md) | Scope execution settings to projects and runs | Proposed | — |
 | [0039](0039-replace-unusable-frozen-verifiers-through-reviewed-replanning.md) | Replace unusable frozen verifiers through reviewed replanning | Accepted | 0031 (replanning policy only) |
 | [0040](0040-distinguish-verification-hosts.md) | Distinguish worker and coordinator verification requirements | Proposed | — |
+| [0041](0041-approve-conversational-requirements.md) | Bind conversational requirements to exact human plan approval | Proposed | — |
 
 ## Lifecycle
 

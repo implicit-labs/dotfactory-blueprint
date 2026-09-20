@@ -1362,6 +1362,9 @@ class LiveRunner:
                 launch.request.config.get("allowed_preferred_labels", [])
             ),
         }
+        if launch.request.config.get("exit_contract") == "plan-result-v2":
+            from .planning import context as planning_context
+            context["planning"] = planning_context(self.ledger, launch.request.execution_id, launch.request.attempt_id)
         integration_policy = ""
         if disabled_mcp_servers:
             integration_policy = (

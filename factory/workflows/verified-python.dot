@@ -30,6 +30,7 @@ digraph VerifiedPython {
   Todo -> Autoplanning [on=claim, authority=agent]
   Todo -> Planning [on=human]
   Autoplanning -> Ready [on=complete]
+  Autoplanning -> PlanReview [on=review]
   Planning -> PlanReview [on=complete, authority="human,agent"]
   PlanReview -> Ready [on=approve]
   PlanReview -> Planning [on=revise]

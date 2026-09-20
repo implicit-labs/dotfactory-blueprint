@@ -230,6 +230,12 @@ def _operator(args: argparse.Namespace) -> int:
     config = FactoryConfig.load(args.config)
     message = {"operation": args.operation, "project": args.project,
                "execution": args.execution}
+    if args.operation == "planning-chat":
+        if not args.message or not args.expected_state or not args.command_id or not args.execution:
+            raise ValueError("planning-chat requires execution, command-id, expected-state, and message")
+        message.update(operation="command", command_id=args.command_id, request={
+            "action": "planning_message", "expected_state": args.expected_state,
+            "parameters": {"body": args.message}})
     if args.operation == "command":
         if not args.request_file or not args.command_id or not args.execution:
             raise ValueError("command requires execution, command-id, and request-file")
@@ -441,12 +447,14 @@ def main(arguments: list[str] | None = None) -> int:
     )
     attention.set_defaults(callback=_attention)
     operator = commands.add_parser("operator", help="control the running factory over its owner-only socket")
-    operator.add_argument("operation", choices=("status", "artifacts", "delivery", "command", "drain"))
+    operator.add_argument("operation", choices=("status", "artifacts", "delivery", "command", "planning-chat", "drain"))
     operator.add_argument("--config", default=os.environ.get("DOTFACTORY_CONFIG"))
     operator.add_argument("--project", required=True)
     operator.add_argument("--execution")
     operator.add_argument("--request-file")
     operator.add_argument("--command-id")
+    operator.add_argument("--message")
+    operator.add_argument("--expected-state")
     operator.set_defaults(callback=_operator)
     demo = commands.add_parser("demo", help="run a disposable Git-backed toy lifecycle")
     demo.add_argument("--output")

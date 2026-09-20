@@ -1921,6 +1921,16 @@ class SQLiteLedger:
                        "observation": observation,
                        "workflow_digest": workflow_digest,
                        "resolved_node": resolved_node or {}}
+            if from_state == "PlanReview" and to_state == "Ready" and actor == "human":
+                from .planning import approval
+                from .delivery import DeliveryError
+                # Legacy workflows without delivery receipts are unaffected.
+                has_plan = db.execute("SELECT 1 FROM events WHERE execution_id=? AND event_type='delivery_checked'", (execution_id,)).fetchone()
+                if has_plan:
+                    try:
+                        payload["planning_approval"] = approval(self, execution_id, review_feedback)
+                    except DeliveryError as error:
+                        raise LedgerError(str(error)) from error
             seq = self._event(db, execution_id=execution_id, state_run_id=next_run_id,
                               attempt_id=next_attempt, event_type="transition_accepted",
                               payload=payload, idempotency_key=idempotency_key)

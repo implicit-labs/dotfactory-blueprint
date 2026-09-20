@@ -80,7 +80,8 @@ def settings_view(ledger, execution_id):
     row = ledger.connection.execute("SELECT policy_json FROM execution_policies WHERE execution_id=?", (execution_id,)).fetchone()
     if not row:
         return None
-    value = json.loads(row[0])
+    from .planning import effective_settings
+    value = effective_settings(ledger, execution_id)
     return {"stages": value["policy"]["stages"], "provenance": value.get("provenance", {}),
             "digest": worker.digest(value), "frozen_at": value.get("frozen_at", "legacy-first-placement")}
 
@@ -243,7 +244,10 @@ class ExecutionManager:
     def _policy(self, request):
         row = self.ledger.connection.execute("SELECT policy_json FROM execution_policies WHERE execution_id=?", (request.execution_id,)).fetchone()
         if row:
-            return json.loads(row[0])
+            if request.state_id in ("Planning", "Autoplanning"):
+                return json.loads(row[0])
+            from .planning import effective_settings
+            return effective_settings(self.ledger, request.execution_id)
         # Compatibility for runs created before admission snapshots existed.
         project = self.ledger.current(request.execution_id)["project_key"]
         settings = self.admission(project)

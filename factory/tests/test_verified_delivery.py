@@ -107,6 +107,7 @@ class VerifiedDeliveryTests(unittest.TestCase):
         # Keep coverage for saved, pre-continuation workflow snapshots.
         workflow = self.root / "reviewed.dot"
         workflow.write_text((ROOT / "workflows/verified-python.dot").read_text().replace(
+            '  Autoplanning -> PlanReview [on=review]\n', '').replace(
             'Autoplanning -> Ready [on=complete]', 'Autoplanning -> PlanReview [on=complete]').replace(
             'prompt="prompts/', f'prompt="{ROOT}/workflows/prompts/'))
         values["workflows"]["default"]["path"] = str(workflow)
