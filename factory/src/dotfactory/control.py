@@ -171,6 +171,8 @@ class ObservationService:
             )
         except LedgerError:
             snapshot["linear_agent_session"] = None
+        from .execution import settings_view
+        snapshot["execution_settings"] = settings_view(self.ledger, execution_id)
         snapshot["available_actions"] = self.available_actions(snapshot)
         return {"api_version": API_VERSION, "data": _without_fences(snapshot)}
 

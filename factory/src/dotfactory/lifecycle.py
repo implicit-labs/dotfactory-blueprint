@@ -163,11 +163,15 @@ class FactoryRuntime:
             self.execution = None
             if config.values.get("execution"):
                 from .execution import ExecutionManager, WorkerPreparation
-                self.execution = ExecutionManager(self.ledger, config.values["execution"], routes)
+                self.execution = ExecutionManager(self.ledger, config.values["execution"], routes,
+                    {key: value.get("execution", {}) for key, value in config.values["projects"].items()})
                 self.projects = {
                     key: ScheduledProject(value.kernel, WorkerPreparation(value.preparation, self.execution))
                     for key, value in self.projects.items()
                 }
+            elif not control_only:
+                from .execution import assert_no_frozen_worker_runs
+                assert_no_frozen_worker_runs(self.ledger, self.project_keys)
             if control_only:
                 runner = LiveRunner(
                     self.ledger, routes=routes, environment=self.environment,
@@ -494,14 +498,25 @@ class FactoryRuntime:
 
     def start_issue(
         self, project_key: str, identifier: str, *, title: str | None = None,
-        description: str = "",
+        description: str = "", execution_override: dict[str, Any] | None = None,
         admission_snapshot: dict[str, Any] | None = None,
     ) -> str:
         if project_key not in self.kernels:
             raise LifecycleError(f"project is not enabled: {project_key}")
         existing = self._existing_execution(project_key, identifier)
         if existing:
+            if self.execution:
+                self.execution.assert_same_override(existing, execution_override)
+            elif execution_override is not None:
+                raise LifecycleError("run execution overrides require worker execution configuration")
             return existing
+        settings = None
+        if self.execution:
+            settings = self.execution.admission(project_key, execution_override,
+                work_states=[name for name, state in self.kernels[project_key].states.items()
+                             if state["kind"] == "work"])
+        elif execution_override is not None:
+            raise LifecycleError("run execution overrides require worker execution configuration")
         intent = {"title": title or identifier, "description": description,
                   "source": "admitted_queue" if admission_snapshot is not None else "explicit_issue"}
         if admission_snapshot is not None:
@@ -546,7 +561,7 @@ class FactoryRuntime:
             command_id=(
                 f"runtime-begin:{project_key}:{identifier}:{execution_number}"
             ),
-            adopted_state=adopted_state,
+            adopted_state=adopted_state, execution_settings=settings,
         )
         if worker:
             # The adoption snapshot is the first observation. A second read here
@@ -751,6 +766,8 @@ class FactoryRuntime:
         return decision
 
     def step(self) -> dict[str, Any]:
+        if self.control_only:
+            raise LifecycleError("control-only runtimes cannot dispatch work")
         if self.operator_server:
             self.operator_server.pump()
         if self.drain_requested or self.stop_requested:

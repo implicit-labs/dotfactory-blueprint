@@ -139,6 +139,10 @@ def _load_description(path_value: str | None) -> str:
 def _run(args: argparse.Namespace) -> int:
     config = FactoryConfig.load(args.config)
     description = _load_description(args.description_file)
+    settings_path = getattr(args, "execution_config", None)
+    execution_override = json.loads(_load_description(settings_path)) if settings_path else None
+    if settings_path and not isinstance(execution_override, dict):
+        raise ValueError("execution config must be a JSON object")
     with FactoryRuntime(config, project_keys=[args.project]) as runtime:
         _install_signals(runtime)
         runtime.enable_operator()
@@ -151,6 +155,7 @@ def _run(args: argparse.Namespace) -> int:
         execution = runtime.start_issue(
             args.project, issue, title=title,
             description=description,
+            **({"execution_override": execution_override} if settings_path else {}),
         )
         receipt = runtime.run(
             [execution], watch=args.watch,
@@ -398,6 +403,7 @@ def main(arguments: list[str] | None = None) -> int:
     )
     run.add_argument("--title")
     run.add_argument("--description-file")
+    run.add_argument("--execution-config", help="JSON stage overrides for a new run; omitted fields inherit project settings")
     run.add_argument("--until-state")
     run.add_argument("--watch", action="store_true")
     run.add_argument("--max-ticks", type=int)

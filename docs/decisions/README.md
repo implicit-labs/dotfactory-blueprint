@@ -39,6 +39,7 @@ configured by dotfactory belong to their owning repository.
 | [0035](0035-abandon-uncertain-runs-without-assuming-process-exit.md) | Abandon uncertain runs without assuming process exit | Proposed | — |
 | [0036](0036-admit-continuous-work-explicitly.md) | Admit continuous work explicitly and gate dispatch on recorded usage | Proposed | — |
 | [0037](0037-check-worker-readiness-before-allocation.md) | Check worker readiness before allocation | Proposed | — |
+| [0038](0038-scope-execution-settings-to-projects-and-runs.md) | Scope execution settings to projects and runs | Proposed | — |
 | [0039](0039-replace-unusable-frozen-verifiers-through-reviewed-replanning.md) | Replace unusable frozen verifiers through reviewed replanning | Accepted | 0031 (replanning policy only) |
 
 ## Lifecycle
