@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposed |
+| Status | Accepted |
 | Date | 2026-09-19 |
 | Deciders | Maintainers |
 | Supersedes | — |
@@ -26,8 +26,8 @@ Instance-only diagnostic checks conceal project/run overrides.
   workflow authority and credential isolation remain unchanged.
 - Read-only inspection does not claim that probes or remote checks passed.
 - Host probes are trusted operator commands, not plan-authored policy or leases.
-- Remaining configuration domains and planning-to-placement binding require later
-  phases; this record does not grant arbitrary recursive configuration overrides.
+- Planning-to-placement amendments follow ADR-0041's exact human approval;
+  this record does not grant arbitrary recursive configuration overrides.
 
 ## Alternatives
 
@@ -43,3 +43,5 @@ A separately reviewed verification lane supports other hosts or credentials.
 
 - [Guide](../guides/verification-hosts.md)
 - [Implementation plan](../plans/project-run-contracts.md)
+- [Implementation PR](https://github.com/implicit-labs/dotfactory-blueprint/pull/21)
+- [Changelog](../changelogs/2026-09-19-verification-host-contracts.md)

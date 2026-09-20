@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposed |
+| Status | Accepted |
 | Date | 2026-09-19 |
 | Deciders | Maintainers |
 
@@ -46,3 +46,5 @@ A reviewed executor supports additional verification hosts or mid-run revision.
 
 - [User journey and commands](../guides/planning-conversation.md)
 - [Verification host boundary](0040-distinguish-verification-hosts.md)
+- [Implementation PR](https://github.com/implicit-labs/dotfactory-blueprint/pull/22)
+- [Changelog](../changelogs/2026-09-19-planning-conversation.md)

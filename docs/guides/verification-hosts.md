@@ -64,5 +64,8 @@ not an existing run: inspect that run's frozen `execution_settings` for its poli
 
 The shared resolver currently covers execution fields. Runner/tool profiles,
 workflow selection, workspace policy, budgets, projections and evidence retention
-remain separate follow-up phases. Planning cannot yet alter placement requirements;
-use a new run with explicit operator settings. Readiness does not reserve devices.
+remain separate follow-up phases. Planning may propose changes to configurable
+implementation and verification fields. They apply only after exact plan and
+requirements approval; credentials, host registrations, billing identity, safety
+ceilings, pinned checks and the original admission record remain unchanged.
+Readiness does not reserve devices.
