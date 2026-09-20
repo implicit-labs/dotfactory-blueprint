@@ -41,6 +41,23 @@ def overlay_policy(policy, override, *, origin, provenance=None):
     return result, sources
 
 
+def resolve_settings(policy, project=None, override=None, *, work_states=None):
+    """Pure resolution shared by admission and inspection; never probes or opens a ledger."""
+    project = {} if project is None else project
+    override = {} if override is None else override
+    resolved, sources = overlay_policy(policy, project, origin="project")
+    resolved, sources = overlay_policy(resolved, override, origin="run", provenance=sources)
+    if work_states is not None:
+        for layer in (project, override):
+            if set(layer.get("stages", {})) - set(work_states):
+                raise ValueError("execution override names a non-work or unknown workflow stage")
+        # Instance defaults can serve several workflows. Unused stage contracts
+        # must not block this workflow's coordinator preflight.
+        resolved["stages"] = {key: value for key, value in resolved["stages"].items() if key in work_states}
+        sources = {key: value for key, value in sources.items() if key in work_states}
+    return resolved, sources
+
+
 def record_admission(db, execution_id, settings):
     db.execute("INSERT INTO execution_policies VALUES (?,?)",
                (execution_id, json.dumps(settings, sort_keys=True)))
@@ -98,7 +115,7 @@ def validate_policy(policy):
     if not isinstance(policy["stages"], dict) or not policy["stages"]:
         raise ValueError("execution stages must be a nonempty object")
     for rule in policy["stages"].values():
-        if not isinstance(rule, dict) or set(rule) - {"workers", "requires", "scope", "checks", "check_timeout_seconds", "readiness"}:
+        if not isinstance(rule, dict) or set(rule) - {"workers", "requires", "scope", "checks", "check_timeout_seconds", "readiness", "coordinator"}:
             raise ValueError("unknown execution stage setting")
         if rule.get("scope") not in ("portable", "native"):
             raise ValueError("stage scope must explicitly be portable or native")
@@ -111,9 +128,46 @@ def validate_policy(policy):
         if not isinstance(rule.get("checks"), list) or any(not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or not arg or '\x00' in arg for arg in argv) for argv in rule["checks"]):
             raise ValueError("stage checks must be arrays of command arguments")
         worker.validate_readiness(rule.get("readiness", []))
+        from .verification_host import validate as validate_coordinator
+        validate_coordinator(rule.get("coordinator", {}))
         timeout = rule.get("check_timeout_seconds", 300)
         if type(timeout) is not int or not 1 <= timeout <= 3600:
             raise ValueError("check timeout must be 1..3600 seconds")
+
+
+def validate_report(report, probes, minimum_version):
+    """Fail closed for old/malformed workers; diagnostics and dispatch share this check."""
+    expected = [item["name"] for item in probes]
+    results = report.get("readiness", [])
+    if expected and (not isinstance(results, list) or len(results) != len(expected)
+            or not all(isinstance(item, dict) for item in results)
+            or [item.get("name") for item in results] != expected):
+        raise ExecutionError("worker did not report requested readiness probes")
+    if expected and any(item.get("passed") is not True or item.get("exit_code") != 0 for item in results):
+        report["available"] = False
+        report["missing"] = list(report.get("missing", [])) + [
+            "readiness:" + item["name"] + ":failed" for item in results
+            if item.get("passed") is not True or item.get("exit_code") != 0]
+    if report.get("available") is True:
+        from .live_runner import _version_tuple
+        current, minimum = _version_tuple(report.get("version", "")), _version_tuple(minimum_version)
+        width = max(len(current), len(minimum))
+        if current + (0,) * (width - len(current)) < minimum + (0,) * (width - len(minimum)):
+            raise ExecutionError("runner is too old")
+
+
+def worker_requirements(rule, repository_path):
+    requirements = set(rule["requires"]) | {"tool:git"}
+    commands = {Path(argv[0]).name for argv in rule["checks"]}
+    requirements.update("tool:" + item for item in commands)
+    apple = "xcodebuild" in commands or "xcrun" in commands
+    if rule["scope"] == "native":
+        repository = Path(repository_path)
+        paths = worker.git(repository, "ls-files").splitlines()
+        apple = apple or any(".xcodeproj/" in path or ".xcworkspace/" in path for path in paths)
+    if apple:
+        requirements.update(("os:darwin", "tool:xcodebuild"))
+    return requirements
 
 
 def transport_command(config):
@@ -174,12 +228,7 @@ class ExecutionManager:
     def admission(self, project_key, override=None, *, work_states=None):
         project = self.project_overrides.get(project_key, {})
         override = {} if override is None else override
-        policy, sources = overlay_policy(self.policy, project, origin="project")
-        policy, sources = overlay_policy(policy, override, origin="run", provenance=sources)
-        if work_states is not None:
-            for layer in (project, override):
-                if set(layer.get("stages", {})) - set(work_states):
-                    raise ValueError("execution override names a non-work or unknown workflow stage")
+        policy, sources = resolve_settings(self.policy, project, override, work_states=work_states)
         return {"policy": policy, "routes": {key: asdict(value) for key, value in self.routes.items()},
                 "project_key": project_key, "run_overrides": copy.deepcopy(override),
                 "provenance": sources, "frozen_at": "admission"}
@@ -232,9 +281,18 @@ class ExecutionManager:
 
     def precheck(self, request, project):
         self.ledger.assert_attempt_active(request.attempt_id, request.fence_token)
+        binding = self._policy(request)
+        from .verification_host import inspect as inspect_coordinator
+        coordinator_reports = {}
+        # All configured verification lanes must be viable before any model work.
+        for state, configured in binding["policy"]["stages"].items():
+            if configured.get("coordinator"):
+                report = inspect_coordinator(configured["coordinator"], execute=True)
+                coordinator_reports[state] = report
+                if not report["available"]:
+                    raise ExecutionError("coordinator verification prerequisites unavailable for " + state + ": " + ", ".join(report["missing"]))
         if self.record(request):
             return
-        binding = self._policy(request)
         policy = binding["policy"]
         rule = policy["stages"].get(request.state_id)
         if not rule:
@@ -245,16 +303,7 @@ class ExecutionManager:
         route = RunnerRoute(**binding["routes"][request.config["runner"]])
         if route.kind not in ("codex", "claude-code"):
             raise ExecutionError("worker execution supports native Codex and Claude Code")
-        requirements = set(rule["requires"]) | {"tool:git"}
-        commands = {Path(argv[0]).name for argv in rule["checks"]}
-        requirements.update("tool:" + item for item in commands)
-        apple = "xcodebuild" in commands or "xcrun" in commands
-        if rule["scope"] == "native":
-            repository = Path(project["repository_path"])
-            paths = worker.git(repository, "ls-files").splitlines()
-            apple = apple or any(".xcodeproj/" in path or ".xcworkspace/" in path for path in paths)
-        if apple:
-            requirements.update(("os:darwin", "tool:xcodebuild"))
+        requirements = worker_requirements(rule, project["repository_path"])
         failures = []
         for name in rule["workers"]:
             config = policy["workers"][name]
@@ -265,34 +314,15 @@ class ExecutionManager:
             try:
                 budget = 45 + sum(item.get("timeout_seconds", 10) for item in spec["readiness"])
                 report = call(config, spec, timeout=budget)
-                expected = [item["name"] for item in spec["readiness"]]
-                results = report.get("readiness", [])
-                if expected and (not isinstance(results, list) or
-                        len(results) != len(expected) or not all(isinstance(item, dict) for item in results) or
-                        [item.get("name") for item in results if isinstance(item, dict)] != expected):
-                    failures.append(name + ": worker did not report requested readiness probes")
-                    continue
-                if expected and any(item.get("passed") is not True or item.get("exit_code") != 0
-                                    for item in results):
-                    report["available"] = False
-                    report["missing"] = list(report.get("missing", [])) + [
-                        "readiness:" + item["name"] + ":failed" for item in results
-                        if item.get("passed") is not True or item.get("exit_code") != 0]
+                validate_report(report, spec["readiness"], route.minimum_version)
                 if not report["available"]:
                     failures.append(name + ": " + ", ".join(report["missing"]))
-                    continue
-                from .live_runner import _version_tuple
-                current = _version_tuple(report["version"])
-                minimum = _version_tuple(route.minimum_version)
-                width = max(len(current), len(minimum))
-                if current + (0,) * (width-len(current)) < minimum + (0,) * (width-len(minimum)):
-                    failures.append(name + ": runner is too old")
                     continue
             except (ExecutionError, OSError, ValueError) as error:
                 failures.append(name + ": " + str(error))
                 continue
             manifest = {"worker": name, "worker_config": config, "rule": rule,
-                        "route": asdict(route), "report": report, "requirements": sorted(requirements),
+                        "route": asdict(route), "report": report, "coordinator_reports": coordinator_reports, "requirements": sorted(requirements),
                         "fence_digest": worker.digest(request.fence_token), "status": "selected",
                         "identity": hashlib.sha256((request.execution_id + request.attempt_id).encode()).hexdigest(),
                         "state": request.state_id, "workflow_digest": request.workflow_digest}

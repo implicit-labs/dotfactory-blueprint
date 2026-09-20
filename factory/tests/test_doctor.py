@@ -393,7 +393,7 @@ class DoctorCommandTests(unittest.TestCase):
         module = Path(__file__).resolve().parents[1] / "src" / "dotfactory" / "doctor.py"
         source = module.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(module), feature_version=(3, 9))
-        allowed_local = {"instance"}
+        allowed_local = {"instance", "configuration", "verification_host"}
         allowed_stdlib = {
             "dataclasses", "json", "os", "pathlib", "re", "shlex", "shutil",
             "subprocess", "typing",

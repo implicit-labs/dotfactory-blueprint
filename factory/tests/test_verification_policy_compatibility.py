@@ -15,6 +15,12 @@ from dotfactory import delivery  # noqa: E402
 
 class VerificationPolicyCompatibilityTests(unittest.TestCase):
     def test_legacy_accepted_receipt_uses_sixty_seconds_through_evaluate(self):
+        self.evaluate_fixture()
+
+    def test_delivery_rechecks_host_after_preflight_succeeded(self):
+        self.evaluate_fixture(host_drift=True)
+
+    def evaluate_fixture(self, host_drift=False):
         with tempfile.TemporaryDirectory(prefix="df-legacy-policy-") as directory:
             root = Path(directory)
             (root / ".factory").mkdir()
@@ -29,11 +35,13 @@ class VerificationPolicyCompatibilityTests(unittest.TestCase):
                 attempt_id="attempt",
                 fence_token="fence",
                 workflow_digest="workflow",
-                execution_id="execution",
+                execution_id="execution", state_id="Verifying",
             )
             launch = SimpleNamespace(request=request, workspace_path=str(root))
             ledger = MagicMock()
             ledger.assert_attempt_active = MagicMock()
+            # Legacy fixture predates frozen execution policies.
+            ledger.connection.execute.return_value.fetchone.return_value = None
             ledger.event_for_command.return_value = None
             ledger.workspace_for_execution.return_value = {"path": str(root)}
             ledger.record_delivery_check.side_effect = (
@@ -60,7 +68,18 @@ class VerificationPolicyCompatibilityTests(unittest.TestCase):
                 "head_sha": "head",
                 "changed_files": ["factory/src/dotfactory/delivery.py"],
             }
+            host = None
+            if host_drift:
+                marker = root / 'fixture-available'
+                marker.touch()
+                host = {'readiness': [{'name': 'fixture', 'command': [
+                    '{python}', '-I', '-c', 'from pathlib import Path; assert Path(' + repr(str(marker)) + ').exists()']}]}
+                from dotfactory.verification_host import inspect
+                self.assertTrue(inspect(host, execute=True)['available'])
+                marker.unlink()
+            settings = {'stages': {'Verifying': {'coordinator': host}}} if host else None
             with (
+                patch('dotfactory.execution.settings_view', return_value=settings),
                 patch.object(delivery, "source_snapshot", return_value=source),
                 patch.object(delivery, "_evidence", return_value=[]),
                 patch.object(delivery, "git", return_value=b"factory/src/dotfactory/delivery.py\0"),
@@ -73,6 +92,14 @@ class VerificationPolicyCompatibilityTests(unittest.TestCase):
                     delivery.RunnerResult("done", "complete", ()),
                 )
 
+            if host_drift:
+                verifier.assert_not_called()
+                receipt = ledger.record_delivery_check.call_args.args[2]
+                self.assertFalse(receipt['passed'])
+                self.assertFalse(receipt['coordinator']['available'])
+                self.assertIn('coordinator verification prerequisites', receipt['error'])
+                self.assertNotEqual('complete', result.preferred_label)
+                return
             self.assertEqual("complete", result.preferred_label)
             verifier.assert_called_once()
             self.assertIsNone(verifier.call_args.kwargs["policy"])

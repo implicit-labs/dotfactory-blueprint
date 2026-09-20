@@ -363,7 +363,16 @@ def _dataset(args: argparse.Namespace) -> int:
 def _doctor(args: argparse.Namespace) -> int:
     from .doctor import run
 
-    return run(args.config, json_output=args.json)
+    from .configuration import load_override
+    return run(args.config, json_output=args.json, project=args.project,
+               execution_override=load_override(args.execution_config))
+
+
+def _config_preview(args):
+    from .configuration import preview, load_override
+    print(json.dumps(preview(FactoryConfig.load(args.config), args.project,
+                             load_override(args.execution_config)), indent=2, sort_keys=True))
+    return 0
 
 
 def _listener(args: argparse.Namespace) -> int:
@@ -387,7 +396,14 @@ def main(arguments: list[str] | None = None) -> int:
     )
     doctor.add_argument("--config", required=True)
     doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--project")
+    doctor.add_argument("--execution-config")
     doctor.set_defaults(callback=_doctor)
+    preview = commands.add_parser("config-preview", help="resolve project/run settings without creating runtime state")
+    preview.add_argument("--config", required=True)
+    preview.add_argument("--project", required=True)
+    preview.add_argument("--execution-config")
+    preview.set_defaults(callback=_config_preview)
     from .worker_cli import add_commands
     add_commands(commands)
     work = commands.add_parser("work", help="continuously discover Linear work and run the coordinator")

@@ -405,11 +405,8 @@ def _verify(
         pinned = temp / "verify.py"
         pinned.write_bytes(script)
         output = temp / "check.log"
-        environment = {
-            "PATH": os.defpath,
-            "HOME": str(temp),
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
+        from .verification_host import environment as verification_environment
+        environment = verification_environment(temp)
         with output.open("wb") as stream:
             process = subprocess.Popen(
                 [sys.executable, "-I", str(pinned), str(checkout)], cwd=temp,
@@ -561,6 +558,14 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
                 # Pre-policy plan-result-v2 receipts are immutable and omit this key.
                 # Passing None preserves their historical 60-second verifier budget.
                 policy = approved.get("policy") if approved else None
+                from .execution import settings_view
+                from .verification_host import inspect as inspect_coordinator
+                settings = settings_view(ledger, request.execution_id)
+                host = settings["stages"].get(request.state_id, {}).get("coordinator") if settings else None
+                if host:
+                    receipt["coordinator"] = inspect_coordinator(host, execute=True)
+                    if not receipt["coordinator"]["available"]:
+                        raise DeliveryError("coordinator verification prerequisites unavailable")
                 receipt["verification"] = _verify(
                     root,
                     approved["head_sha"] if approved else source["base_sha"],

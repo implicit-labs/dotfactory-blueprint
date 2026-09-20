@@ -235,6 +235,10 @@ def _validate_projects(projects: Any, workflow_names: set[str] | None = None) ->
             raise FactoryConfigError(f"{path} must use a lowercase hyphenated project key")
         if not isinstance(project, dict):
             raise FactoryConfigError(f"{path} must be an object")
+        allowed = {"display_name", "enabled_by_default", "workflow", "tracker", "repository_path",
+                   "repository_path_env", "workspace", "execution", "resources"}
+        if set(project) - allowed:
+            raise FactoryConfigError(f"{path} contains unknown fields")
         if not isinstance(project.get("display_name"), str) or not project["display_name"].strip():
             raise FactoryConfigError(f"{path}.display_name must be a non-empty string")
         if not isinstance(project.get("enabled_by_default"), bool):
@@ -551,6 +555,11 @@ class FactoryConfig:
         values = json.loads(resolved.read_text(encoding="utf-8"))
         if not isinstance(values, dict):
             raise FactoryConfigError("config must be a JSON object")
+        allowed = {"schema_version", "factory_id", "ledger_path", "workflow_path", "default_workflow",
+                   "workflows", "preparation", "projects", "scheduler", "runners", "execution",
+                   "projections", "work_queue", "budgets"}
+        if set(values) - allowed:
+            raise FactoryConfigError("config contains unknown fields: " + ", ".join(sorted(set(values) - allowed)))
         _reject_embedded_secrets(values)
         if values.get("schema_version") not in (2, 3, 4, 5, 6):
             raise FactoryConfigError(
