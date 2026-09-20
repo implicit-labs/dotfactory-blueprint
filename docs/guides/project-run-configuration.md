@@ -120,7 +120,10 @@ first placement and report `legacy-first-placement`; they cannot accept a new ru
 override. Queue discovery through `work` inherits project defaults. Issue prose,
 comments and agent output cannot supply execution overrides.
 
-Settings for worker placement are frozen at admission, separately from exact-SHA
-plan approval. Changing the verification plan does not change placement policy in
-this version. See the [configuration audit](../audits/project-run-configuration.md)
-for the required follow-up across both contracts and execution hosts.
+Settings for worker placement are frozen at admission. Planning chat may propose
+an explicit amendment for configurable implementation and verification fields.
+Exact plan SHA and requirements-digest approval records that amendment atomically
+while preserving the original admission snapshot. Unapproved prose, unanswered
+questions and stale revisions never change placement policy. See the
+[planning conversation guide](planning-conversation.md) and
+[configuration audit](../audits/project-run-configuration.md).
