@@ -290,7 +290,7 @@ def _result(checks: Sequence[Check]) -> Dict[str, Any]:
     }
 
 
-def inspect(config_path: str, environment: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+def inspect(config_path: str, environment: Optional[Mapping[str, str]] = None, *, project=None, execution_override=None) -> Dict[str, Any]:
     """Inspect local prerequisites without constructing runtime state."""
     environment = os.environ if environment is None else environment
     try:
@@ -320,12 +320,39 @@ def inspect(config_path: str, environment: Optional[Mapping[str, str]] = None) -
             "Validation used FactoryConfig.load without creating runtime state.",
         )
     ]
-    for project_key in config.project_keys:
+    if execution_override is not None and project is None:
+        raise ValueError("doctor --execution-config requires --project")
+    projects = [project] if project is not None else config.project_keys
+    for project_key in projects:
         checks.extend(_project_checks(config, project_key, environment))
-    for name, values in config.values.get("runners", {}).items():
-        checks.extend(_runner_checks(str(name), values, environment))
+    # Worker routes execute on their selected worker, not this coordinator.
+    # Their authentication/executable checks belong to explicit worker-check.
+    if not config.values.get("execution"):
+        for name, values in config.values.get("runners", {}).items():
+            checks.extend(_runner_checks(str(name), values, environment))
     checks.extend(_integration_checks(config, environment))
-    return _result(checks)
+    effective = {}
+    if config.values.get("execution"):
+        from .configuration import preview
+        from .verification_host import inspect as coordinator_inspect
+        for key in projects:
+            effective[key] = preview(config, key, execution_override)
+            for state, rule in effective[key]["stages"].items():
+                if rule.get("coordinator"):
+                    report = coordinator_inspect(rule["coordinator"])
+                    status = "fail" if report["missing"] else "not_checked" if report["available"] is None else "pass"
+                    checks.append(_check(key + ":" + state + ":coordinator", "project:" + key,
+                        status, True, "Coordinator verification host requirements: " + status,
+                        "Inspect effective configuration and run explicit worker-check for probes.",
+                        "Only OS, interpreter and isolated PATH inspected; no readiness command executed."))
+                checks.append(_check(key + ":" + state + ":worker", "project:" + key,
+                    "not_checked", True, "Selected worker readiness has not been probed.",
+                    "Run worker-check with this project, stage and execution config.",
+                    "Doctor does not contact workers or execute readiness commands."))
+    result = _result(checks)
+    if effective:
+        result["execution_settings"] = effective
+    return result
 
 
 def render_text(result: Mapping[str, Any]) -> str:
@@ -347,8 +374,8 @@ def render_text(result: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run(config_path: str, json_output: bool = False) -> int:
-    result = inspect(config_path)
+def run(config_path: str, json_output: bool = False, *, project=None, execution_override=None) -> int:
+    result = inspect(config_path, project=project, execution_override=execution_override)
     if json_output:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:

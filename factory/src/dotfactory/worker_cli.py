@@ -46,12 +46,51 @@ def check(args):
     policy = config.values.get("execution")
     if not policy:
         raise ValueError("config has no execution policy")
-    route = config.resolve_runners()[args.runner]
+    from .configuration import resolve, load_override
+    from .execution import worker_requirements, validate_report
+    from .verification_host import inspect as inspect_coordinator
+    override = load_override(getattr(args, "execution_config", None))
+    project = getattr(args, "project", None)
+    stage = getattr(args, "stage", None)
+    if bool(project) != bool(stage) or (override is not None and not project):
+        raise ValueError("worker-check scoped settings require --project and --stage")
+    rule = {}
+    coordinator = {}
+    runner = args.runner
+    if project:
+        policy, _sources, graph = resolve(config, project, override)
+        if stage not in policy["stages"]:
+            raise ValueError("stage has no execution settings")
+        rule = policy["stages"][stage]
+        if args.worker not in rule["workers"]:
+            raise ValueError("worker is not a candidate for the effective stage")
+        node = next(state for state in graph.states if state["id"] == stage)
+        expected_runner = node["execution"]["runner"]
+        if runner is not None and runner != expected_runner:
+            raise ValueError("runner differs from the resolved workflow stage")
+        runner = expected_runner
+        for state, configured in policy["stages"].items():
+            if configured.get("coordinator"):
+                coordinator[state] = inspect_coordinator(configured["coordinator"], execute=True)
+        if any(not item["available"] for item in coordinator.values()):
+            print(json.dumps({"available": False, "coordinator": coordinator}, indent=2))
+            return 1
+        repository = config.resolve_project(project)["repository_path"]
+        requirements = sorted(worker_requirements(rule, repository) | set(args.require))
+    else:
+        if not runner:
+            raise ValueError("worker-check requires --runner or a project/stage")
+        requirements = args.require
+    route = config.resolve_runners()[runner]
     selected = policy["workers"][args.worker]
+    probes = rule.get("readiness", [])
     report = call(selected, {"op": "probe", "kind": route["kind"], "command": route["command"],
-                             "billing": selected["billing"], "requires": args.require,
-                             "environment_envs": route["environment_envs"]})
-    print(json.dumps({"worker": args.worker, "billing": selected["billing"], **report}, indent=2))
+                             "billing": selected["billing"], "requires": requirements,
+                             "environment_envs": route["environment_envs"], "readiness": probes},
+                  timeout=45 + sum(item.get("timeout_seconds", 10) for item in probes))
+    validate_report(report, probes, route["minimum_version"])
+    print(json.dumps({"worker": args.worker, "billing": selected["billing"],
+                      "coordinator": coordinator, **report}, indent=2))
     return 0 if report["available"] else 1
 
 
@@ -65,6 +104,9 @@ def add_commands(commands):
     probe = commands.add_parser("worker-check", help="check worker tools and native authentication")
     probe.add_argument("--config", required=True)
     probe.add_argument("--worker", required=True)
-    probe.add_argument("--runner", required=True)
+    probe.add_argument("--runner")
+    probe.add_argument("--project")
+    probe.add_argument("--stage")
+    probe.add_argument("--execution-config")
     probe.add_argument("--require", action="append", default=[])
     probe.set_defaults(callback=check)
