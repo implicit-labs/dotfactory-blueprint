@@ -39,6 +39,7 @@ class VerificationPolicyCompatibilityTests(unittest.TestCase):
             )
             launch = SimpleNamespace(request=request, workspace_path=str(root))
             ledger = MagicMock()
+            ledger.current.return_value = {"intent_snapshot_json": "{}"}
             ledger.assert_attempt_active = MagicMock()
             # Legacy fixture predates frozen execution policies.
             ledger.connection.execute.return_value.fetchone.return_value = None

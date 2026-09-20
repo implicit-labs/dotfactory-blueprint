@@ -415,8 +415,167 @@ def collect(spec):
     return output
 
 
+
+def validate_verification_method(method):
+    fields = {'description', 'hosts', 'requires', 'readiness', 'commands', 'artifacts', 'timeout_seconds', 'files'}
+    if not isinstance(method, dict) or set(method) != fields:
+        raise ValueError('verification method has missing or unknown fields')
+    if not isinstance(method['description'], str) or not method['description'].strip():
+        raise ValueError('verification method needs a description')
+    for key in ('hosts', 'requires'):
+        if not isinstance(method[key], list) or len(method[key]) > 32 or any(not isinstance(x, str) for x in method[key]):
+            raise ValueError('invalid verification ' + key)
+    if not method['hosts'] or any(not re.fullmatch(r'[a-z][a-z0-9-]{0,63}', host) for host in method['hosts']):
+        raise ValueError('verification requires named eligible hosts')
+    if any(not re.fullmatch(r'(os|arch|tool):[A-Za-z0-9_.+-]+', item) for item in method['requires']):
+        raise ValueError('invalid verification capability')
+    validate_readiness(method['readiness'])
+    if type(method['timeout_seconds']) is not int or not 1 <= method['timeout_seconds'] <= 1800:
+        raise ValueError('verification deadline must be 1 to 1800 seconds')
+    commands = method['commands']
+    if not isinstance(commands, dict) or 'after' not in commands or set(commands) - {'before', 'after'}:
+        raise ValueError('verification requires after command and optional before command')
+    for argv in commands.values():
+        if not isinstance(argv, list) or not argv or len(argv) > 128 or any(not isinstance(a, str) or not a or '\x00' in a for a in argv):
+            raise ValueError('verification command requires argv')
+    inputs = method['files']
+    if not isinstance(inputs, list) or len(inputs) > 128 or any(not isinstance(name, str) or not name or
+            str(Path(name)) != name or name.startswith('/') or '..' in Path(name).parts or
+            '\\' in name or '\x00' in name or name.startswith('-') for name in inputs):
+        raise ValueError('verification files must be canonical repository file/directory paths')
+    for argv in commands.values():
+        for argument in argv:
+            relative = argument.removeprefix('{source}/')
+            if relative.endswith(('.py', '.js', '.mjs', '.cjs', '.sh')) and not relative.startswith('/'):
+                if not any(relative == name or relative.startswith(name + '/') for name in inputs):
+                    raise ValueError('relative verification scripts must be declared in files')
+        if '-m' in argv and not inputs:
+            raise ValueError('module verification requires declared source harness files')
+    artifacts = method['artifacts']
+    if not isinstance(artifacts, list) or len(artifacts) > 16:
+        raise ValueError('verification artifacts must be a bounded list')
+    seen = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {'phase', 'path', 'kind', 'scenario'}:
+            raise ValueError('artifact requires phase, path, kind and scenario')
+        phase, path = artifact['phase'], artifact['path']
+        if phase not in commands or not isinstance(path, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}', path):
+            raise ValueError('artifact needs an executable phase and a simple filename')
+        if artifact['kind'] not in ('screenshot', 'recording', 'report'):
+            raise ValueError('unknown artifact kind')
+        if not isinstance(artifact['scenario'], str) or not artifact['scenario'].strip():
+            raise ValueError('artifact requires a scenario including device or viewport')
+        if (phase, path) in seen:
+            raise ValueError('duplicate artifact')
+        seen.add((phase, path))
+    for artifact in artifacts:
+        if artifact['phase'] == 'before' and not any(a['phase'] == 'after' and a['scenario'] == artifact['scenario'] and a['kind'] == artifact['kind'] for a in artifacts):
+            raise ValueError('before evidence requires a matching after scenario and kind')
+
+
+def verification_environment():
+    # Use host tools and simulator services, but do not pass model/provider secrets.
+    return {key: value for key, value in os.environ.items()
+            if key in ('HOME', 'PATH', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'DEVELOPER_DIR')}
+
+
+def verification_probe(spec):
+    method = spec['method']
+    validate_verification_method(method)
+    env = verification_environment()
+    facts = {'os:' + platform.system().lower(), 'arch:' + platform.machine().lower()}
+    missing = []
+    for requirement in method['requires']:
+        if requirement.startswith('tool:') and shutil.which(requirement[5:], path=env.get('PATH', os.defpath)):
+            facts.add(requirement)
+        elif requirement not in facts:
+            missing.append(requirement)
+    probes = readiness(method['readiness'], env) if not missing else []
+    missing.extend('readiness:' + item['name'] for item in probes if not item['passed'])
+    return {'available': not missing, 'facts': sorted(facts), 'missing': missing, 'readiness': probes}
+
+
+def verify_method(spec):
+    method = spec['method']
+    validate_verification_method(method)
+    phase = spec['phase']
+    if phase not in method['commands']:
+        raise WorkerError('verification phase has no executor')
+    if not verification_probe(spec)['available']:
+        raise WorkerError('verification prerequisites unavailable')
+    # Separate source and output directories make checked-in stale evidence unusable.
+    with tempfile.TemporaryDirectory(prefix='dotfactory-verification-') as temporary:
+        root = Path(temporary)
+        repo, artifacts = root / 'repo', root / 'artifacts'
+        repo.mkdir()
+        artifacts.mkdir()
+        git(repo, 'init', '-q')
+        import_bundle(repo, spec['bundle'], spec['source_sha'])
+        git(repo, 'checkout', '--detach', spec['source_sha'])
+        # Refuse symlinks before running project-owned verification code.
+        if any(path.is_symlink() for path in repo.rglob('*')):
+            raise WorkerError('verification source contains symlinks')
+        pinned = spec.get('pinned_files', {})
+        for name in method['files']:
+            tracked = set(git(repo, 'ls-files', '--', name).splitlines())
+            expected = {path for path in pinned if path == name or path.startswith(name + '/')}
+            if not expected or tracked != expected:
+                raise WorkerError('verification harness file inventory changed')
+            for path in expected:
+                if hashlib.sha256((repo / path).read_bytes()).hexdigest() != pinned[path]:
+                    raise WorkerError('approved verification harness changed: ' + path)
+        argv = [arg.replace('{artifacts}', str(artifacts)).replace('{source}', str(repo)).replace('{python}', sys.executable)
+                for arg in method['commands'][phase]]
+        result = {'source_sha': spec['source_sha'], 'phase': phase, 'method_digest': digest(method),
+                  'passed': False, 'artifacts': [], 'exit_code': None}
+        # A file bounds memory; output is truncated in the receipt. Kill descendants too.
+        with tempfile.TemporaryFile() as output:
+            process = subprocess.Popen(argv, cwd=repo, env=verification_environment(), stdout=output,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                result['exit_code'] = process.wait(timeout=method['timeout_seconds'])
+            except subprocess.TimeoutExpired:
+                result['error'] = 'verification deadline exceeded'
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            output.seek(0)
+            result['output'] = output.read(16384).decode(errors='replace')
+        if result['exit_code'] != 0:
+            return result
+        if git(repo, 'rev-parse', 'HEAD') != spec['source_sha'] or git(repo, 'diff', 'HEAD', '--'):
+            raise WorkerError('verification changed tracked source')
+        total = 0
+        for declaration in method['artifacts']:
+            if declaration['phase'] != phase:
+                continue
+            path = artifacts / declaration['path']
+            if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+                raise WorkerError('required verification artifact missing: ' + declaration['path'])
+            size = path.stat().st_size
+            total += size
+            if total > 8 * 1024 * 1024:
+                raise WorkerError('verification artifacts exceed 8 MiB per method phase')
+            data = path.read_bytes()
+            if declaration['kind'] == 'screenshot' and not (data.startswith(b'\x89PNG\r\n\x1a\n') or data.startswith(b'\xff\xd8\xff')):
+                raise WorkerError('screenshot must be PNG or JPEG')
+            if declaration['kind'] == 'recording' and not (data[4:8] == b'ftyp' or data.startswith(b'\x1aE\xdf\xa3')):
+                raise WorkerError('recording must be MP4 or WebM')
+            result['artifacts'].append({**declaration, 'sha256': hashlib.sha256(data).hexdigest(),
+                                        'bytes': size, 'data_base64': base64.b64encode(data).decode()})
+        result['passed'] = True
+        return result
+
+
 def dispatch(spec):
     op = spec["op"]
+    if op == "verification-probe":
+        return verification_probe(spec)
+    if op == "verify-method":
+        return verify_method(spec)
     if op == "probe":
         return probe(spec)
     if op == "prepare":

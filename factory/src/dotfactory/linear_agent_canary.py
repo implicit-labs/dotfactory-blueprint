@@ -133,9 +133,9 @@ def main(arguments: list[str] | None = None) -> int:
     report: dict[str, Any] = {"status": "blocked", "executed": False}
     started = False
     try:
-        token = os.environ.get("LINEAR_AGENT_TOKEN", "").strip()
+        token = os.environ.get("LINEAR_DOTFACTORY_AGENT_TOKEN", "").strip()
         if not token:
-            raise ValueError("LINEAR_AGENT_TOKEN is missing; an app-actor OAuth token is required")
+            raise ValueError("LINEAR_DOTFACTORY_AGENT_TOKEN is missing; an app-actor OAuth token is required")
         authorization = token if token.startswith("Bearer ") else "Bearer " + token
         client = LinearGraphQLClient(authorization)
         https_url(args.marker_url)

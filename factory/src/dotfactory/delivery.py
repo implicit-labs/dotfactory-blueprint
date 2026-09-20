@@ -512,9 +512,17 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
         plan = local_file(root, ".factory/plan.md")
         git(root, "ls-files", "--error-unmatch", "--", ".factory/plan.md")
         receipt["plan_sha256"] = digest(plan.read_bytes())
+        if ledger.run_snapshot(request.execution_id)['intent'].get('linear_planning'):
+            text = plan.read_text(encoding='utf-8')
+            if not text.strip() or len(text) > 12000:
+                raise DeliveryError('Linear planning requires a compact plan of 1 to 12000 characters')
+            receipt['plan_markdown'] = text
         if contract == "plan-result-v2":
             receipt["verification_plan"] = verification_definition(root)
             if request.state_id == "Replanning":
+                from .verification_contract import frozen
+                if frozen(ledger, request.execution_id):
+                    raise DeliveryError("method contracts require a new Planning run; verifier-only replanning cannot replace them")
                 context = _recorded_replan_context(ledger, request.execution_id)
                 git(root, "merge-base", "--is-ancestor", context["baseline_head_sha"], source["head_sha"])
                 changes = git(
@@ -596,6 +604,17 @@ def evaluate(ledger: Any, launch: Any, result: RunnerResult,
                         "recovery": "investigate_then_request_confirmed_replan_if_harness_is_unusable",
                     }
                     raise DeliveryError("pinned verification failed")
+        if contract in ("implementation-result-v2", "python-verification-v2"):
+            from .verification_contract import frozen, approved as method_contract, assert_coverage, run_phase, baseline
+            registry = frozen(ledger, request.execution_id)
+            if registry:
+                method_plan = method_contract(ledger, request.execution_id)
+                if not method_plan:
+                    raise DeliveryError("approved verification contract missing")
+                assert_coverage(method_plan, registry, changes)
+                receipt["verification_baseline"] = baseline(ledger, request.execution_id, method_plan, approved["head_sha"])
+                if contract == "python-verification-v2":
+                    receipt["verification_methods"] = run_phase(ledger, launch, "after", source["head_sha"])
         if source_snapshot(workspace) != source:
             raise DeliveryError("verification changed the source being checked")
         receipt["passed"] = True
@@ -630,6 +649,13 @@ def require_receipt(ledger: Any, attempt_id: str, contract: str) -> None:
     if not workspace or source_snapshot(workspace) != receipt["source"]:
         raise DeliveryError("source changed after verification; a new attempt is required")
     root = Path(workspace["path"]).resolve()
+    from .verification_contract import check_evidence
+    for key in ("verification_baseline", "verification_methods"):
+        if receipt.get(key):
+            try:
+                check_evidence(ledger, receipt[key])
+            except ValueError as error:
+                raise DeliveryError(str(error)) from error
     for item in receipt["files"]:
         if digest(local_file(root, item["path"]).read_bytes()) != item["sha256"]:
             raise DeliveryError("evidence changed after verification")
@@ -665,6 +691,14 @@ def export_review(ledger: Any, execution_id: str, output: str) -> dict[str, Any]
               "next_action": "Review and approve the proposed verification plan." if planning else "Review the patch and checks; request changes or explicitly authorize merge."}
     destination = Path(output)
     destination.mkdir(parents=True, exist_ok=False)
+    for evidence_key in ("verification_baseline", "verification_methods"):
+        for method in (receipt.get(evidence_key) or {}).get("methods", {}).values():
+            for artifact in method.get("result", {}).get("artifacts", []):
+                from .verification_contract import evidence_root
+                artifact_directory = destination / "verification-artifacts"
+                artifact_directory.mkdir(exist_ok=True)
+                (artifact_directory / artifact["sha256"]).write_bytes(
+                    (evidence_root(ledger) / artifact["sha256"]).read_bytes())
     definition = receipt.get("verification_plan") or receipt.get("approved_plan")
     if definition:
         (destination / "verification-plan.json").write_bytes(encoded(definition) + b"\n")

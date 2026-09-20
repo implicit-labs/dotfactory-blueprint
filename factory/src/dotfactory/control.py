@@ -407,7 +407,7 @@ class ObservationService:
         _workflow, states, _edges = self.kernel.graph_for_execution(str(snapshot["id"]))
         if (
             snapshot["status"] == "running"
-            and state in ("Todo", "Planning", "Autoplanning", "PlanReview", "Ready")
+            and state in ("Todo", "PlanQueued", "Planning", "Autoplanning", "PlanReview", "Ready")
             and any(
                 node.get("execution", {}).get("exit_contract") == "plan-result-v2"
                 for node in states.values()
@@ -581,7 +581,7 @@ class ControlService:
         if action == "planning_message":
             _workflow, states, _edges = self.kernel.graph_for_execution(execution_id)
             supported = any(node.get("execution", {}).get("exit_contract") == "plan-result-v2" for node in states.values())
-            return (supported and request["expected_state"] in ("Todo", "Planning", "Autoplanning", "PlanReview", "Ready"),
+            return (supported and request["expected_state"] in ("Todo", "PlanQueued", "Planning", "Autoplanning", "PlanReview", "Ready"),
                     "planning messages require a planned workflow before implementation")
         if action == "attention":
             remedy = request["parameters"].get("remedy")

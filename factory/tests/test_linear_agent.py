@@ -524,12 +524,12 @@ class LinearAgentTests(unittest.TestCase):
         class Config:
             def resolve_linear_projection(self, *, environment):
                 return {"enabled": True, "endpoint": "https://api.linear.app/graphql", "timeout_seconds": 15,
-                        "agent_sessions_enabled": True, "agent_token_env": "LINEAR_AGENT_TOKEN"}
+                        "agent_sessions_enabled": True, "agent_token_env": "LINEAR_DOTFACTORY_AGENT_TOKEN"}
             def linear_authorization(self, *, environment):
                 return "personal-api-key"
             def resolve_project(self, key, *, environment):
                 return {"tracker_team_id": "team", "tracker_project_id": "project"}
-        for environment in [{}, {"LINEAR_AGENT_TOKEN": "synthetic-app-token"}]:
+        for environment in [{}, {"LINEAR_DOTFACTORY_AGENT_TOKEN": "synthetic-app-token"}]:
             runtime = object.__new__(FactoryRuntime)
             runtime.config, runtime.environment, runtime.ledger = Config(), environment, self.ledger
             runtime.kernels = {"dotfactory": self.kernel}
@@ -577,10 +577,12 @@ class LinearAgentTests(unittest.TestCase):
         values["projections"]["linear"]["agent_session_url_template"] = (
             "https://runs.example/{execution_id}"
         )
+        values["projections"]["linear"].pop("agent_token_env", None)
         path.write_text(json.dumps(values))
         config = FactoryConfig.load(path)
         resolved = config.resolve_linear_projection(environment={})
         self.assertTrue(resolved["agent_sessions_enabled"])
+        self.assertEqual("LINEAR_DOTFACTORY_AGENT_TOKEN", resolved["agent_token_env"])
 
 
 if __name__ == "__main__":

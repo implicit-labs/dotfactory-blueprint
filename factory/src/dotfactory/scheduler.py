@@ -281,6 +281,12 @@ class Scheduler:
     def dispatch_prepared(self, launch: PreparedLaunch) -> RunnerResult:
         if not isinstance(launch, PreparedLaunch):
             raise PreparationError("scheduler dispatch requires PreparedLaunch")
+        from .verification_contract import before
+        from .delivery import DeliveryError
+        try:
+            before(self.ledger, launch)
+        except (DeliveryError, ValueError, OSError) as error:
+            return RunnerResult("Verification preparation failed: " + str(error), "failed", ())
         result = self.runner.run(launch)
         if not isinstance(result, RunnerResult):
             raise PreparationError("runner did not return RunnerResult")

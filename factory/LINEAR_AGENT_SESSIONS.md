@@ -5,7 +5,7 @@
 | Setting | Purpose |
 |---|---|
 | `projections.linear.token_env` | Existing issue/status/comment credential |
-| `projections.linear.agent_token_env` | Separate app-actor OAuth token; defaults to `LINEAR_AGENT_TOKEN` |
+| `projections.linear.agent_token_env` | Separate app-actor OAuth token; defaults to `LINEAR_DOTFACTORY_AGENT_TOKEN` |
 | `agent_sessions_enabled` | Opt in to native session projection |
 | `agent_session_url_template` | HTTPS run URL with one `{execution_id}` placeholder |
 
@@ -63,7 +63,7 @@ PYTHONPATH=factory/src python3 -m dotfactory.linear_agent_canary \
   --receipt /private/tmp/linear-agent-canary.json
 ```
 
-`LINEAR_AGENT_TOKEN` must be present. A personal actor, identity mismatch, missing
+`LINEAR_DOTFACTORY_AGENT_TOKEN` must be present. A personal actor, identity mismatch, missing
 token, or failed readiness probe blocks before remote writes.
 
 ## Execute and replay
