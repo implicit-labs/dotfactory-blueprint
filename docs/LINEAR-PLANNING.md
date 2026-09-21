@@ -5,7 +5,7 @@
 1. Move an issue to **Planning** in an enabled project.
 2. Open Dotfactory's native agent discussion on the issue. The first message says
    planning is queued; an eligible, awake worker investigates the repository.
-3. Read one contextual question batch. Each question explains the decision,
+3. Review the proposed plan, or answer a contextual batch when product decisions remain. Each question explains the decision,
    recommends an option and names the tradeoff. Reply naturally, for example:
    “Compact dock only. Expand the selected page; hover should only show a tooltip.”
 4. Dotfactory saves your answer, batches nearby replies and revises the same plan.
@@ -110,3 +110,16 @@ Before activation, verify the collapsed detail, native Agent Activity rendering
 and notification delivery with the configured app identity. Comment rendering or
 a user API token does not prove the app-actor path. This format applies only to
 planning reviews; other update types retain their current presentation.
+
+## Routine verification decisions
+
+The planner chooses tools, viewports, fixtures and eligible hosts from project
+settings and the changed surface. These are disclosed, not separate permission
+questions. Missing routine harness setup becomes agent work; unavailable methods
+remain explicitly pending. Ask only about unresolved product intent, material
+scope/cost/coverage tradeoffs, or user-owned access/hardware blockers.
+
+The review leads with product behavior and a short verification/evidence summary.
+Technical verification requirements and changed project settings are expandable.
+No unresolved choices means an empty questions list and one exact-version plan
+approval. This does not authorize implementation before approval.

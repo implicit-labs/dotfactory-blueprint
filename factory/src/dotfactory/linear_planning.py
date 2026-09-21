@@ -79,7 +79,7 @@ def paused(ledger, execution):
     return bool(changes and changes[-1]['paused'])
 
 
-def plan_preview(plan):
+def plan_preview(plan, *, title="Full plan and scope", include_preview=True):
     """Preserve the frozen plan; isolate ambiguous markup from the action below."""
     fence = None
     unsafe = False
@@ -97,7 +97,7 @@ def plan_preview(plan):
         # Show literal Markdown rather than nesting toggles or allowing an open
         # fence to consume the approval instructions. Choose an unforgeable close.
         boundary = '`' * max(3, 1 + max((len(m.group()) for m in re.finditer(r'`+', plan)), default=0))
-        return '**Full plan and scope (Markdown)**\n\n' + boundary + '\n' + plan + '\n' + boundary
+        return '**' + title + ' (Markdown)**\n\n' + boundary + '\n' + plan + '\n' + boundary
     preview = 'Expand the full plan to review the proposed scope and approach.'
     # Only reuse a complete short prose paragraph; never truncate Markdown.
     for block in plan.split('\n\n'):
@@ -109,7 +109,7 @@ def plan_preview(plan):
                 for line in block.splitlines()):
             preview = block
             break
-    return preview + '\n\n+++ Full plan and scope\n\n' + plan + '\n\n+++'
+    return (preview + '\n\n' if include_preview else '') + '+++ ' + title + '\n\n' + plan + '\n\n+++'
 
 
 def present(ledger, execution, policy):
@@ -130,12 +130,19 @@ def present(ledger, execution, policy):
     if not plan:
         raise LedgerError('Linear planning requires a frozen readable plan; run planning again')
     lines = [f'**Plan v{number} — ' + ('questions for you**' if questions else 'ready for your review**'), plan_preview(plan)]
+    summary = re.search(r'^## Verification summary\s*\n(.*?)(?=^## |\Z)', plan, re.M | re.S)
+    if summary:
+        prose = summary.group(1).strip()
+        if prose and len(prose) <= 400 and not re.search(r'^\s*(?:[#>`~+*|-]|\d+[.)]\s)', prose, re.M):
+            lines += ['**Verification**', prose]
     if value.get('verification_summary'):
-        lines += ['**Verification and evidence**', value['verification_summary']]
+        lines += [plan_preview(value['verification_summary'], title='Verification requirements and evidence', include_preview=False)]
     changes = value['proposal']['changes']
-    lines += ['**Project defaults**', 'Unchanged.' if not changes else 'The following run-specific changes replace project defaults:']
-    for change in changes:
-        lines.append(f"- {change['stage']} / {change['field']}: {canonical_json(change['before'])} → {canonical_json(change['after'])}")
+    if changes:
+        details = 'These run-specific changes replace project defaults:\n\n' + '\n'.join(
+            f"- {change['stage']} / {change['field']}: {canonical_json(change['before'])} → {canonical_json(change['after'])}"
+            for change in changes)
+        lines += [plan_preview(details, title='Changes to project defaults', include_preview=False)]
     if questions:
         lines += ['**Decisions needed**'] + [f'{i}. {question}' for i, question in enumerate(questions, 1)]
         lines += ['Reply here in your own words. I will incorporate your answers into the next plan.']

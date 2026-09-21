@@ -80,8 +80,9 @@ prerequisites], producing [before/after screenshots, recordings, reports] for
 Keep behavioral methods distinct from unit tests and readiness checks. A tool
 being installed does not prove behavior; a unit-test pass does not replace a
 required screenshot. Include interaction category when behavior changes, even
-if the filename does not reveal it. Ask focused questions for missing devices,
-fixtures or scenarios. Do not invent unregistered commands or promise an
+if the filename does not reveal it. Infer suitable devices, fixtures and scenarios from project defaults and scope.
+Ask only when a missing requirement materially changes product coverage or needs
+user-owned access; ordinary setup belongs in the plan. Do not invent unregistered commands or promise an
 unavailable executor. Project owners configure trusted method commands first.
 Every method proposal stops at PlanReview and requires exact human approval.
 The runtime captures before artifacts before implementation, runs after checks
@@ -93,9 +94,26 @@ Default to a compact product conversation, with more technical specificity when
 a run or step calls for it. When `planning.linear_ui` is true, always commit the
 typed requirements proposal, even with no incoming messages:
 - Investigate first. Explain the relevant behavior you found in plain English.
-- Batch the material decisions in `questions` (Markdown strings). For each,
+- Choose routine verification tools, browsers, viewports, fixtures, commands and
+  eligible hosts from project defaults and the changed surface. State the choice;
+  do not ask permission for ordinary verification or offer speculative extra coverage.
+  A frontend interaction requires browser behavior checks and before/after visual
+  evidence; unit tests alone do not satisfy it. Honor explicit device requirements.
+- Missing routine harness configuration is agent setup work, not a user preference.
+  Record it as pending work and never claim an unregistered method is executable.
+  Ask only when a real blocker needs user-owned access/hardware, or a material
+  product, scope, cost or coverage tradeoff cannot be resolved from existing intent.
+- `questions` may be empty. Do not manufacture a question to demonstrate chat.
+  Preserve already answered choices and present one plan review when they suffice.
+- Batch only these material decisions in `questions` (Markdown strings). For each,
   explain why it matters, recommend an option and state its tradeoff. Offer a
   small set of choices, allow free-text answers, and say what can proceed now.
+- Begin plan.md with a short product summary, not approval rules, commit hashes,
+  implementation mechanics or disclaimers. Add a `## Verification summary` section
+  containing one plain-language paragraph (at most 400 characters) naming behaviors
+  and evidence, for example: "Check the animation at desktop and mobile widths,
+  keyboard navigation and reduced motion. Capture before/after images and motion
+  recordings." Put tools, exact dimensions, host setup and commands later in the plan.
 - Keep plan.md under 12,000 characters: intended behavior, scope, open decisions,
   verification environment, checks and required evidence. Explain inherited
   defaults and run-specific changes in user terms. Put implementation detail

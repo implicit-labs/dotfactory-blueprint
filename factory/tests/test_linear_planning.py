@@ -50,6 +50,38 @@ class LinearPlanningTests(unittest.TestCase):
         self.assertIn(long_plan, plan_preview(long_plan))
 
 
+    def test_product_review_discloses_details_without_extra_permission_gate(self):
+        runtime, runner = self.configured()
+        with runtime:
+            execution = self.setup_run(runtime, runner)
+            runtime.run([execution], until_state='PlanReview')
+            from dotfactory.planning import view
+            value = view(runtime.ledger, execution)
+            value['plan_markdown'] = ('# Navigation\n\nExpand the selected navigation pill.\n\n'
+                '## Verification summary\n\nCheck motion and keyboard navigation; capture before/after recordings.\n\n'
+                '## Setup\n\nInstall the browser fixture before implementation.')
+            value['verification_summary'] = 'Chromium at 390x844; trusted fixture command; recordings required.'
+            value['proposal']['changes'] = [{'stage': 'Verifying', 'field': 'requires',
+                'before': [], 'after': ['browser']}]
+            with patch('dotfactory.linear_planning.view', return_value=value):
+                review = present(runtime.ledger, execution, POLICY)
+            body = review['body']
+            self.assertFalse(review['questions'])
+            self.assertIn('ready for your review', body)
+            self.assertIn('**Verification**\n\nCheck motion', body)
+            self.assertIn('+++ Verification requirements and evidence\n\nChromium', body)
+            self.assertIn('+++ Changes to project defaults', body)
+            self.assertNotIn('**Decisions needed**', body)
+            self.assertIn('Reply **approve plan v1**', body.rsplit('+++', 1)[1])
+            # Re-rendering cannot rewrite the already published exact revision.
+            self.assertEqual(review, present(runtime.ledger, execution, POLICY))
+
+    def test_technical_details_cannot_swallow_review_actions(self):
+        rendered = plan_preview('fixture\n+++ nested\ncontent',
+            title='Verification requirements and evidence', include_preview=False)
+        self.assertIn('(Markdown)', rendered)
+        self.assertNotIn('+++ Verification', rendered)
+
     def setup_run(self, runtime, runner):
         runtime.config.values['projects']['demo']['linear_planning'] = POLICY
         execution = runtime.kernels['demo'].begin('demo', 'LINEAR-1', {
