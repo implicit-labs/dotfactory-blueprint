@@ -146,6 +146,14 @@ def execution_dataset_case(
         },
     }
     canonical_json(case)
+    from .projection_policy import settings_view, dataset_case_policy
+    policy = settings_view(ledger, execution_id)
+    if policy:
+        case["metadata"].update(execution_id=execution_id, projection_policy_digest=policy["digest"],
+            source_observed_at=ledger.connection.execute(
+                "SELECT MAX(observed_at) FROM trace_records WHERE execution_id=?", (execution_id,)).fetchone()[0])
+        case = dataset_case_policy(ledger, execution_id, case)
+        case["case_id"] = hashlib.sha256(canonical_json({k: v for k, v in case.items() if k != "case_id"}).encode()).hexdigest()
     return case
 
 
@@ -360,6 +368,26 @@ class HostedDatasetPublisher:
                 raise DatasetContractError(
                     "hosted dataset receipt persistence requires a command ID"
                 )
+            from .projection_policy import authorize, dataset_case_policy, settings_view
+            policy_bindings = {}
+            if (hasattr(self.ledger, "projection_policy_values") or self.ledger.connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projection_policies'").fetchone()):
+                for case in ordered:
+                    execution_id = str(case.get("metadata", {}).get("execution_id") or "")
+                    if not execution_id:
+                        raise DatasetContractError("managed dataset case requires an execution identity")
+                    if (not case["metadata"].get("source_observed_at") or case.get("case_id") != hashlib.sha256(
+                            canonical_json({k: v for k, v in case.items() if k != "case_id"}).encode()).hexdigest()):
+                        raise DatasetContractError("managed dataset case content or source time changed; regenerate the case")
+                    decision = authorize(self.ledger, execution_id, "dataset", dataset_name=self.settings.dataset_name,
+                        project=self.settings.project, region=self.settings.region,
+                        source_at=case["metadata"].get("source_observed_at"))
+                    if not decision["allowed"]:
+                        raise DatasetContractError("dataset blocked by projection policy: " + decision["reason"])
+                    if (settings_view(self.ledger, execution_id)["digest"] != case["metadata"].get("projection_policy_digest")
+                            or dataset_case_policy(self.ledger, execution_id, case) != case):
+                        raise DatasetContractError("dataset case does not match the frozen projection/redaction policy")
+                    policy_bindings[execution_id] = decision["delivery_digest"]
             attempt = self.ledger.start_projection_attempt(
                 self.settings.destination, command_id=command_id,
                 idempotency_key=(
@@ -368,6 +396,14 @@ class HostedDatasetPublisher:
                 source_kind="dataset_case", from_source_seq=1,
                 through_source_seq=len(ordered),
             )
+            with self.ledger.transaction() as db:
+                db.execute("CREATE TABLE IF NOT EXISTS hosted_dataset_policy_plans (attempt_id TEXT PRIMARY KEY,request_digest TEXT NOT NULL,policy_json TEXT NOT NULL)")
+                body_digest = hashlib.sha256(canonical_json(ordered).encode()).hexdigest()
+                row = db.execute("SELECT * FROM hosted_dataset_policy_plans WHERE attempt_id=?", (attempt["id"],)).fetchone()
+                if row and (row["request_digest"] != body_digest or row["policy_json"] != canonical_json(policy_bindings)):
+                    raise DatasetContractError("dataset retry content or projection policy changed")
+                db.execute("INSERT OR IGNORE INTO hosted_dataset_policy_plans VALUES(?,?,?)",
+                           (attempt["id"], body_digest, canonical_json(policy_bindings)))
             if attempt["status"] == "completed":
                 return {
                     "dataset_name": self.settings.dataset_name,

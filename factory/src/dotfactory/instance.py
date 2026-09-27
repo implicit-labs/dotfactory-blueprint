@@ -236,7 +236,8 @@ def _validate_projects(projects: Any, workflow_names: set[str] | None = None) ->
         if not isinstance(project, dict):
             raise FactoryConfigError(f"{path} must be an object")
         allowed = {"display_name", "enabled_by_default", "workflow", "tracker", "repository_path",
-                   "repository_path_env", "workspace", "execution", "resources", "verification", "linear_planning"}
+                   "repository_path_env", "workspace", "execution", "resources", "verification", "linear_planning",
+                   "profile", "stage_profiles", "evidence_policy", "projection_policy"}
         if set(project) - allowed:
             raise FactoryConfigError(f"{path} contains unknown fields")
         if not isinstance(project.get("display_name"), str) or not project["display_name"].strip():
@@ -569,7 +570,7 @@ class FactoryConfig:
             raise FactoryConfigError("config must be a JSON object")
         allowed = {"schema_version", "factory_id", "ledger_path", "workflow_path", "default_workflow",
                    "workflows", "preparation", "projects", "scheduler", "runners", "execution",
-                   "projections", "work_queue", "budgets"}
+                   "projections", "work_queue", "budgets", "selection_profiles", "evidence_policy", "projection_policy"}
         if set(values) - allowed:
             raise FactoryConfigError("config contains unknown fields: " + ", ".join(sorted(set(values) - allowed)))
         _reject_embedded_secrets(values)
@@ -587,6 +588,19 @@ class FactoryConfig:
         _validate_projects(values.get("projects"), workflow_names)
         _validate_scheduler(values)
         _validate_runners(values)
+        from .selection import validate_layer, validate_profiles
+        from .evidence_policy import resolve as resolve_evidence
+        from .projection_policy import resolve as resolve_projection
+        try:
+            profiles = validate_profiles(values)
+            for project_key, project in values["projects"].items():
+                resolve_evidence(values, project_key)
+                resolve_projection(values, project_key)
+                layer = {key: project[key] for key in ("profile", "stage_profiles") if key in project}
+                validate_layer(layer, profiles, values.get("workflows", {}),
+                               f"config.projects.{project_key}")
+        except ValueError as error:
+            raise FactoryConfigError(str(error)) from error
         from .budgets import validate_budgets
         from .work_queue import validate_queue
         try:
@@ -766,17 +780,21 @@ class FactoryConfig:
             result["dataset_api_key"] = str(environment[name])
         return result
 
-    def resolve_workflow(self, project_key: str) -> dict[str, Any]:
+    def resolve_workflow(self, project_key: str, *, name: str | None = None) -> dict[str, Any]:
         if project_key not in self.values["projects"]:
             raise FactoryConfigError(f"unknown project: {project_key}")
         project = self.values["projects"][project_key]
         if self.values["schema_version"] == 2:
+            if name is not None:
+                raise FactoryConfigError("run workflow selection requires registered workflows")
             path = self.values["workflow_path"]
             profile_paths: list[str] = []
             defaults: dict[str, Any] = {}
             name = "legacy-default"
         else:
-            name = str(project.get("workflow", self.values["default_workflow"]))
+            name = str(name if name is not None else project.get("workflow", self.values["default_workflow"]))
+            if name not in self.values["workflows"]:
+                raise FactoryConfigError(f"unknown registered workflow: {name}")
             workflow = self.values["workflows"][name]
             path = workflow["path"]
             profile_paths = list(workflow.get("profile_paths", []))

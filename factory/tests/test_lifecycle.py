@@ -120,6 +120,7 @@ class FactoryLifecycleTests(unittest.TestCase):
                 self.delivered.append(mutation["id"])
                 # Observing the first confirmation also confirms its duplicate.
                 self.ledger.pending = []
+                return {"id": mutation["id"], "status": "confirmed"}
 
         runtime = object.__new__(FactoryRuntime)
         runtime.ledger = Ledger()

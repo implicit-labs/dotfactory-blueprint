@@ -671,6 +671,12 @@ def latest_check(ledger: Any, execution_id: str) -> dict[str, Any] | None:
 
 
 def export_review(ledger: Any, execution_id: str, output: str) -> dict[str, Any]:
+    from .evidence_bundle import publish
+    return publish(ledger, execution_id, output,
+                   lambda destination: _write_review(ledger, execution_id, destination))
+
+
+def _write_review(ledger: Any, execution_id: str, output: str) -> dict[str, Any]:
     current = ledger.current(execution_id)
     receipt = latest_check(ledger, execution_id)
     planning = current["current_state_id"] in ("PlanReview", "ReplanReview") and receipt and receipt["contract"] == "plan-result-v2"
@@ -697,8 +703,10 @@ def export_review(ledger: Any, execution_id: str, output: str) -> dict[str, Any]
                 from .verification_contract import evidence_root
                 artifact_directory = destination / "verification-artifacts"
                 artifact_directory.mkdir(exist_ok=True)
-                (artifact_directory / artifact["sha256"]).write_bytes(
-                    (evidence_root(ledger) / artifact["sha256"]).read_bytes())
+                data = (evidence_root(ledger) / artifact["sha256"]).read_bytes()
+                if digest(data) != artifact["sha256"]:
+                    raise DeliveryError("canonical verification artifact does not match its checked hash")
+                (artifact_directory / artifact["sha256"]).write_bytes(data)
     definition = receipt.get("verification_plan") or receipt.get("approved_plan")
     if definition:
         (destination / "verification-plan.json").write_bytes(encoded(definition) + b"\n")

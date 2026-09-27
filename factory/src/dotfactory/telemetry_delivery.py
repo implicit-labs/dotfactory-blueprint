@@ -13,6 +13,7 @@ from typing import Any
 
 from .ledger import LedgerError, SQLiteLedger
 from .observability import canonical_json
+from .projection_policy import ProjectionPolicyBlocked, authorize, span_policy
 from .telemetry_mapping import (
     OTEL_MAPPING_VERSION, record_spans, span_document,
 )
@@ -26,6 +27,9 @@ class TelemetryOutbox:
         self.destination = destination
         # Independent namespace: do not consume a canonical ledger schema version.
         with ledger.transaction() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS otlp_policy_bindings (attempt_id TEXT NOT NULL,execution_id TEXT NOT NULL,delivery_digest TEXT NOT NULL,source_at TEXT NOT NULL,PRIMARY KEY(attempt_id,execution_id))")
+            db.execute("CREATE TABLE IF NOT EXISTS otlp_policy_skips (attempt_id TEXT NOT NULL,record_id TEXT NOT NULL,reason TEXT NOT NULL,policy_digest TEXT NOT NULL,PRIMARY KEY(attempt_id,record_id))")
+            db.execute("CREATE TABLE IF NOT EXISTS otlp_policy_blocks (attempt_id TEXT PRIMARY KEY,reason TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS otlp_schema ("
                        "component TEXT PRIMARY KEY,version INTEGER NOT NULL)")
             row = db.execute("SELECT version FROM otlp_schema WHERE component='delivery'").fetchone()
@@ -125,6 +129,16 @@ class TelemetryOutbox:
                     break
                 for row in rows:
                     record = self.ledger._trace_record_dict(row)
+                    decision = authorize(self.ledger, record["execution_id"], "logfire", source_at=record["observed_at"], record=False)
+                    if not decision["allowed"]:
+                        if decision["reason"] not in {"opted_out", "delivery_expired"}:
+                            raise ProjectionPolicyBlocked(decision["reason"])
+                        if int(row["seq"]) >= int(attempt["from_source_seq"]):
+                            db.execute("INSERT OR IGNORE INTO otlp_policy_skips VALUES(?,?,?,?)", (
+                                attempt_id, record["record_id"], decision["reason"], decision["policy_digest"]))
+                        continue
+                    db.execute("INSERT OR IGNORE INTO otlp_policy_bindings VALUES(?,?,?,?)", (
+                        attempt_id, record["execution_id"], decision["delivery_digest"], record["observed_at"]))
                     record["_preparation_id"] = row["otlp_preparation_id"]
                     table = {"resource_allocation": "resource_allocations",
                              "resource_mutation": "resource_mutations"}.get(record["entity_kind"])
@@ -137,7 +151,7 @@ class TelemetryOutbox:
                                        "FROM error_facts WHERE trace_record_id=?", (record["record_id"],)).fetchone()
                     if error:
                         record["_error"] = dict(error)
-                    candidates = record_spans(record)
+                    candidates = [span_policy(self.ledger, record["execution_id"], span) for span in record_spans(record)]
                     for span in candidates:
                         # Later observations may omit ownership metadata. The first
                         # frozen context remains authoritative, including its parent.
@@ -189,6 +203,39 @@ class TelemetryOutbox:
             "ORDER BY ordinal LIMIT 1", (attempt_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    def validate_batch(self, batch, endpoint, *, project=None, region=None):
+        if hashlib.sha256(batch["body_json"].encode()).hexdigest() != batch["body_sha256"]:
+            raise ProjectionPolicyBlocked("queued_payload_changed")
+        # Old outboxes have no policy rows. Bind only after checking the actual saved bytes.
+        rows = self.ledger.connection.execute(
+            "SELECT DISTINCT t.execution_id,MIN(t.observed_at) AS source_at FROM otlp_dependencies d "
+            "JOIN trace_records t ON t.record_id=d.record_id WHERE d.attempt_id=? GROUP BY t.execution_id", (batch["attempt_id"],)).fetchall()
+        for row in rows:
+            decision = authorize(self.ledger, row["execution_id"], "logfire", endpoint=endpoint, project=project, region=region, source_at=row["source_at"])
+            if not decision["allowed"]:
+                raise ProjectionPolicyBlocked(decision["reason"])
+            prior = self.ledger.connection.execute("SELECT delivery_digest FROM otlp_policy_bindings WHERE attempt_id=? AND execution_id=?",
+                                                   (batch["attempt_id"], row["execution_id"])).fetchone()
+            if prior and prior[0] != decision["delivery_digest"]:
+                raise ProjectionPolicyBlocked("queued_policy_changed")
+        for resource in json.loads(batch["body_json"])["resourceSpans"]:
+            for scope in resource["scopeSpans"]:
+                for span in scope["spans"]:
+                    execution_id = next(item["value"]["stringValue"] for item in span["attributes"] if item["key"] == "dotfactory.execution.id")
+                    if span_policy(self.ledger, execution_id, span) != span:
+                        raise ProjectionPolicyBlocked("queued_redaction_changed")
+        with self.ledger.transaction() as db:
+            for row in rows:
+                decision = authorize(self.ledger, row["execution_id"], "logfire", record=False)
+                db.execute("INSERT OR IGNORE INTO otlp_policy_bindings VALUES(?,?,?,?)", (
+                    batch["attempt_id"], row["execution_id"], decision["delivery_digest"], row["source_at"]))
+            db.execute("DELETE FROM otlp_policy_blocks WHERE attempt_id=?", (batch["attempt_id"],))
+
+    def block_policy(self, attempt_id, reason):
+        with self.ledger.transaction() as db:
+            db.execute("INSERT OR REPLACE INTO otlp_policy_blocks VALUES(?,?)", (attempt_id, reason))
+            db.execute("UPDATE projection_attempts SET status='paused' WHERE id=?", (attempt_id,))
 
     def plan_failure(self, attempt_id: str) -> str | None:
         row = self.ledger.connection.execute(
@@ -278,11 +325,12 @@ class TelemetryOutbox:
             missing = db.execute(
                 "SELECT 1 FROM trace_records t WHERE t.seq BETWEEN ? AND ? AND NOT EXISTS ("
                 "SELECT 1 FROM projection_receipts r WHERE r.attempt_id=? AND r.source_record_id=t.record_id "
-                "AND r.status='accepted') LIMIT 1",
-                (attempt["from_source_seq"], attempt["through_source_seq"], attempt_id),
+                "AND r.status='accepted') AND NOT EXISTS (SELECT 1 FROM otlp_policy_skips s WHERE s.attempt_id=? AND s.record_id=t.record_id) LIMIT 1",
+                (attempt["from_source_seq"], attempt["through_source_seq"], attempt_id, attempt_id),
             ).fetchone()
             if missing:
                 raise LedgerError("OTLP plan completed without full source coverage")
+            db.execute("DELETE FROM otlp_policy_blocks WHERE attempt_id=?", (attempt_id,))
             now = self.ledger.clock()
             db.execute("UPDATE projection_attempts SET status='completed',updated_at=?,completed_at=? WHERE id=?",
                        (now, now, attempt_id))
@@ -290,7 +338,9 @@ class TelemetryOutbox:
             first_gap = db.execute(
                 "SELECT MIN(t.seq) FROM trace_records t WHERE NOT EXISTS ("
                 "SELECT 1 FROM projection_receipts r WHERE r.destination=? "
-                "AND r.source_record_id=t.record_id AND r.status='accepted')", (self.destination,),
+                "AND r.source_record_id=t.record_id AND r.status='accepted') AND NOT EXISTS ("
+                "SELECT 1 FROM otlp_policy_skips s JOIN projection_attempts p ON p.id=s.attempt_id WHERE s.record_id=t.record_id AND p.destination=?)",
+                (self.destination, self.destination),
             ).fetchone()[0]
             through = int(first_gap) - 1 if first_gap else int(db.execute(
                 "SELECT COALESCE(MAX(seq),0) FROM trace_records").fetchone()[0])
@@ -304,6 +354,7 @@ class TelemetryOutbox:
         result = self.ledger.projection_attempt(attempt_id)
         batch = self.next_batch(attempt_id)
         result["mapping_version"] = OTEL_MAPPING_VERSION
+        result["policy_skipped_count"] = self.ledger.connection.execute("SELECT COUNT(*) FROM otlp_policy_skips WHERE attempt_id=?", (attempt_id,)).fetchone()[0]
         result["delivery"] = {
             "status": batch["status"] if batch else result["status"],
             "batch_ordinal": batch["ordinal"] if batch else None,
@@ -313,4 +364,7 @@ class TelemetryOutbox:
         if failure:
             result["delivery"] = {"status": "blocked", "batch_ordinal": None,
                                   "outcome": {"code": failure, "retryable": False, "ambiguous": False}}
+        blocked = self.ledger.connection.execute("SELECT reason FROM otlp_policy_blocks WHERE attempt_id=?", (attempt_id,)).fetchone()
+        if blocked:
+            result["delivery"] = {"status": "policy_blocked", "outcome": {"code": "PROJECTION_POLICY_BLOCKED", "reason": blocked[0], "retryable": False}}
         return result

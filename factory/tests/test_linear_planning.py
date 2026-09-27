@@ -101,10 +101,15 @@ class LinearPlanningTests(unittest.TestCase):
     def configured(self, questions=None):
         values = copy.deepcopy(self.config.values)
         values['workflows']['default']['path'] = str(ROOT / 'workflows/linear-planning.dot')
+        # Fake adapters still need real admission authority. Patch only client setup,
+        # not the frozen send policy that production planning uses.
+        values.setdefault('projections', {}).setdefault('linear', {})['enabled'] = True
+        values['projects']['demo']['tracker']['team_id'] = 'fixture-team'
         path = self.root / 'linear.json'
         path.write_text(json.dumps(values))
         runner = ChatRunner(questions=questions)
-        runtime = FactoryRuntime(FactoryConfig.load(path), runner=runner)
+        with patch.object(FactoryRuntime, '_build_linear'):
+            runtime = FactoryRuntime(FactoryConfig.load(path), runner=runner)
         return runtime, runner
 
     def session(self, runtime, execution, replies):
@@ -249,7 +254,7 @@ class LinearPlanningTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'simulated crash'):
                     receive(runtime, execution, self.session(runtime, execution, [response]))
             self.assertEqual('Ready', runtime.ledger.current(execution)['current_state_id'])
-        with FactoryRuntime(config, runner=ChatRunner()) as restarted:
+        with patch.object(FactoryRuntime, '_build_linear'), FactoryRuntime(config, runner=ChatRunner()) as restarted:
             receive(restarted, execution, self.session(restarted, execution, [response]))
             self.assertEqual('Ready', restarted.ledger.current(execution)['current_state_id'])
             self.assertEqual('accepted', events(restarted.ledger, execution, 'linear_planning_reply')[-1]['status'])

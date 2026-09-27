@@ -82,8 +82,11 @@ def settings_view(ledger, execution_id):
         return None
     from .planning import effective_settings
     value = effective_settings(ledger, execution_id)
-    return {"stages": value["policy"]["stages"], "provenance": value.get("provenance", {}),
-            "digest": worker.digest(value), "frozen_at": value.get("frozen_at", "legacy-first-placement")}
+    result = {"stages": value["policy"]["stages"], "provenance": value.get("provenance", {}),
+              "digest": worker.digest(value), "frozen_at": value.get("frozen_at", "legacy-first-placement")}
+    if "selection" in value:
+        result["selection"] = value["selection"]
+    return result
 
 
 def validate_policy(policy):

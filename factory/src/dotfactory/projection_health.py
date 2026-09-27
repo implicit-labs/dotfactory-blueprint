@@ -23,6 +23,8 @@ def _safe_error(value: Any) -> dict[str, str] | None:
 
 def _state(row: dict[str, Any]) -> str:
     status = row["status"]
+    if status in ("policy_skipped", "policy_blocked"):
+        return status
     if status in ("confirmed", "delivered", "accepted", "active", "superseded"):
         return "confirmed" if status != "superseded" else "superseded"
     if status in ("ambiguous", "sending", "in_flight"):
@@ -42,6 +44,7 @@ def _summarize(destination: str, kind: str, enabled: bool | None,
         "destination": destination, "projection_type": kind, "enabled": enabled,
         "count_unit": "source_records", "pending": 0, "retry": 0,
         "ambiguous": 0, "failed": 0, "fallback": 0, "confirmed": 0, "superseded": 0,
+        "policy_skipped": 0, "policy_blocked": 0,
         "oldest_pending_at": None, "oldest_pending_age_seconds": None,
         "last_confirmed_receipt": None, "safe_error": None,
     }
@@ -53,7 +56,7 @@ def _summarize(destination: str, kind: str, enabled: bool | None,
         when = row.get("confirmed_at")
         if when and (not result["last_confirmed_receipt"] or when > result["last_confirmed_receipt"]["confirmed_at"]):
             result["last_confirmed_receipt"] = {"id": row.get("receipt_id") or row["id"], "confirmed_at": when}
-        if state not in ("confirmed", "superseded"):
+        if state not in ("confirmed", "superseded", "policy_skipped"):
             when = row["created_at"]
             if not result["oldest_pending_at"] or when < result["oldest_pending_at"]:
                 result["oldest_pending_at"] = when
@@ -67,8 +70,8 @@ def _summarize(destination: str, kind: str, enabled: bool | None,
         ).total_seconds()))
     result["status"] = (
         "disabled" if enabled is False else "unknown" if enabled is None else
-        next((key for key in ("failed", "ambiguous", "retry", "fallback", "pending") if result[key]),
-             "healthy" if result["confirmed"] else "idle")
+        next((key for key in ("policy_blocked", "failed", "ambiguous", "retry", "fallback", "pending") if result[key]),
+             "healthy" if result["confirmed"] else "policy_skipped" if result["policy_skipped"] else "idle")
     )
     return result
 
@@ -80,6 +83,14 @@ def projection_health(ledger: Any, execution_id: str | None = None) -> dict[str,
     logfire = configuration.get("logfire")
     sessions = configuration.get("linear_agent")
     logfire_destination = configuration.get("logfire_destination")
+    policy_decisions = {}
+    if execution_id and hasattr(ledger, "projection_policy_values"):
+        from .projection_policy import authorize
+        policy_decisions = {key: authorize(ledger, execution_id, key, record=False) for key in ("linear", "logfire")}
+        if not policy_decisions["linear"]["allowed"]:
+            linear = sessions = False
+        if not policy_decisions["logfire"]["allowed"]:
+            logfire = False
     now = ledger.clock()
     channels = []
     scope = " WHERE execution_id=?" if execution_id else ""
@@ -127,6 +138,10 @@ def projection_health(ledger: Any, execution_id: str | None = None) -> dict[str,
                     item.update(delivery_status=status, error=batch["outcome_json"])
             if failure:
                 item.update(delivery_status="blocked", error={"code": failure[0]})
+            if "otlp_policy_blocks" in tables:
+                blocked = db.execute("SELECT reason FROM otlp_policy_blocks WHERE attempt_id=?", (item["id"],)).fetchone()
+                if blocked:
+                    item.update(delivery_status="policy_blocked", error={"code": "PROJECTION_POLICY_BLOCKED"})
         else:
             continue
         attempts.append(item)
@@ -143,6 +158,12 @@ def projection_health(ledger: Any, execution_id: str | None = None) -> dict[str,
         for source in rows:
             row = dict(source)
             row["status"] = "confirmed" if row["confirmed_at"] else "pending"
+            if not row["confirmed_at"] and "otlp_policy_skips" in tables and db.execute(
+                    "SELECT 1 FROM otlp_policy_skips s JOIN projection_attempts p ON p.id=s.attempt_id WHERE s.record_id=? AND p.destination=?",
+                    (row["id"], logfire_destination)).fetchone():
+                row["status"] = "policy_skipped"
+                yield row
+                continue
             if not row["confirmed_at"]:
                 attempt = next((a for a in reversed(attempts) if a["from_source_seq"] <= row["seq"] <= a["through_source_seq"]), None)
                 if attempt:
@@ -151,4 +172,9 @@ def projection_health(ledger: Any, execution_id: str | None = None) -> dict[str,
     trace = _summarize("logfire", "trace", logfire, trace_rows(), now)
     trace["unconfirmed_status_scope"] = "delivery_attempt"
     channels.append(trace)
+    for channel in channels:
+        decision = policy_decisions.get(channel["destination"])
+        if decision:
+            channel["policy"] = {"allowed": decision["allowed"], "reason": decision["reason"],
+                                 "digest": decision["policy_digest"]}
     return {"schema_version": 1, "generated_at": now, "channels": channels}
