@@ -332,11 +332,12 @@ def inspect(config_path: str, environment: Optional[Mapping[str, str]] = None, *
             checks.extend(_runner_checks(str(name), values, environment))
     checks.extend(_integration_checks(config, environment))
     effective = {}
-    if config.values.get("execution"):
+    if config.values.get("execution") or config.values.get("evidence_policy") or config.values.get("projection_policy") or any(
+            item.get("evidence_policy") or item.get("projection_policy") for item in config.values["projects"].values()) or execution_override:
         from .configuration import preview
         from .verification_host import inspect as coordinator_inspect
         for key in projects:
-            effective[key] = preview(config, key, execution_override)
+            effective[key] = preview(config, key, execution_override, environment=environment)
             for state, rule in effective[key]["stages"].items():
                 if rule.get("coordinator"):
                     report = coordinator_inspect(rule["coordinator"])

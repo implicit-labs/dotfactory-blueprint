@@ -329,6 +329,15 @@ def _delivery_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _evidence_cleanup(args: argparse.Namespace) -> int:
+    from .evidence_bundle import cleanup
+    config = FactoryConfig.load(args.config)
+    with FactoryRuntime(config, project_keys=[args.project], control_only=True) as runtime:
+        result = cleanup(runtime.ledger, args.project, apply=args.apply)
+    print(json.dumps({"apply": args.apply, "exports": result}, indent=2, sort_keys=True))
+    return 1 if any(item["status"] == "needs_attention" for item in result) else 0
+
+
 def _dataset(args: argparse.Namespace) -> int:
     config = FactoryConfig.load(args.config)
     with FactoryRuntime(
@@ -425,7 +434,7 @@ def main(arguments: list[str] | None = None) -> int:
     )
     run.add_argument("--title")
     run.add_argument("--description-file")
-    run.add_argument("--execution-config", help="JSON stage overrides for a new run; omitted fields inherit project settings")
+    run.add_argument("--execution-config", help="JSON placement overrides and registered workflow/profile selections for a new run")
     run.add_argument("--until-state")
     run.add_argument("--watch", action="store_true")
     run.add_argument("--max-ticks", type=int)
@@ -474,6 +483,11 @@ def main(arguments: list[str] | None = None) -> int:
     delivery.add_argument("--execution", required=True)
     delivery.add_argument("--output", required=True)
     delivery.set_defaults(callback=_delivery_export)
+    cleanup = commands.add_parser("evidence-cleanup", help="preview expiry cleanup of exact-owned local review exports")
+    cleanup.add_argument("--config", default=os.environ.get("DOTFACTORY_CONFIG"))
+    cleanup.add_argument("--project", required=True)
+    cleanup.add_argument("--apply", action="store_true", help="delete only expired, unchanged exported copies; preserve canonical evidence")
+    cleanup.set_defaults(callback=_evidence_cleanup)
     initialize = commands.add_parser("init", help="initialize a local verified Python delivery instance")
     initialize.add_argument("--repository", required=True)
     initialize.add_argument("--output", required=True, help="new instance directory; never overwritten")
@@ -507,7 +521,7 @@ def main(arguments: list[str] | None = None) -> int:
     server.add_argument("--subject", default=os.environ.get("USER", "local-operator"))
     server.set_defaults(callback=serve)
     args = parser.parse_args(arguments)
-    if args.command in ("run", "attention", "operator", "dataset", "delivery", "status", "serve", "work") and not args.config:
+    if args.command in ("run", "attention", "operator", "dataset", "delivery", "evidence-cleanup", "status", "serve", "work") and not args.config:
         parser.error(f"{args.command} requires --config or DOTFACTORY_CONFIG")
     try:
         return int(args.callback(args))

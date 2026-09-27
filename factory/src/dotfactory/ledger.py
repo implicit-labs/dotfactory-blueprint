@@ -1568,6 +1568,8 @@ class SQLiteLedger:
         actor: str = "agent",
         observed_linear_status: str | None = None,
         execution_settings: dict[str, Any] | None = None,
+        evidence_settings: dict[str, Any] | None = None,
+        projection_settings: dict[str, Any] | None = None,
     ) -> str:
         existing = self.connection.execute(
             "SELECT execution_id FROM events WHERE idempotency_key=?", (idempotency_key,)
@@ -1634,6 +1636,12 @@ class SQLiteLedger:
             if execution_settings is not None:
                 from .execution import record_admission
                 record_admission(db, execution_id, execution_settings)
+            if evidence_settings is not None:
+                from .evidence_policy import record_admission as record_evidence
+                record_evidence(db, execution_id, project_key, evidence_settings)
+            if projection_settings is not None:
+                from .projection_policy import record_admission as record_projection
+                record_projection(db, execution_id, project_key, projection_settings)
             initial_attempt = None
             if state_kind == "work":
                 if not owner:
@@ -5437,6 +5445,10 @@ class SQLiteLedger:
     def run_snapshot(self, execution_id: str) -> dict[str, Any]:
         from .projection_health import projection_health
         current = self.current(execution_id)
+        from .evidence_policy import settings_view as evidence_view
+        current["evidence_policy"] = evidence_view(self, execution_id)
+        from .projection_policy import settings_view as projection_view
+        current["projection_policy"] = projection_view(self, execution_id)
         current["projection_health"] = projection_health(self, execution_id)
         current["intent"] = json.loads(current.pop("intent_snapshot_json"))
         current["pending_transition"] = self.pending_transition(execution_id)

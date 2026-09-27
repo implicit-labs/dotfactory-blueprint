@@ -372,6 +372,14 @@ class LinearAgentSessionWorker:
         )
 
     def _drain_session(self, item: Mapping[str, Any]) -> str:
+        from .projection_policy import authorize, sanitize
+        decision = authorize(self.ledger, str(item["execution_id"]), "linear",
+                             endpoint=getattr(self.client, "endpoint", None), source_at=item.get("created_at"))
+        if not decision["allowed"]:
+            return "policy_blocked"
+        if (decision["effective"] and (decision["effective"]["redaction"] == "metadata" or decision["effective"]["redact_fields"])) or sanitize(
+                self.ledger, str(item["execution_id"]), "linear", item["desired_external_urls"]) != item["desired_external_urls"]:
+            return "policy_blocked"
         if str(item["status"]) == "fallback":
             return "fallback"
         if str(item["status"]) in {"sending", "ambiguous"}:
@@ -518,6 +526,12 @@ class LinearAgentSessionWorker:
     def _drain_activity(
         self, item: Mapping[str, Any], session_id: str,
     ) -> str:
+        from .projection_policy import authorize, sanitize
+        decision = authorize(self.ledger, str(item["execution_id"]), "linear",
+                             endpoint=getattr(self.client, "endpoint", None), source_at=item.get("created_at"))
+        if (not decision["allowed"] or (decision["effective"] and (decision["effective"]["redaction"] == "metadata" or decision["effective"]["redact_fields"]))
+                or sanitize(self.ledger, str(item["execution_id"]), "linear", item["content"]) != item["content"]):
+            return "policy_blocked"
         attempt_number = int(item["attempt_count"])
         if item.get("next_attempt_at") and str(item["next_attempt_at"]) > self.ledger.clock():
             return "pending"
@@ -580,6 +594,15 @@ class LinearAgentSessionWorker:
         self, execution_id: str, *, issue_id: str, marker_url: str,
         external_urls: list[dict[str, str]], activities: list[dict[str, Any]],
     ) -> str:
+        from .projection_policy import authorize, sanitize
+        decision = authorize(self.ledger, execution_id, "linear", endpoint=getattr(self.client, "endpoint", None))
+        if not decision["allowed"]:
+            return "policy_blocked"
+        if decision["effective"] and (decision["effective"]["redaction"] == "metadata" or decision["effective"]["redact_fields"]):
+            # Native sessions carry conversational content; use the metadata-only comment instead.
+            return "fallback"
+        external_urls = sanitize(self.ledger, execution_id, "linear", external_urls)
+        activities = sanitize(self.ledger, execution_id, "linear", activities)
         item = self._stage_session(
             execution_id, issue_id=issue_id, marker_url=marker_url,
             external_urls=external_urls,

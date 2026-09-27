@@ -62,9 +62,9 @@ login/version checks using the same resolver and report validation as dispatch.
 Omit `--execution-config` to use project defaults. Preview describes new admission,
 not an existing run: inspect that run's frozen `execution_settings` for its policy.
 
-The shared resolver currently covers execution fields. Runner/tool profiles,
-workflow selection, workspace policy, budgets, projections and evidence retention
-remain separate follow-up phases. Planning may propose changes to configurable
+The shared preview/admission path covers placement and registered runner/skill
+profile or workflow selection. Workspace policy, budgets, projections and evidence
+retention remain separate follow-up phases. Planning may propose changes to configurable
 implementation and verification fields. They apply only after exact plan and
 requirements approval; credentials, host registrations, billing identity, safety
 ceilings, pinned checks and the original admission record remain unchanged.

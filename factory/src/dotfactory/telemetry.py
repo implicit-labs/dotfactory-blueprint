@@ -11,6 +11,7 @@ from urllib.parse import unquote
 
 from .ledger import SQLiteLedger
 from .telemetry_delivery import TelemetryOutbox
+from .projection_policy import ProjectionPolicyBlocked
 from .telemetry_mapping import (
     OTEL_MAPPING_VERSION, _unix_nano, otel_trace_document,
 )
@@ -217,6 +218,9 @@ class LogfireProjectionWorker:
             frozen = self.outbox.freeze(
                 attempt, service_name=self.settings.service_name, batch_size=self.batch_size,
             )
+        except ProjectionPolicyBlocked as error:
+            self.outbox.block_policy(attempt_id, str(error))
+            return self.outbox.result(attempt_id)
         except (ValueError, TypeError, KeyError):
             self.outbox.block_invalid_plan(attempt_id)
             return self.outbox.result(attempt_id)
@@ -236,6 +240,11 @@ class LogfireProjectionWorker:
                 self.outbox.finish(attempt_id)
                 return self.outbox.result(attempt_id)
             if batch["status"] == "blocked":
+                return self.outbox.result(attempt_id)
+            try:
+                self.outbox.validate_batch(batch, self.settings.endpoint, project=self.settings.project, region=self.settings.region)
+            except ProjectionPolicyBlocked as error:
+                self.outbox.block_policy(attempt_id, str(error))
                 return self.outbox.result(attempt_id)
             self.outbox.begin_delivery(batch)
             total = len(json.loads(batch["span_ids_json"]))

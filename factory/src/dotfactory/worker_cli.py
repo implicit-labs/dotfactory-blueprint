@@ -58,7 +58,7 @@ def check(args):
     coordinator = {}
     runner = args.runner
     if project:
-        policy, _sources, graph = resolve(config, project, override)
+        policy, _sources, graph, _selection = resolve(config, project, override)
         if stage not in policy["stages"]:
             raise ValueError("stage has no execution settings")
         rule = policy["stages"][stage]

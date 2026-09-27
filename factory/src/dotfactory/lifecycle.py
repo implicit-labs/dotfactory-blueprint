@@ -127,7 +127,9 @@ class FactoryRuntime:
         self.stop_requested = False
         self.drain_requested = False
         self.operator_server: Any | None = None
-        self._last_live_poll = 0.0
+        # A monotonic clock may start near zero (notably Python 3.9 on macOS).
+        # The first eligible read is immediate; only subsequent reads are throttled.
+        self._last_live_poll = float("-inf")
         self._live_poll_inflight = False
         self._live_poll_results: queue.Queue[Any] = queue.Queue(maxsize=1)
         self.shutdown_reason = "settled"
@@ -150,6 +152,10 @@ class FactoryRuntime:
                 self.ledger, environment=self.environment,
                 only=list(self.project_keys),
             )
+            from .evidence_policy import configure as configure_evidence
+            configure_evidence(self.ledger, config.values, self.project_keys)
+            from .projection_policy import configure as configure_projection
+            configure_projection(self.ledger, config.values, self.environment, self.project_keys)
             self.kernels: dict[str, DurableKernel] = {}
             self.engines: dict[str, PreparationEngine] = {}
             self.projects: dict[str, ScheduledProject] = {}
@@ -265,10 +271,14 @@ class FactoryRuntime:
                 project_key, environment=self.environment
             )
             workflow = self.config.resolve_workflow(project_key)
+            from .evidence_policy import resolve as resolve_evidence
+            from .projection_policy import resolve as resolve_projection
             kernel = DurableKernel(
                 self.ledger, workflow["path"],
                 profile_paths=workflow["profile_paths"],
                 factory_defaults=workflow["defaults"],
+                default_evidence_policy=resolve_evidence(self.config.values, project_key),
+                default_projection_policy=resolve_projection(self.config.values, project_key, environment=self.environment),
             )
             for state in kernel.states.values():
                 execution = state.get("execution", {})
@@ -407,6 +417,7 @@ class FactoryRuntime:
         return self.stop_requested or run["status"] in ("canceled", "superseded")
 
     def _poll_linear_during_run(self, run: Mapping[str, Any]) -> None:
+        from .projection_policy import authorize
         # Only the network read crosses threads. Observe/reconcile/command work
         # always runs here on the existing ledger writer.
         try:
@@ -420,7 +431,7 @@ class FactoryRuntime:
             if error:
                 self.preflights.append({"kind": "linear-live-poll", "available": False,
                                         "reason": error})
-            elif self.ledger.current(execution_id)["status"] == "running":
+            elif self.ledger.current(execution_id)["status"] == "running" and authorize(self.ledger, execution_id, "linear")["allowed"]:
                 planning_session = issue.pop('_planning_session', None)
                 if planning_session is not None:
                     from .linear_planning import receive
@@ -436,7 +447,7 @@ class FactoryRuntime:
         current = self.ledger.current(execution_id)
         project_key = str(current["project_key"])
         worker = self.linear_workers.get(project_key)
-        if not worker:
+        if not worker or not authorize(self.ledger, execution_id, "linear")["allowed"]:
             return
         identifier = str(current["work_item_identifier"])
         client = worker.client
@@ -525,25 +536,56 @@ class FactoryRuntime:
     ) -> str:
         if project_key not in self.kernels:
             raise LifecycleError(f"project is not enabled: {project_key}")
+        from .selection import resolve as resolve_selection, split_override
+        from .evidence_policy import resolve as resolve_evidence, settings_view as evidence_view
+        from .projection_policy import resolve as resolve_projection, settings_view as projection_view
+        placement_override, selection_override = split_override(execution_override)
         existing = self._existing_execution(project_key, identifier)
         if existing:
             if self.execution:
-                self.execution.assert_same_override(existing, execution_override)
-            elif execution_override is not None:
+                self.execution.assert_same_override(existing, placement_override)
+            elif placement_override:
                 raise LifecycleError("run execution overrides require worker execution configuration")
+            if execution_override is not None:
+                if projection_view(self.ledger, existing)["run_override"] != execution_override.get("projection_policy", {}):
+                    raise LifecycleError("existing run projection policy is frozen; start a new run")
+                evidence_override = execution_override.get("evidence_policy", {})
+                if evidence_view(self.ledger, existing)["run_override"] != evidence_override:
+                    raise LifecycleError("existing run evidence policy is frozen; start a new run")
+                frozen = self.ledger.run_snapshot(existing)["intent"].get("selection", {})
+                if frozen.get("run_override", {}) != selection_override:
+                    raise LifecycleError("existing run profile selection is frozen; start a new run")
             return existing
+        evidence_settings = resolve_evidence(self.config.values, project_key,
+            (execution_override or {}).get("evidence_policy"))
+        projection_settings = resolve_projection(self.config.values, project_key,
+            (execution_override or {}).get("projection_policy"), environment=self.environment)
+        definition, selection, _placement = resolve_selection(
+            self.config, project_key, execution_override
+        )
+        for state in definition.states:
+            if state["kind"] == "work" and not str(state.get("execution", {}).get("prompt", "")).strip():
+                raise LifecycleError(f"workflow work state {state['id']} has no immutable prompt")
+        kernel = self.kernels[project_key]
+        if definition.digest != kernel.definition.digest:
+            selected_workflow = self.config.resolve_workflow(
+                project_key, name=selection["workflow"]["name"]
+            )
+            kernel = DurableKernel(self.ledger, selected_workflow["path"], definition=definition)
         settings = None
         if self.execution:
-            settings = self.execution.admission(project_key, execution_override,
-                work_states=[name for name, state in self.kernels[project_key].states.items()
+            settings = self.execution.admission(project_key, placement_override,
+                work_states=[name for name, state in kernel.states.items()
                              if state["kind"] == "work"])
-        elif execution_override is not None:
+            settings["selection"] = selection
+        elif placement_override:
             raise LifecycleError("run execution overrides require worker execution configuration")
         intent = {"title": title or identifier, "description": description,
-                  "source": "admitted_queue" if admission_snapshot is not None else "explicit_issue"}
+                  "source": "admitted_queue" if admission_snapshot is not None else "explicit_issue",
+                  "selection": selection}
         planning_policy = self.config.values["projects"][project_key].get("linear_planning", {})
         if planning_policy.get("enabled"):
-            states = self.kernels[project_key].states
+            states = kernel.states
             if project_key not in self.linear_agent_workers or not any(
                     n.get("checkpoint_role") == "pickup" and n.get("linear_status") == "Planning" for n in states.values()):
                 raise LifecycleError("Linear planning requires Agent Sessions and a Planning pickup workflow")
@@ -554,7 +596,7 @@ class FactoryRuntime:
         if verification is not None:
             from .verification_contract import validate
             validate(verification)
-            states = self.kernels[project_key].states
+            states = kernel.states
             contracts = {node.get("execution", {}).get("exit_contract") for node in states.values()}
             if not {"plan-result-v2", "implementation-result-v2", "python-verification-v2"}.issubset(contracts) or "PlanReview" not in states:
                 raise LifecycleError("verification methods require a reviewed plan, implementation and Python verification workflow")
@@ -579,7 +621,7 @@ class FactoryRuntime:
             ).get("id") != project["tracker_team_id"]:
                 raise LifecycleError("Linear issue belongs to a different team")
             candidates = [
-                state["id"] for state in self.kernels[project_key].states.values()
+                state["id"] for state in kernel.states.values()
                 if state.get("checkpoint_role") == "pickup"
                 and state.get("linear_status") == (issue.get("state") or {}).get("name")
             ]
@@ -595,13 +637,25 @@ class FactoryRuntime:
             })
         if not isinstance(intent["description"], str) or len(intent["description"]) > 65536:
             raise LifecycleError("issue description must be text of at most 65536 characters")
+        linear_worker = self.linear_workers.get(project_key)
+        if isinstance(linear_worker, LinearConvergenceWorker):
+            project_identity = self.config.resolve_project(
+                project_key, environment=self.environment
+            )
+            linear_worker.ensure_selected_bindings(
+                project_key=project_key, workflow_digest=definition.digest,
+                states=kernel.states, team_id=project_identity.get("tracker_team_id"),
+                project_id=project_identity["tracker_project_id"],
+            )
         execution_number = self._next_execution_number(project_key, identifier)
-        execution_id = self.kernels[project_key].begin(
+        execution_id = kernel.begin(
             project_key, identifier, intent,
             command_id=(
                 f"runtime-begin:{project_key}:{identifier}:{execution_number}"
             ),
             adopted_state=adopted_state, execution_settings=settings,
+            evidence_settings=evidence_settings,
+            projection_settings=projection_settings,
         )
         if worker:
             # The adoption snapshot is the first observation. A second read here
@@ -646,9 +700,10 @@ class FactoryRuntime:
         ) if row["project_key"] in self.kernels]
 
     def _poll_linear(self) -> None:
+        from .projection_policy import authorize
         for run in self._owned_runs("running"):
             worker = self.linear_workers.get(str(run["project_key"]))
-            if worker:
+            if worker and authorize(self.ledger, str(run["id"]), "linear")["allowed"]:
                 worker.poll(str(run["id"]), str(run["work_item_identifier"]))
 
     def _drain_linear(self) -> None:
@@ -656,12 +711,13 @@ class FactoryRuntime:
             return
         # Re-read after every delivery. Confirming one mutation can reconcile and
         # confirm another pending mutation for the same desired status.
+        blocked = set()
         for _index in range(100):
             pending = self.ledger.pending_linear_mutations(100)
             owned = [
                 item for item in pending
                 if self.ledger.current(str(item["execution_id"]))["project_key"]
-                in self.linear_workers
+                in self.linear_workers and item["id"] not in blocked
             ]
             if not owned:
                 break
@@ -669,9 +725,12 @@ class FactoryRuntime:
             project_key = str(self.ledger.current(
                 str(item["execution_id"])
             )["project_key"])
-            self.linear_workers[project_key].drain_one(item)
+            result = self.linear_workers[project_key].drain_one(item)
+            if result.get("status") == "policy_blocked":
+                blocked.add(item["id"])
 
     def _sync_linear_evidence(self) -> None:
+        from .projection_policy import authorize, linear_body
         if not self.linear_evidence_workers:
             return
         agent_workers = getattr(self, "linear_agent_workers", {})
@@ -683,6 +742,8 @@ class FactoryRuntime:
             project_key = str(run["project_key"])
             if project_key not in self.linear_evidence_workers:
                 continue
+            if not authorize(self.ledger, execution_id, "linear")["allowed"]:
+                continue
             snapshot = self.ledger.run_snapshot(execution_id)
             issue_id = str(snapshot["intent"].get("linear_issue_id") or "")
             if not issue_id:
@@ -692,6 +753,8 @@ class FactoryRuntime:
             body, digest = render_linear_run_summary(
                 snapshot, projection, self.ledger.run_history(execution_id)
             )
+            body = linear_body(self.ledger, execution_id, body)
+            digest = hashlib.sha256(body.encode()).hexdigest()
             agent_worker = agent_workers.get(project_key)
             if agent_worker:
                 template = str(linear_projection["agent_session_url_template"])

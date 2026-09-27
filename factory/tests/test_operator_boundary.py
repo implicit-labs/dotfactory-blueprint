@@ -10,6 +10,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from dotfactory.cli import _demo_config, _run_exit_code, main
 from dotfactory.control import Principal
@@ -163,7 +164,10 @@ class OperatorBoundaryTests(unittest.TestCase):
                 release_read.wait(5)
                 read_finished.set()
                 raise LinearAPIError("TIMEOUT", "fixture outage", retryable=True)
-        with FactoryRuntime(self.config, runner=fixture_runner()) as runtime:
+        # Exercise an authorized tracker read without starting a real network client.
+        self.config.values.setdefault("projections", {}).setdefault("linear", {})["enabled"] = True
+        self.config.values["projects"]["demo"]["tracker"]["team_id"] = "fixture-team"
+        with patch.object(FactoryRuntime, "_build_linear"), FactoryRuntime(self.config, runner=fixture_runner()) as runtime:
             execution = runtime.start_issue("demo", "DEMO-1")
             runtime._claim_pickups()
             request = runner_request(runtime.kernels["demo"], execution)

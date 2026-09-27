@@ -682,6 +682,48 @@ class LinearConvergenceWorker:
             states=self.kernel.states, team_id=team_id, project_id=project_id,
         )
 
+    def ensure_selected_bindings(
+        self, *, project_key: str, workflow_digest: str,
+        states: dict[str, dict[str, Any]], team_id: str | None,
+        project_id: str,
+    ) -> list[dict[str, Any]]:
+        """Bind a selected graph before admission, reusing identical team statuses."""
+        required = {str(state["linear_status"]) for state in states.values()
+                    if state.get("linear_status")}
+        current = [dict(row) for row in self.ledger.connection.execute(
+            "SELECT * FROM linear_status_bindings WHERE project_key=? AND workflow_digest=?",
+            (project_key, workflow_digest),
+        )]
+        if required <= {str(row["status_name"]) for row in current}:
+            if team_id and any(str(row["team_id"]) != team_id for row in current):
+                raise LinearAPIError("wrong_team", "selected graph has foreign team bindings", retryable=False)
+            return current
+        baseline = [dict(row) for row in self.ledger.connection.execute(
+            "SELECT * FROM linear_status_bindings WHERE project_key=? AND workflow_digest=?",
+            (project_key, self.kernel.definition.digest),
+        )]
+        by_name = {str(row["status_name"]): row for row in baseline}
+        if required <= set(by_name) and (
+            not team_id or all(str(by_name[name]["team_id"]) == team_id for name in required)
+        ):
+            bindings = [LinearStatusBindingV1(
+                project_key=project_key, workflow_digest=workflow_digest,
+                team_id=str(by_name[name]["team_id"]),
+                status_id=str(by_name[name]["status_id"]), status_name=name,
+                status_type=str(by_name[name]["status_type"]),
+            ) for name in sorted(required)]
+            return self.ledger.bind_linear_statuses(
+                project_key, workflow_digest, bindings[0].team_id, bindings
+            )
+        if not team_id:
+            raise LinearAPIError(
+                "missing_team", "selected workflow requires a configured Linear team", retryable=False
+            )
+        return self._preflight_bindings(
+            project_key=project_key, workflow_digest=workflow_digest,
+            states=states, team_id=team_id, project_id=project_id,
+        )
+
     def _preflight_bindings(
         self, *, project_key: str, workflow_digest: str,
         states: dict[str, dict[str, Any]], team_id: str, project_id: str,
@@ -779,6 +821,11 @@ class LinearConvergenceWorker:
         )
 
     def drain_one(self, mutation: dict[str, Any]) -> dict[str, Any]:
+        from .projection_policy import authorize
+        decision = authorize(self.ledger, mutation["execution_id"], "linear",
+                             endpoint=getattr(self.client, "endpoint", None), source_at=mutation.get("created_at"))
+        if not decision["allowed"]:
+            return {"id": mutation["id"], "status": "policy_blocked", "reason": decision["reason"]}
         current = self.ledger.current(mutation["execution_id"])
         bindings = self.ledger.require_linear_status_bindings(
             current["project_key"], current["workflow_digest"],

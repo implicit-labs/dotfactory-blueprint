@@ -1,5 +1,9 @@
 # Project defaults and run overrides
 
+Local review export has a separate [evidence policy](local-evidence-policy.md).
+Its defaults, run overrides, redaction, retention and destination constraints do
+not change worker placement or hosted Linear/Logfire projections.
+
 Set project requirements in `factory.json` under
 `projects.<project>.execution.stages.<stage>`. The instance's `execution.workers`
 remains the worker registry; `execution.stages` supplies compatibility defaults.
@@ -95,8 +99,9 @@ Allowed override fields: `workers`, `scope`, `requires`, `readiness`, `checks`,
 workflow. Unknown fields, empty worker candidates, invalid probe limits and
 unknown workers are rejected before admitting a run.
 
-Overrides cannot redefine worker hosts, billing, credentials, workflow authority
-or runner models. Git, native runner authentication/minimum version, requirements
+Placement overrides cannot redefine worker hosts, billing, credentials, or
+workflow authority. Registered selection profiles can choose a runner/model;
+see below. Git, native runner authentication/minimum version, requirements
 implied by retained verification commands, and frozen delivery contracts remain
 in force. Removing a prerequisite does not remove an approved acceptance check.
 
@@ -127,3 +132,64 @@ while preserving the original admission snapshot. Unapproved prose, unanswered
 questions and stale revisions never change placement policy. See the
 [planning conversation guide](planning-conversation.md) and
 [configuration audit](../audits/project-run-configuration.md).
+
+## Select a workflow and runner profile
+
+Register named profiles at the instance ceiling. Project and run inputs may
+select them, but cannot supply an arbitrary runner command, model, credential,
+skill directory or workflow path.
+
+```json
+{
+  "selection_profiles": {
+    "sol-medium": {"runner": "codex", "model": "gpt-5.6-sol", "reasoning_effort": "medium"},
+    "browser-check": {"runner": "codex", "skills": ["browser-qa"], "capabilities": ["browser"]},
+    "no-extra-skills": {"skills": []}
+  },
+  "projects": {
+    "landing": {
+      "workflow": "default",
+      "profile": "sol-medium",
+      "stage_profiles": {"Verifying": "browser-check"}
+    }
+  }
+}
+```
+
+The example is a fragment: keep the required project, runner and workflow
+fields from the base configuration. The browser capability must be declared on
+the registered runner, and any named resource must be registered for the
+project. Profile fields are `runner`, `model`, `reasoning_effort`, `skills`,
+`capabilities`, `resources`, `timeout`, and `max_retries`.
+
+Resolution order for each work stage: workflow/DOT fields → project profile →
+project stage profile → run profile → run stage profile. Omitted fields inherit;
+each supplied list replaces the entire list, and `[]` clears it. An explicit
+`null` for a run `profile` or stage selection clears inherited named profiles
+for that scope and returns to workflow/runner defaults. `null` is not valid
+inside a profile's fields. The registered runner's default model and reasoning
+effort fill any remaining gaps; Codex defaults to Sol/medium.
+
+To select a registered alternate workflow and a stage profile for one run:
+
+```json
+{
+  "workflow": "alternate",
+  "profile": "sol-medium",
+  "stage_profiles": {"Verifying": "no-extra-skills"},
+  "stages": {"Verifying": {"workers": ["mac"]}}
+}
+```
+
+`workflow` must name an entry in `workflows`; it cannot change edges or human
+authority. `stage_profiles` accepts work stages only. Save this as a JSON file
+and pass it to `run --execution-config`; `config-preview` and `doctor` accept
+the same file for read-only inspection. Preview reports the selected workflow,
+per-stage effective values, provenance and overridden-field conflicts without
+probing hosts. Admission
+freezes the resolved graph, route/placement policy and selection in one ledger
+transaction. Reusing a running issue with changed explicit selection fails;
+restarts use the frozen snapshot, not new project/profile definitions.
+
+Profiles describe declared requirements. They do not acquire simulators or
+browsers, grant credentials, or replace `prepare_attempt()` and lease checks.

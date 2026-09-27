@@ -369,6 +369,14 @@ class LinearEvidenceWorker:
 
     def drain_one(self, item: Mapping[str, Any]) -> str:
         execution_id = str(item["execution_id"])
+        from .projection_policy import authorize, linear_body
+        decision = authorize(self.ledger, execution_id, "linear", endpoint=getattr(self.client, "endpoint", None),
+                             source_at=item.get("created_at"))
+        if not decision["allowed"]:
+            return "policy_blocked"
+        if linear_body(self.ledger, execution_id, str(item["desired_body"])) != item["desired_body"]:
+            # Never rewrite an ambiguous request or replay old bytes under a tighter policy.
+            return "policy_blocked"
         status = str(item["status"])
         if status in {"sending", "ambiguous"}:
             known, remote = self._read(item)
@@ -430,7 +438,7 @@ class LinearEvidenceWorker:
         return "confirmed"
 
     def drain(self, limit: int = 100) -> dict[str, int]:
-        counts = {"confirmed": 0, "ambiguous": 0, "pending": 0, "failed": 0}
+        counts = {"confirmed": 0, "ambiguous": 0, "pending": 0, "failed": 0, "policy_blocked": 0}
         for item in self.ledger.pending_linear_evidence(limit):
             counts[self.drain_one(item)] += 1
         return counts

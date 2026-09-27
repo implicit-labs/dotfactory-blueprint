@@ -22,9 +22,14 @@ class DurableKernel:
         self, ledger: SQLiteLedger, workflow_path: str | Path,
         *, profile_paths: list[str | Path] | None = None,
         factory_defaults: dict[str, Any] | None = None,
+        definition: WorkflowDefinition | None = None,
+        default_evidence_policy: dict[str, Any] | None = None,
+        default_projection_policy: dict[str, Any] | None = None,
     ) -> None:
         self.ledger = ledger
-        self.definition: WorkflowDefinition = load_workflow(
+        self.default_evidence_policy = default_evidence_policy
+        self.default_projection_policy = default_projection_policy
+        self.definition: WorkflowDefinition = definition or load_workflow(
             workflow_path, profile_paths=profile_paths or (),
             factory_defaults=factory_defaults,
         )
@@ -73,6 +78,8 @@ class DurableKernel:
         command_id: str, owner: str | None = None, actor: str = "agent",
         adopted_state: str | None = None,
         execution_settings: dict[str, Any] | None = None,
+        evidence_settings: dict[str, Any] | None = None,
+        projection_settings: dict[str, Any] | None = None,
     ) -> str:
         idempotency_key = (
             f"project:{project_key}:work:{identifier}:begin:{command_id}"
@@ -94,6 +101,8 @@ class DurableKernel:
             state_kind=state["kind"], linear_status=state["linear_status"],
             workflow_snapshot=self.definition.snapshot(),
             resolved_node=state.get("execution", {}), execution_settings=execution_settings,
+            evidence_settings=evidence_settings if evidence_settings is not None else self.default_evidence_policy,
+            projection_settings=projection_settings if projection_settings is not None else self.default_projection_policy,
             owner=owner, actor=actor,
             idempotency_key=idempotency_key,
             observed_linear_status=state["linear_status"] if adopted_state else None,
